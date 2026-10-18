@@ -116,7 +116,7 @@ export function readbackDiffs(result, sid) {
   for (const r of result.rows || []) {
     const from = byId[r.id];
     if (!from) continue;
-    const bad = r.pos_ok === false || r.size_ok === false || r.rot_ok === false || !r.matched;
+    const bad = r.pos_ok === false || r.size_ok === false || r.rot_ok === false || r.level_ok === false || r.color_ok === false || !r.matched;
     if (!bad) continue;
     diffs.push({ id: r.id, from: [from[0], from[2]], to: r.readback_position ? [r.readback_position[0], r.readback_position[2]] : null, err_m: r.pos_err_m, row: r });
   }

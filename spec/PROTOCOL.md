@@ -130,6 +130,8 @@ Unreal：
 ```
 `mesh` ∈ cube / cylinder / plane / sphere / cone / empty。
 
+每个对象可以再带一个 `color` 字段（材质主色的精确 HEX，`"#RRGGBB"`，如 `"color": "#D9C9A3"`）。带了评分脚本就会把它与意图里该对象 `color_role` 对应的 `style.palette` HEX 比色差（CIE76 ΔE ≤ 10 合格）；不带则颜色不计分。
+
 直接导入 `scene.glb` 的情况（实验 D 组）：glb 节点的 translation 已经是底面中心、scale 就是 (w, h, d)，不要再按原生几何体减半高；读回请直接写成 SID 形态（`volumes[].position/size/rotation_y`，SID 坐标系），或在 Unity 格式里把 `primitive` 填 `mesh`。
 
 区域 / 路径 / 地形的复现物（薄片、路段、半球）名字按 id 或 `aux_<id>_*` 命名；评分脚本默认不对它们计分、也不算"多余"。
@@ -144,14 +146,17 @@ Unreal：
 | 尺寸比（最大维度） | 0.8–1.25 | 改 scale；注意 Cylinder 高是 scale.y × 2 |
 | 朝向差 | < 20° | 先查符号（−rotation_y），再查长短边是否对调 |
 | 缺漏 / 多余 | 0 | 补上 / 删掉 |
-| 颜色 | 与 HEX 一致 | 重设材质 |
+| 台地层（每个体块，`level_ok`） | 读回位置落在的层 = 意图位置的层（层号 = round((地形高 − base) / `meta.layer_height_m`)，地形按 `terrain.features` 的高度函数算） | 把体块挪回它该在的台地多边形内；别只改 y |
+| 出生点看见地标（`summary.visible_from_spawn.readback`） | 与意图一致（从 `player_spawn` 位置 `player_height` 眼高到地标顶部，沿线每 1 m 采样：地形 + 0.3 m 不高过视线、不穿过任何体块 OBB） | 看 `blocked_by`：`terrain` 查地形有没有做高了，`volume:<名字>` 把那个体块挪开或压矮 |
+| 主路连通（`summary.trail_connected.readback`） | 与意图一致（2 m 网格 BFS，可走 = 坡度 ≤ 0.7 或在路走廊内；路走廊 = 到路中心线 ≤ 宽/2 + 1 m；终点 = 距地标中心 ≤ 6 m 的任一格） | 路段要连续、按 `aux_<path_id>_*` 命名、从 `player_spawn` 一直铺到地标门前；台地墙处靠路爬坡 |
+| 颜色（读回带 `color` 时，`color_ok`） | CIE76 ΔE ≤ 10（与 `color_role` → `style.palette` 的 HEX 比） | 重设材质，直接用 HEX |
 
 先修布局，再修外观。修完再读回一次。
 
 ### 4.3 「场景对话」里的读回验收
 
 把 `readback.json` 导入「场景对话」（出 → 导入读回 JSON 对比），差的对象在俯视图上标成红点，每个红点三选一：**按意图修**（写进下一轮 `BRIEF.md` 的「修正要求」，请按意图位置重放）、**接受引擎版**（意图跟着引擎改并锁住，下轮不要再动它）、**不重要**。
-除位置 / 尺寸 / 朝向外，验收时还要对照 `BRIEF.md` 核三件事：出生点能否看见地标（`relations` 里有 `visible_from`）、主路是否从出生点一直到地标门前（`must_reach`）、每栋房子是否落在它该在的台地层上（`volumes[].terrace_level` / `level`）。
+除位置 / 尺寸 / 朝向外，评分脚本还会算三件事并在表格里显示：出生点能否看见地标（`relations` 里有 `visible_from`）、主路是否从出生点一直到地标门前（`must_reach`）、每栋房子是否落在它该在的台地层上（表格「层」列）；读回带 `color` 时再比颜色（「颜色」列的 ΔE）。层或颜色不对的对象同样标红点、同样三选一。
 
 ## 5. Draft：从文字生成 SID（本实验不用，供「生成后引导」流程）
 

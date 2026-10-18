@@ -93,7 +93,7 @@
 
 **判读规则**（来自报告）：C ≫ A/B 且 C ≈ D → 中间层的价值只剩"不开引擎 + 预计算关系 + 语义 / 色彩标注"，做 Unity 插件而不是独立工具；D ≫ C → 放弃独立输入端，只做"标注 + 校验"插件；A ≈ C → 重新审视 P2。
 
-**新增度量**：AABB 重叠 > 5 cm 的计数、越出 bounds 计数、对话轮数、总 token（Claude Code `/usage`）、MCP 调用数、墙钟时间。`score_readback.py` 目前只算位置 / 尺寸 / 朝向 / 缺漏，重叠与越界先手数或用编辑器的「校验」按钮对读回文件跑一遍。
+**新增度量**：AABB 重叠 > 5 cm 的计数、越出 bounds 计数、对话轮数、总 token（Claude Code `/usage`）、MCP 调用数、墙钟时间。`score_readback.py` 算位置 / 尺寸 / 朝向 / 缺漏，外加台地层、出生点可见地标、主路连通、颜色 ΔE（读回带 `color` 时）；重叠与越界先手数或用编辑器的「校验」按钮对读回文件跑一遍。
 
 **场景**：先用村口广场（户外、有视线与高差，P2 更敏感）；报告建议再加一个 8×6×3 m、14 物体的室内房间作为第二场景（4 墙 + 门 + 2 窗 + 桌 + 4 椅 + 吊灯 + 台灯 + 书架），室内是求解器路线覆盖最好的领域，能看出中间层相对学术方案的增量。
 
@@ -116,6 +116,9 @@ week0-ab/
 ├── scoring/
 │   ├── score-sheet.md
 │   ├── map.example.json
-│   └── readback.example-unity.json   （由 SID 按 PROTOCOL 公式生成的理想读回，用来自检脚本）
+│   ├── readback.example-unity.json   （由 SID 按 PROTOCOL 公式生成的理想读回，用来自检脚本）
+│   ├── terraced.sid.json             （「场景对话」导出的 4 层台地山村，自检台地层 / 可见性 / 连通性 / 颜色）
+│   ├── terraced.readback.example-unity.json          （上者的理想读回，带 color 与 aux_main_trail_* 路段：应全合格）
+│   └── terraced.readback.example-unity-broken.json   （故意弄坏：一栋房挪层、地标前 20 m 体块、一栋房颜色错、主路没爬上去）
 └── runs/                     （实验产物，按 <条件>-<轮次> 建目录）
 ```

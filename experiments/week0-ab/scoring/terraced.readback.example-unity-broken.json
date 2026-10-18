@@ -1,0 +1,399 @@
+{
+ "engine": "unity",
+ "_comment": "故意弄坏的读回：house_1_2 挪到第 4 层台地（层）、地标与出生点连线中点放 20 m 高体块 blocker（可见性）、house_2_1 颜色改成 #5A7FD0（颜色）、主路只铺了前 3 段、没爬上第 3 层（连通性）。导入「场景对话」应看到这几项变红",
+ "objects": [
+  {
+   "name": "SID_scene",
+   "primitive": "empty",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "euler_y": 0
+  },
+  {
+   "name": "landmark",
+   "primitive": "cube",
+   "position": [
+    0,
+    16.5,
+    35
+   ],
+   "scale": [
+    8,
+    9,
+    8
+   ],
+   "euler_y": -180,
+   "color": "#4A4A4A"
+  },
+  {
+   "name": "house_0_1",
+   "primitive": "cube",
+   "position": [
+    9.12,
+    1.755,
+    -34.15
+   ],
+   "scale": [
+    6.4,
+    3.51,
+    4.45
+   ],
+   "euler_y": -90,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_0_2",
+   "primitive": "cube",
+   "position": [
+    -10.22,
+    2.015,
+    -27.57
+   ],
+   "scale": [
+    5.44,
+    4.03,
+    5.5
+   ],
+   "euler_y": -270,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_0_3",
+   "primitive": "cube",
+   "position": [
+    -23.51,
+    1.86,
+    -32.7
+   ],
+   "scale": [
+    6.6,
+    3.72,
+    4.17
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_0_4",
+   "primitive": "cube",
+   "position": [
+    22.29,
+    2.24,
+    -26.74
+   ],
+   "scale": [
+    5.99,
+    4.48,
+    5.02
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_1_1",
+   "primitive": "cube",
+   "position": [
+    -19.66,
+    6.225,
+    -5.92
+   ],
+   "scale": [
+    5.33,
+    4.45,
+    5.72
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_1_2",
+   "primitive": "cube",
+   "position": [
+    9,
+    14.035,
+    34
+   ],
+   "scale": [
+    6.6,
+    4.07,
+    4.57
+   ],
+   "euler_y": -270,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_1_3",
+   "primitive": "cube",
+   "position": [
+    19.07,
+    5.805,
+    -5.82
+   ],
+   "scale": [
+    6.01,
+    3.61,
+    5.42
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_1_4",
+   "primitive": "cube",
+   "position": [
+    14.92,
+    6.105,
+    -14.4
+   ],
+   "scale": [
+    6.18,
+    4.21,
+    5.22
+   ],
+   "euler_y": -90,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_2_1",
+   "primitive": "cube",
+   "position": [
+    -15.37,
+    10.245000000000001,
+    9.52
+   ],
+   "scale": [
+    6.06,
+    4.49,
+    4.69
+   ],
+   "euler_y": -180,
+   "color": "#5A7FD0"
+  },
+  {
+   "name": "house_2_2",
+   "primitive": "cube",
+   "position": [
+    13.46,
+    9.965,
+    12.21
+   ],
+   "scale": [
+    5.65,
+    3.93,
+    4.32
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_2_3",
+   "primitive": "cube",
+   "position": [
+    -8.21,
+    10.015,
+    7.76
+   ],
+   "scale": [
+    5.97,
+    4.03,
+    5.46
+   ],
+   "euler_y": -270,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_2_4",
+   "primitive": "cube",
+   "position": [
+    -8.54,
+    9.94,
+    18.03
+   ],
+   "scale": [
+    5.33,
+    3.88,
+    4.04
+   ],
+   "euler_y": -303.39,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_2_5",
+   "primitive": "cube",
+   "position": [
+    -19.58,
+    9.76,
+    16.65
+   ],
+   "scale": [
+    5.71,
+    3.52,
+    4.11
+   ],
+   "euler_y": -180,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_3_1",
+   "primitive": "cube",
+   "position": [
+    11.96,
+    14.125,
+    41.28
+   ],
+   "scale": [
+    5.55,
+    4.25,
+    4.06
+   ],
+   "euler_y": 0,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_3_2",
+   "primitive": "cube",
+   "position": [
+    -13.16,
+    13.985,
+    40.91
+   ],
+   "scale": [
+    5.18,
+    3.97,
+    4.36
+   ],
+   "euler_y": 0,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_3_3",
+   "primitive": "cube",
+   "position": [
+    14.81,
+    14.105,
+    34.43
+   ],
+   "scale": [
+    6.12,
+    4.21,
+    5.08
+   ],
+   "euler_y": -270,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "house_3_4",
+   "primitive": "cube",
+   "position": [
+    -16.52,
+    14.06,
+    34.23
+   ],
+   "scale": [
+    5.24,
+    4.12,
+    4.32
+   ],
+   "euler_y": -90,
+   "color": "#D9C9A3"
+  },
+  {
+   "name": "spawn",
+   "primitive": "empty",
+   "position": [
+    0,
+    0,
+    -50
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "euler_y": 0
+  },
+  {
+   "name": "landmark_poi",
+   "primitive": "empty",
+   "position": [
+    0,
+    21,
+    35
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "euler_y": 0
+  },
+  {
+   "name": "aux_main_trail_1",
+   "primitive": "cube",
+   "position": [
+    0.5,
+    0.01,
+    -49.5
+   ],
+   "scale": [
+    1.4142135623730951,
+    0.02,
+    2
+   ],
+   "euler_y": -45.0
+  },
+  {
+   "name": "aux_main_trail_2",
+   "primitive": "cube",
+   "position": [
+    1.0,
+    0.01,
+    -36.0
+   ],
+   "scale": [
+    26.0,
+    0.02,
+    2
+   ],
+   "euler_y": -90.0
+  },
+  {
+   "name": "aux_main_trail_3",
+   "primitive": "cube",
+   "position": [
+    2.0,
+    0.01,
+    -22.0
+   ],
+   "scale": [
+    2.8284271247461903,
+    0.02,
+    2
+   ],
+   "euler_y": -45.0
+  },
+  {
+   "name": "blocker",
+   "primitive": "cube",
+   "position": [
+    0.0,
+    14.0,
+    -7.5
+   ],
+   "scale": [
+    10,
+    20,
+    2
+   ],
+   "euler_y": 0
+  }
+ ]
+}

@@ -51,7 +51,8 @@ def _score(root: str, payload: dict) -> dict:
         rb.update(sr.merge_path_readbacks(rb, [p["id"] for p in sid.get("paths", [])]))
         unscored = {sr.norm(f["id"]) for f in sid.get("terrain", {}).get("features", [])}
     mapping = {k: v for k, v in (payload.get("map") or {}).items() if not str(k).startswith("_")}
-    res = sr.compare(intent, rb, mapping, bool(payload.get("auto_map", True)), unscored)
+    # 传 sid 与原始读回：compare 才会算台地层 / 颜色（rows）与可见性 / 连通性（summary）
+    res = sr.compare(intent, rb, mapping, bool(payload.get("auto_map", True)), unscored, sid=sid, rb_raw=payload["readback"])
     res["format"] = fmt
     # 给前端画红点用：每行附上引擎实际的位置 / 朝向 / 尺寸
     by_raw = {o.get("raw_name"): o for o in rb.values()}

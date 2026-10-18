@@ -407,23 +407,31 @@ function renderReadback(body, status) {
   const res = S.readback; if (!res) return;
   body.replaceChildren();
   const s = res.summary;
-  status.textContent = `读回格式 ${res.format} · 匹配 ${s.matched}/${s.intent_objects} · 位置中位误差 ${s.pos_err_median_m} m · 位置合格 ${s.pos_ok_rate_pct}% · 尺寸合格 ${s.size_ok_rate_pct}% · 朝向合格 ${s.rot_ok_rate_pct}%`;
-  const table = el("table", {}, el("tr", {}, ...["对象", "匹配到", "位置误差 m", "高度差 m", "尺寸比", "朝向差°", "怎么办"].map((h) => el("th", {}, h))));
+  const okMark = (v) => (v === true ? "✓" : v === false ? "✗" : "—");
+  const pct = (v) => (v == null ? "—" : `${v}%`);
+  const vis = s.visible_from_spawn || {}, con = s.trail_connected || {};
+  status.textContent = `读回格式 ${res.format} · 匹配 ${s.matched}/${s.intent_objects} · 位置中位误差 ${s.pos_err_median_m} m · 位置合格 ${s.pos_ok_rate_pct}% · 尺寸合格 ${s.size_ok_rate_pct}% · 朝向合格 ${s.rot_ok_rate_pct}% · 层合格 ${pct(s.level_ok_rate_pct)} · 颜色合格 ${pct(s.color_ok_rate_pct)} · 出生点见地标 ${okMark(vis.readback)}${vis.readback === false && vis.blocked_by ? `（被 ${vis.blocked_by} 挡）` : ""} · 主路连通 ${okMark(con.readback)}`;
+  // 层：意图层→读回层（显示为第 n 层，1 起）；颜色：读回色块 + ΔE
+  const levelCell = (r) => (r.level_intent == null ? "—" : r.level_ok === false ? `${r.level_intent + 1}→${r.level_readback + 1} 层` : `${r.level_intent + 1} 层`);
+  const colorCell = (r) => (r.delta_e == null ? "—" : el("span", {}, el("span", { class: "swatch", style: `background:${r.color_readback}`, title: `读回 ${r.color_readback} · 意图 ${r.color_intent}` }), ` ΔE ${r.delta_e}`));
+  const table = el("table", {}, el("tr", {}, ...["对象", "匹配到", "位置误差 m", "高度差 m", "尺寸比", "朝向差°", "层", "颜色", "怎么办"].map((h) => el("th", {}, h))));
   for (const r of res.rows) {
     const d = S.diffs.find((x) => x.id === r.id);
     const bad = !!d;
     table.append(el("tr", { class: bad ? "bad" : "" }, el("td", {}, r.id), el("td", {}, r.matched || "—"), el("td", { class: "num" }, r.pos_err_m ?? "—"), el("td", { class: "num" }, r.dy_m ?? "—"), el("td", { class: "num" }, r.size_ratio ?? "—"), el("td", { class: "num" }, r.rot_err ?? "—"),
+      el("td", { class: "num" }, levelCell(r)), el("td", { class: "num" }, colorCell(r)),
       el("td", {}, bad ? el("div", { class: "fixes" }, ...diffButtons(d, () => renderReadback(body, status))) : "✓")));
   }
-  for (const d of S.diffs.filter((x) => x.missing)) table.append(el("tr", { class: "bad" }, el("td", {}, d.id), el("td", {}, "— 引擎里没有"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", {}, el("div", { class: "fixes" }, ...diffButtons(d, () => renderReadback(body, status))))));
+  for (const d of S.diffs.filter((x) => x.missing)) table.append(el("tr", { class: "bad" }, el("td", {}, d.id), el("td", {}, "— 引擎里没有"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", { class: "num" }, "—"), el("td", {}, el("div", { class: "fixes" }, ...diffButtons(d, () => renderReadback(body, status))))));
   body.append(table);
+  if (vis.readback === false || con.readback === false) body.append(el("p", { class: "hint" }, `${vis.readback === false ? `引擎里从出生点看不见地标${vis.blocked_by ? `（被 ${vis.blocked_by} 挡）` : ""}${vis.intent ? "，意图里能看见" : ""}。` : ""}${con.readback === false ? `引擎里主路没有从出生点连到地标门前${con.intent ? "，意图里是连通的" : ""}。` : ""}`));
   if (S.corrections.length) body.append(el("div", { style: "margin-top:8px" }, el("b", {}, "下一轮修正要求（会写进 BRIEF.md）"), el("pre", {}, S.corrections.join("\n"))));
 }
 function diffButtons(d, after = () => {}) {
   const row = d.row || {};
   const done = () => { S.diffs = S.diffs.filter((x) => x.id !== d.id); renderViews(); after(); };
   return [
-    el("button", { class: "chip", onclick: () => { bump("choose"); const txt = d.missing ? `${d.id}：引擎里没放，请按 SID 位置 (${d.from[0]}, ${d.from[1]}) 补上` : `${d.id}：意图位置 (${d.from[0]}, ${d.from[1]})，引擎放在 (${d.to ? d.to.map((v) => Math.round(v * 10) / 10).join(", ") : "?"})，偏 ${row.pos_err_m} m${row.rot_ok === false ? `，朝向差 ${row.rot_err}°` : ""}${row.size_ok === false ? `，尺寸比 ${row.size_ratio}` : ""}；请按意图重放`; if (!S.corrections.includes(txt)) S.corrections.push(txt); done(); ai(`记下了：${txt}`); } }, "按意图修"),
+    el("button", { class: "chip", onclick: () => { bump("choose"); const txt = d.missing ? `${d.id}：引擎里没放，请按 SID 位置 (${d.from[0]}, ${d.from[1]}) 补上` : `${d.id}：意图位置 (${d.from[0]}, ${d.from[1]})，引擎放在 (${d.to ? d.to.map((v) => Math.round(v * 10) / 10).join(", ") : "?"})，偏 ${row.pos_err_m} m${row.rot_ok === false ? `，朝向差 ${row.rot_err}°` : ""}${row.size_ok === false ? `，尺寸比 ${row.size_ratio}` : ""}${row.level_ok === false ? `，落在第 ${row.level_readback + 1} 层而不是第 ${row.level_intent + 1} 层` : ""}${row.color_ok === false ? `，颜色 ${row.color_readback} 应为 ${row.color_intent}（ΔE ${row.delta_e}）` : ""}；请按意图重放`; if (!S.corrections.includes(txt)) S.corrections.push(txt); done(); ai(`记下了：${txt}`); } }, "按意图修"),
     d.to ? el("button", { class: "chip", onclick: () => { bump("choose"); S.scene.acceptReadback(d.id, row.readback_position || [d.to[0], 0, d.to[1]], row.readback_rotation_y); done(); renderPanels(); ai(`${d.id} 接受引擎的位置，意图跟着改了并锁住。`); } }, "接受引擎版") : null,
     el("button", { class: "chip", onclick: () => { bump("choose"); done(); } }, "不重要"),
   ].filter(Boolean);
