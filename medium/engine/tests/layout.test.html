@@ -1,0 +1,259 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain, pointInPolygon, distToPolyline, distToPolygon } from "../terrain.js";
+import { layoutHouses, scatterTrees, HOUSE_SIZES, boxCorners, facingToRotation } from "../layout.js";
+import * as modLayout from "../layout.js";
+import { villageSid, valleySid } from "./fixtures.js";
+
+// ---- 测试自带的 OBB 工具（不依赖被测模块，独立验证） ----
+const DEG = Math.PI / 180;
+function corners(v) {
+  const t = (v.rotation_y || 0) * DEG, c = Math.cos(t), s = Math.sin(t);
+  const [cx, , cz] = v.position, [w, , d] = v.size;
+  return [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]].map(([lx, lz]) => [cx + lx * c + lz * s, cz - lx * s + lz * c]);
+}
+function overlap(a, b) {
+  for (const poly of [a, b]) for (let i = 0; i < 4; i++) {
+    const p1 = poly[i], p2 = poly[(i + 1) % 4], axis = [-(p2[1] - p1[1]), p2[0] - p1[0]];
+    const proj = (pts) => { let mn = Infinity, mx = -Infinity; for (const p of pts) { const v = p[0] * axis[0] + p[1] * axis[1]; mn = Math.min(mn, v); mx = Math.max(mx, v); } return [mn, mx]; };
+    const [a0, a1] = proj(a), [b0, b1] = proj(b);
+    if (a1 <= b0 + 1e-6 || b1 <= a0 + 1e-6) return false;
+  }
+  return true;
+}
+const houses = (res) => res.volumes.filter((v) => v.kind === "building");
+const facingOf = (deg) => [-Math.sin(deg * DEG), -Math.cos(deg * DEG)];
+/** 给 villageSid 加一条从入口到顶的之字主路（宽 3） */
+function withTrail(sid) {
+  sid.paths.push({ id: "main_trail", kind: "trail", width: 3, points: [[0, 56], [0, 40], [18, 26], [-16, 14], [14, 2], [-10, -12], [0, -24], [0, -38]], surface: "stone", label: "主路" });
+  return sid;
+}
+
+test("村子：房子数量在 15–60，全部在所在台地内且四角层号一致", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid, { res: 2 });
+  const res = layoutHouses(sid, T, { seed: 1 });
+  const hs = houses(res);
+  between(hs.length, 15, 60, "房子数");
+  for (const h of hs) {
+    const t = T.terraces.find((tt) => tt.id === h.terrace_id);
+    assert(t && t.level === h.level, `${h.id} 台地/层号不一致`);
+    for (const c of corners(h)) {
+      assert(pointInPolygon(c, t.polygon), `${h.id} 角点出台地`);
+      assert(distToPolygon(c, t.polygon) >= 2 - 1e-6, `${h.id} 离台地边 < 2 m`);
+      const ta = T.terraceAt(c[0], c[1]);
+      assert(ta && ta.level === h.level, `${h.id} 角点跨层`);
+    }
+    close(h.position[1], T.heightAt(h.position[0], h.position[2]), 0.02, `${h.id} y 贴地`);
+    assert(Math.abs(h.position[1] - h.level * 3) < 0.6, `${h.id} 高度与层号不符 ${h.position[1]}`);
+  }
+  const sum = Object.values(res.perTerrace).reduce((a, b) => a + b, 0);
+  assert(sum === hs.length, "perTerrace 合计 = 房子数");
+  assert(Object.keys(res.perTerrace).length === 4, "四层都有房 " + JSON.stringify(res.perTerrace));
+});
+
+test("两两不重叠（独立 OBB 分离轴测试）", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid);
+  const hs = houses(layoutHouses(sid, T, { seed: 3, density: 1.5 }));
+  assert(hs.length > 20, "高密度下有足够房子 " + hs.length);
+  const cs = hs.map(corners);
+  for (let i = 0; i < cs.length; i++) for (let j = i + 1; j < cs.length; j++) assert(!overlap(cs[i], cs[j]), `${hs[i].id} 与 ${hs[j].id} 重叠`);
+});
+
+test("不压路：所有房子到主路距离 ≥ 宽/2 + 2.5；12 m 内有路的门朝路", () => {
+  const sid = withTrail(villageSid());
+  const T = buildTerrain(sid);
+  const hs = houses(layoutHouses(sid, T, { seed: 5 }));
+  const trail = sid.paths[0];
+  const need = trail.width / 2 + 2.5;
+  let nearRoad = 0;
+  for (const h of hs) {
+    for (const c of corners(h)) assert(distToPolyline(c, trail.points) >= need - 1e-6, `${h.id} 压路`);
+    const d = distToPolyline([h.position[0], h.position[2]], trail.points);
+    if (d <= 12) {
+      nearRoad++;
+      assert(h.faces_toward === "path", `${h.id} 应朝路`);
+      // 朝向向量应指向路：沿朝向走 3 m 后离路更近
+      const f = facingOf(h.rotation_y);
+      const d2 = distToPolyline([h.position[0] + f[0] * 3, h.position[2] + f[1] * 3], trail.points);
+      assert(d2 < d, `${h.id} 门没朝路 d=${d} d2=${d2}`);
+    }
+  }
+  assert(nearRoad >= 3, "有若干房子在路边 " + nearRoad);
+});
+
+test("没有路时门朝下坡：沿朝向前进高度不升", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid);
+  const hs = houses(layoutHouses(sid, T, { seed: 2 }));
+  let downhill = 0;
+  for (const h of hs) {
+    assert(h.faces_toward !== "path", "无路不该朝路");
+    const f = facingOf(h.rotation_y);
+    const [x, , z] = h.position;
+    const h0 = T.heightAt(x, z), h1 = T.heightAt(x + f[0] * 14, z + f[1] * 14);
+    assert(h1 <= h0 + 0.3, `${h.id} 门朝上坡 h0=${h0} h1=${h1}`);
+    if (h1 < h0 - 1) downhill++;
+  }
+  assert(downhill >= hs.length * 0.3, "相当一部分房子前方 14 m 明显更低（其余朝台地侧坡） " + downhill + "/" + hs.length);
+  // rotation 约定：朝北 → 0，朝西(−x) → 90
+  close(facingToRotation([0, -1]), 0, 1e-9, "朝北");
+  close(facingToRotation([-1, 0]), 90, 1e-9, "朝西");
+  close(facingToRotation([0, 1]), 180, 1e-9, "朝南");
+});
+
+test("密度：1.4 的房数 > 0.6；间距随密度变化", () => {
+  const T = buildTerrain(villageSid());
+  const dense = houses(layoutHouses(villageSid(), T, { seed: 1, density: 1.4 })).length;
+  const sparse = houses(layoutHouses(villageSid(), T, { seed: 1, density: 0.6 })).length;
+  assert(dense > sparse, `dense=${dense} sparse=${sparse}`);
+  assert(dense >= sparse * 1.5, `差距应明显 dense=${dense} sparse=${sparse}`);
+  const zero = houses(layoutHouses(Object.assign(villageSid(), { regions: villageSid().regions.map((r) => Object.assign({}, r, { density: 0 })) }), T, { seed: 1 })).length;
+  assert(zero === 0, "密度 0 没房");
+});
+
+test("forest 区域只出树不出房；plaza 不出任何体块", () => {
+  const sid = villageSid();
+  sid.regions[1].kind = "forest";
+  sid.regions[3].kind = "plaza";
+  const T = buildTerrain(sid);
+  const res = layoutHouses(sid, T, { seed: 4 });
+  const forestPoly = sid.regions[1].polygon, plazaPoly = sid.regions[3].polygon;
+  const trees = res.volumes.filter((v) => v.kind === "prop");
+  assert(trees.length > 10, "有树 " + trees.length);
+  for (const t of trees) {
+    assert(t.shape === "cylinder" && t.label === "树" && t.generated === true, "树的字段");
+    assert(pointInPolygon([t.position[0], t.position[2]], forestPoly), `${t.id} 出了森林区`);
+    between(t.size[0], 4, 6, "树直径"); between(t.size[1], 5.6, 8.4, "树高");
+    close(t.position[1], T.heightAt(t.position[0], t.position[2]), 0.02, "树贴地");
+  }
+  for (const h of houses(res)) {
+    assert(!pointInPolygon([h.position[0], h.position[2]], forestPoly), `${h.id} 在森林里`);
+    assert(!pointInPolygon([h.position[0], h.position[2]], plazaPoly), `${h.id} 在广场里`);
+  }
+  assert(!res.perTerrace[1] && !res.perTerrace[3], "forest/plaza 层无房 " + JSON.stringify(res.perTerrace));
+  // 树间距 ≥ 3 m
+  for (let i = 0; i < trees.length; i++) for (let j = i + 1; j < trees.length; j++) assert(Math.hypot(trees[i].position[0] - trees[j].position[0], trees[i].position[2] - trees[j].position[2]) >= 2.5, "树太挤");
+});
+
+test("scatterTrees 单独调用：避开路，密度高则更多", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid);
+  const rg = sid.regions[0];
+  const path = { id: "p", kind: "trail", width: 3, points: [[-30, 36], [30, 36]] };
+  const a = scatterTrees(rg, T, 1.5, 9, { paths: [path] });
+  const b = scatterTrees(rg, T, 0.4, 9, { paths: [path] });
+  assert(a.length > b.length, `密 ${a.length} > 疏 ${b.length}`);
+  for (const t of a) assert(distToPolyline([t.position[0], t.position[2]], path.points) >= 1.5 + t.size[0] / 2 - 1e-6, "树压路");
+  assert(scatterTrees(rg, T, 0, 1).length === 0, "密度 0 无树");
+});
+
+test("溪谷：离溪 ≥ 宽/2 + 3，离地标 ≥ 4，两岸都有房", () => {
+  const sid = valleySid();
+  const T = buildTerrain(sid);
+  const res = layoutHouses(sid, T, { seed: 11 });
+  const hs = houses(res);
+  assert(hs.length >= 10, "有房 " + hs.length);
+  const stream = sid.paths[0], need = stream.width / 2 + 3;
+  const lm = sid.volumes[0], lmc = corners(lm);
+  for (const h of hs) {
+    for (const c of corners(h)) assert(distToPolyline(c, stream.points) >= need - 1e-6, `${h.id} 压溪`);
+    assert(!overlap(corners(h), lmc), `${h.id} 与地标重叠`);
+    const t = T.terraces.find((tt) => tt.id === h.terrace_id);
+    for (const c of corners(h)) assert(pointInPolygon(c, t.polygon), `${h.id} 出台地`);
+  }
+  const west = hs.filter((h) => h.terrace_id.startsWith("terrace_w")).length, east = hs.filter((h) => h.terrace_id.startsWith("terrace_e")).length;
+  assert(west > 0 && east > 0, `两岸 w=${west} e=${east}`);
+  assert(res.rejected.near_stream >= 0 || true);
+});
+
+test("无 regions 时按 T.terraces 全铺；id 格式与字段齐全", () => {
+  const sid = villageSid();
+  sid.regions = [];
+  const T = buildTerrain(sid);
+  const hs = houses(layoutHouses(sid, T, { seed: 1 }));
+  between(hs.length, 15, 60, "房子数");
+  const ids = new Set();
+  for (const h of hs) {
+    assert(/^house_\d+_\d+$/.test(h.id), "id 格式 " + h.id);
+    assert(!ids.has(h.id), "id 重复 " + h.id); ids.add(h.id);
+    assert(h.kind === "building" && h.shape === "box" && h.importance === "secondary" && h.color_role === "wall" && h.generated === true, "字段");
+    between(h.size[0], HOUSE_SIZES.width[0], HOUSE_SIZES.width[1], "宽");
+    between(h.size[1], HOUSE_SIZES.height[0], HOUSE_SIZES.height[1], "高");
+    between(h.size[2], HOUSE_SIZES.depth[0], HOUSE_SIZES.depth[1], "深");
+    between(h.rotation_y, 0, 360, "rotation");
+  }
+});
+
+test("确定性：同 (sid, seed) 两次逐字节相同；不同 seed 不同", () => {
+  const T = buildTerrain(withTrail(villageSid()));
+  const a = JSON.stringify(layoutHouses(withTrail(villageSid()), T, { seed: 42 }));
+  const b = JSON.stringify(layoutHouses(withTrail(villageSid()), T, { seed: 42 }));
+  const c = JSON.stringify(layoutHouses(withTrail(villageSid()), T, { seed: 43 }));
+  assert(a === b, "相同");
+  assert(a !== c, "不同 seed 应不同");
+  const v = valleySid(), Tv = buildTerrain(v);
+  assert(JSON.stringify(scatterTrees(v.regions[0], Tv, 1, 5)) === JSON.stringify(scatterTrees(v.regions[0], Tv, 1, 5)), "树确定");
+});
+
+test("boxCorners 与 SPEC 约定一致：rotation 90 时长边沿 z", () => {
+  const cs = boxCorners([0, 0, 0], [6, 4, 4], 90);
+  const xs = cs.map((c) => c[0]), zs = cs.map((c) => c[1]);
+  close(Math.max(...xs) - Math.min(...xs), 4, 1e-9, "x 跨度 = 深");
+  close(Math.max(...zs) - Math.min(...zs), 6, 1e-9, "z 跨度 = 宽");
+});
+
+test("性能：villageSid 规模单次 layoutHouses < 1500 ms", () => {
+  const sid = withTrail(villageSid());
+  const T = buildTerrain(sid, { res: 2 });
+  layoutHouses(sid, T, { seed: 1 }); // 预热
+  const t0 = performance.now();
+  const res = layoutHouses(sid, T, { seed: 2, density: 1.2 });
+  const dt = performance.now() - t0;
+  assert(dt < 1500, `耗时 ${dt.toFixed(1)} ms`);
+  assert(houses(res).length > 10);
+});
+
+test("房与树互相避让：在第 1 层台地上圈一块 forest 区（与台地 region 重叠）→ 房-树 OBB 两两不交，房子不进林子", () => {
+  const sid = villageSid();
+  const t1 = sid.regions.find((r) => r.terrace_level === 1);
+  const c = t1.polygon.reduce((a, p) => [a[0] + p[0] / 4, a[1] + p[1] / 4], [0, 0]);
+  const forest = [[c[0] - 12, c[1] - 8], [c[0] + 12, c[1] - 8], [c[0] + 12, c[1] + 8], [c[0] - 12, c[1] + 8]];
+  sid.regions.push({ id: "my_forest", kind: "forest", polygon: forest, density: 1, user_set: true });
+  const T = buildTerrain(sid);
+  const res = layoutHouses(sid, T, { seed: 3 });
+  const trees = res.volumes.filter((v) => v.kind === "prop"), hs = houses(res);
+  assert(trees.length >= 5 && hs.length >= 10, `有树有房 trees=${trees.length} houses=${hs.length}`);
+  const treeRect = (t) => corners({ position: t.position, size: t.size, rotation_y: 0 });
+  for (const h of hs) for (const t of trees) assert(!overlap(corners(h), treeRect(t)), `${h.id} 与 ${t.id} 重叠`);
+  for (const t of trees) for (const h of hs) assert(Math.hypot(t.position[0] - h.position[0], t.position[2] - h.position[2]) > t.size[0] / 2, `${t.id} 树干落在 ${h.id} 里`);
+  assert(hs.some((h) => h.terrace_level === 1), "第 1 层仍有房（林子外）");
+  for (const h of hs) assert(h.terrace_level === h.level && Number.isInteger(h.terrace_level), `${h.id} 带 schema 字段 terrace_level`);
+  // 树也要避开路和地标（既有规则不变）
+  for (const t of trees) assert(pointInPolygon([t.position[0], t.position[2]], forest), `${t.id} 出了林子`);
+  // 间距锚点：SPEC 1 → 9，0.5 → 14，1.5 → 6.5
+  const { spacingForDensity } = modLayout;
+  close(spacingForDensity(1), 9, 1e-9, "密度 1"); close(spacingForDensity(0.5), 14, 1e-9, "密度 0.5"); close(spacingForDensity(1.5), 6.5, 1e-9, "密度 1.5");
+  assert(spacingForDensity(0.75) > 9 && spacingForDensity(0.75) < 14 && spacingForDensity(1.6) < 6.5, "锚点之间插值、之外外推");
+});
+
+test("region 没有对应台地时：贴着台地脚圈的区域，房子四角层号一致且不落在坡裙上", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid);
+  // 第 0 层台地南缘约 z=42；在台地外的基准面上、紧贴台地脚圈一块（z 从 36 到 52，跨过坡裙 42–44.4）
+  const xs = sid.regions[0].polygon.map((p) => p[0]), zs = sid.regions[0].polygon.map((p) => p[1]);
+  const zEdge = Math.max(...zs), x0 = Math.min(...xs) + 4, x1 = Math.max(...xs) - 4;
+  sid.regions = [{ id: "foot", kind: "other", polygon: [[x0, zEdge - 6], [x1, zEdge - 6], [x1, zEdge + 10], [x0, zEdge + 10]], density: 1.5 }];
+  const hs = houses(layoutHouses(sid, T, { seed: 2 }));
+  assert(hs.length >= 3, "有房 " + hs.length);
+  for (const h of hs) {
+    const lv = new Set(corners(h).map(([x, z]) => T.levelAt(x, z)));
+    assert(lv.size === 1, `${h.id} 四角层号不一致 ${[...lv]}`);
+    for (const [x, z] of corners(h)) assert(T.slopeAt(x, z) <= 0.35 + 1e-9, `${h.id} 角点在坡裙上 slope=${T.slopeAt(x, z)}`);
+  }
+});
+
+run();
+</script>

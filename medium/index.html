@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>场景对话</title>
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+</head>
+<body>
+  <header id="top">
+    <div class="brand">场景对话 <span class="tag" id="theme-tag">山地村落</span></div>
+    <ol id="steps">
+      <li data-step="1" title="一句话说你要什么">说</li>
+      <li data-step="2" title="三张完整的方案卡，挑一张">选</li>
+      <li data-step="3" title="最多四个问题，每个都可以「你定」">答</li>
+      <li data-step="4" title="在图上画一笔、圈一块、拖一下，随时可做">画</li>
+      <li data-step="5" title="把「我理解为」逐条点对">核</li>
+      <li data-step="6" title="导出给引擎 / 读回对比">出</li>
+    </ol>
+    <div class="budget" id="budget" title="AI 最多问四个问题，每个都可以「你定」跳过">问题 0/4</div>
+    <div class="spacer"></div>
+    <div class="meter" id="meter" title="这一轮沟通里人做了多少动作">指点 0 · 选择 0 · 打字 0 · 坐标 0</div>
+    <button id="ai-status" class="pill" title="AI 设置">AI：…</button>
+  </header>
+
+  <main>
+    <section id="chat">
+      <div id="log" aria-live="polite"></div>
+      <div id="chips"></div>
+      <form id="composer">
+        <input id="input" type="text" placeholder="说一句你想要的场景，比如「我要生成山城村庄」" autocomplete="off" />
+        <button type="submit" id="send">发送</button>
+      </form>
+    </section>
+
+    <section id="stage">
+      <div id="tabs">
+        <button class="tab active" data-view="map">俯视语义图</button>
+        <button class="tab" data-view="profile">侧剖面</button>
+        <button class="tab" data-view="eye">第一眼</button>
+        <button class="tab" data-view="three">3D 预览</button>
+        <div class="spacer"></div>
+        <div id="tools" class="disabled">
+          <button data-tool="select" class="tool active" title="点一下看它是什么，可确认 / 锁住">选择</button>
+          <button data-tool="path" class="tool" title="在图上画一笔，这就是主路">画路</button>
+          <button data-tool="region" class="tool" title="圈一块地，然后说它是什么">圈区域</button>
+          <button data-tool="pin" class="tool" title="拖动地标和入口">图钉</button>
+          <button data-tool="erase" class="tool" title="点掉一个区域，或把路恢复成算出来的">擦除</button>
+        </div>
+        <button id="btn-variants" class="ubtn" disabled title="按一条变化轴再出三张">换一批</button>
+        <button id="btn-export" class="ubtn primary" disabled title="「我理解为」全部点对后才能导出">出 →</button>
+      </div>
+      <div id="views">
+        <div id="view-map" class="view active"></div>
+        <div id="view-profile" class="view"></div>
+        <div id="view-eye" class="view"></div>
+        <div id="view-three" class="view"></div>
+        <div id="popup" hidden></div>
+        <div id="hint" class="hint-bar" hidden></div>
+      </div>
+      <aside id="side">
+        <section class="panel" id="p-understand">
+          <h3>我理解为 <span class="count" id="understand-count"></span></h3>
+          <div class="hint">每条点「对」确认；点「▾」看替代解释；「🔒」后出变体不动它。</div>
+          <ul id="understanding"></ul>
+        </section>
+        <section class="panel" id="p-relations">
+          <h3>关系检查</h3>
+          <ul id="relations"></ul>
+        </section>
+        <section class="panel" id="p-assumptions">
+          <h3>我假设了</h3>
+          <div class="hint">你没说的，我按默认填了。点一下可以改。</div>
+          <ul id="assumptions"></ul>
+        </section>
+        <section class="panel" id="p-palette">
+          <h3>参考与色板</h3>
+          <div class="hint">给一张参考图，我从里面取色；不给就用风格板。</div>
+          <div id="reference"></div>
+          <div id="palette"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <div id="modal" hidden><div class="modal-card" id="modal-card"></div></div>
+
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <h3>AI 设置</h3>
+      <p class="hint">密钥只存在本机 <code>%LOCALAPPDATA%\ai-scene-bridge\config.json</code>，由本地 Python 服务代为调用，网页永远拿不到明文。没有密钥时用内置的模拟 AI（脚本），整条流程照样能走。</p>
+      <label>Anthropic API Key <input id="s-key" type="password" placeholder="sk-ant-…" autocomplete="off" /></label>
+      <div id="s-key-hint" class="hint"></div>
+      <label>模型 <input id="s-model" type="text" value="claude-opus-5-5" /></label>
+      <label class="row"><input id="s-mock" type="checkbox" /> 强制使用模拟 AI（不联网）</label>
+      <div class="actions">
+        <button type="button" id="s-test" class="ubtn">测试密钥</button>
+        <span id="s-test-result" class="hint"></span>
+        <span class="spacer"></span>
+        <button type="button" id="s-cancel" class="ubtn">取消</button>
+        <button type="submit" id="s-save" class="ubtn primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -5,19 +5,37 @@
 
 ## 0. 你拿到的是什么
 
+两种来源的包，文件略有不同，读法一样：
+
 ```
-<package>/
-├── scene.sid.json     主文件：场景意图（几何 + 语义 + 风格 + 关系 + 约束）
-├── views/top.png      俯视正交图：北朝上，网格 5/10 m，坐标刻度，比例尺，每个对象画有 id、label、尺寸、朝向箭头
-├── views/iso.png      鸟瞰示意：编辑器导出的是透视（kind=perspective，相机参数在 views 里）；Python 脚本导出的是正交等轴测（kind=isometric）。可能没有
-├── scene.glb          体块与标记的几何（根节点 SID_scene，节点名 = id，extras.sid 里有 kind / label / size / rotation_y）。v0 只作参考、校对用，Compile 仍按 §3 用原生几何体；可能没有
-├── assets/            编辑器导入素材的原文件（asset_hints[id].file 指向这里）。v0 忽略；可能没有
-├── refs/              用户手动放入的参考图。编辑器 v0 不生成；可能没有
-├── README.txt         本包文件说明（编辑器导出时生成）
-└── PROTOCOL.md        本文件（从仓库根目录启动编辑器时自动放入，否则可能缺）
+<package>/                        「场景对话」（medium/）导出的包
+├── scene.sid.json                主文件：场景意图（几何 + 语义 + 风格 + 关系 + 约束）
+├── BRIEF.md                      人和 AI 都能读的搭建交代：结构决定、第一眼、主路、民居分布、色板 hex、已确认的理解、关系检查、上一轮读回后的修正要求。先读它
+├── views/top.png                 俯视语义图：北朝上，台地按层着色，房子（门朝向短线）、地标、入口视锥、主路、溪、区域标签
+├── views/profile.png             沿主路的侧剖面（纵向有夸张）：层带、坡度着色（红段 > 0.7）、入口小人、地标体块
+├── views/first-sight.png         从出生点 1.7 m 眼高朝地标的示意透视（不是渲染）：地标在画面左 / 中 / 右、仰角、是否被挡
+├── views/preview-3d.png          3D 预览截图（可能没有）
+├── sid.schema.json               校验用
+└── PROTOCOL.md                   本文件
+
+<package>/                        第一版编辑器（app/）或 Python 脚本导出的包
+├── scene.sid.json
+├── views/top.png                 俯视正交图：网格 5/10 m，坐标刻度，比例尺，每个对象画有 id、label、尺寸、朝向箭头
+├── views/iso.png                 鸟瞰示意：编辑器导出透视（kind=perspective）；脚本导出正交等轴测（kind=isometric）。可能没有
+├── scene.glb                     体块与标记的几何（根节点 SID_scene，节点名 = id）。只作参考、校对；可能没有
+├── assets/  refs/  README.txt    素材原文件 / 参考图 / 说明；都可能没有
+└── PROTOCOL.md
 ```
 
 **以 `scene.sid.json` 为准。** 图是帮你建立整体印象、核对相对关系的，坐标与尺寸一律取自 JSON。
+
+「场景对话」导出的 SID 比第一版多这些东西，含义如下：
+- `terrain.features[]` 里的台地是**多边形**：`kind: plateau`，`polygon` 是俯视多边形，`level` 是层号（0 最低），`height = level × meta.layer_height_m`，边缘坡面宽 `skirt`。高度场 = 各台地贡献取最大值：多边形内等于 `height`，外侧线性落到 0。请按这个做地形（Unity：Terrain 或按多边形挤出的网格；UE：Landscape 或 ProceduralMesh），不要用圆形山丘近似。
+- `volumes[]` 里 `generated: true` 的是引擎按规则铺的民居 / 树（长边平行等高线、门朝下坡或朝路、不压路、不重叠、不跨崖），坐标同样精确；`locked: true` 的是人确认过的，一毫米不能动；`importance: landmark` 的是地标；`kind: prop` + `shape: cylinder` + `label: 树` 是树冠占位。
+- `paths[]`：`main_trail` 是主路（`user_drawn: true` 表示人手画的），`spur_*` 是为了让每层台地都有路可达而补的支路，`stream` 是溪（`kind: river`）。主路请做成**石阶 + 歇脚平台**，`BRIEF.md` 里有折数、爬升、台阶数估计。
+- `regions[]`：每层台地一个（`terrace_level`），`kind` 为 other（民居）/ plaza（广场，不放房）/ forest（林子，只有树）/ farmland / terrace（梯田）/ gathering；`user_set: true` 的是人圈出来的多边形。
+- `meta.card` 是 AI 与人商定的结构卡（原型、层数、层高、地标放置类、入口放置类、每层用途与密度、色板、时段），`meta.archetype` 是地形原型名；`meta.ignored_checks` 是人说「不重要」的关系检查。
+- `relations[]` 全部由程序算出（on_top_of / faces / adjacent / visible_from / connects），可用来自检。
 
 ## 1. 读法（按这个顺序）
 
@@ -129,6 +147,11 @@ Unreal：
 | 颜色 | 与 HEX 一致 | 重设材质 |
 
 先修布局，再修外观。修完再读回一次。
+
+### 4.3 「场景对话」里的读回验收
+
+把 `readback.json` 导入「场景对话」（出 → 导入读回 JSON 对比），差的对象在俯视图上标成红点，每个红点三选一：**按意图修**（写进下一轮 `BRIEF.md` 的「修正要求」，请按意图位置重放）、**接受引擎版**（意图跟着引擎改并锁住，下轮不要再动它）、**不重要**。
+除位置 / 尺寸 / 朝向外，验收时还要对照 `BRIEF.md` 核三件事：出生点能否看见地标（`relations` 里有 `visible_from`）、主路是否从出生点一直到地标门前（`must_reach`）、每栋房子是否落在它该在的台地层上（`volumes[].terrace_level` / `level`）。
 
 ## 5. Draft：从文字生成 SID（本实验不用，供「生成后引导」流程）
 

@@ -1,0 +1,161 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain, polygonArea } from "../terrain.js";
+import { classifyStroke, strokeToPath, strokeToPolygon, simplify, simplifyTo, polylineLength } from "../strokes.js";
+import { villageSid, valleySid } from "./fixtures.js";
+
+// 确定性的「手绘」折线：从 a 到 b，200 点，叠加正弦抖动模拟手抖
+function wobblyLine(a, b, n = 200, amp = 1.2) {
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const x = a[0] + (b[0] - a[0]) * t + amp * Math.sin(t * 37) + 0.3 * Math.sin(t * 211);
+    const z = a[1] + (b[1] - a[1]) * t + amp * Math.cos(t * 29);
+    pts.push([x, z]);
+  }
+  return pts;
+}
+function circle(cx, cz, r, n = 60, gap = 0.5) {
+  const pts = [];
+  for (let i = 0; i < n; i++) { const a = (i / n) * Math.PI * 2; pts.push([cx + r * Math.cos(a), cz + r * Math.sin(a)]); }
+  // 末点回到起点附近但不重合（手绘不会精确闭合）
+  pts.push([pts[0][0], pts[0][1] + gap]);
+  return pts;
+}
+const spawnOf = (sid) => { const p = sid.markers.find((m) => m.id === "spawn").position; return [p[0], p[2]]; };
+const landmarkOf = (sid) => { const p = sid.volumes.find((v) => v.id === "landmark").position; return [p[0], p[2]]; };
+
+test("classifyStroke：tap（< 3 m）、line、loop（长 > 20 m 且首尾 < 8%）", () => {
+  assert(classifyStroke([[0, 0], [1, 1], [1.5, 0.5]]) === "tap", "短笔画是 tap");
+  assert(classifyStroke([[0, 0]]) === "tap", "单点是 tap");
+  assert(classifyStroke([[0, 0], [30, 0]]) === "line", "直线是 line");
+  assert(classifyStroke(circle(0, 0, 10)) === "loop", "半径 10 的圆是 loop");
+  // 小圈：长度 ≈ 12.6 m < 20 m → 不算 loop
+  assert(classifyStroke(circle(0, 0, 2)) === "line", "小圈不算 loop");
+  // 首尾离得远的长折线
+  assert(classifyStroke([[0, 0], [20, 0], [20, 20], [0, 20], [0, 8]]) === "line", "首尾 8 m / 68 m > 8% 不算 loop");
+});
+
+test("simplify：Douglas–Peucker 丢掉共线点，首尾保留", () => {
+  const pts = [[0, 0], [1, 0.01], [2, -0.01], [3, 0], [3, 3], [3, 6]];
+  const s = simplify(pts, 0.1);
+  assert(s.length === 3, "剩 3 个拐点，得到 " + s.length);
+  assert(s[0][0] === 0 && s[0][1] === 0 && s[2][0] === 3 && s[2][1] === 6, "首尾保留");
+  assert(simplify([[1, 2]], 1).length === 1 && simplify([], 1).length === 0, "退化输入");
+});
+
+test("200 点手绘折线：简化后 ≤ 12 点，首尾精确保留，长度接近原始", () => {
+  const raw = wobblyLine([-30, 50], [30, -40]);
+  const s = simplifyTo(raw, 12);
+  between(s.length, 2, 12, "点数");
+  assert(s[0][0] === raw[0][0] && s[0][1] === raw[0][1], "起点保留");
+  assert(s[s.length - 1][0] === raw[199][0] && s[s.length - 1][1] === raw[199][1], "终点保留");
+  const L0 = polylineLength(raw), L1 = polylineLength(s);
+  between(L1 / L0, 0.85, 1.0, "简化后长度比");
+  // 自适应：maxPoints 更大则点数更多或相等
+  assert(simplifyTo(raw, 24).length >= s.length, "更大上限保留更多点");
+});
+
+test("strokeToPath（villageSid）：起点 8 m 内吸附到 spawn 精确坐标，南→北 levels_crossed = [0,1,2,3]", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid, { res: 2 });
+  const spawn = spawnOf(sid), landmark = landmarkOf(sid);
+  // 从入口南边 2 m 处出发，一路向北到地标附近
+  const raw = wobblyLine([spawn[0] + 1, spawn[1] + 1.5], [landmark[0] + 2, landmark[1] + 3], 200, 0.8);
+  const r = strokeToPath(raw, { T, anchors: { spawn, landmark }, snap: 10, maxPoints: 12 });
+  assert(r.points.length <= 12, "≤ 12 点");
+  assert(r.facts.n_points === r.points.length, "n_points 一致");
+  assert(r.facts.start_snapped_to === "spawn", "起点吸附到 spawn，得到 " + r.facts.start_snapped_to);
+  assert(r.points[0][0] === spawn[0] && r.points[0][1] === spawn[1], "起点坐标精确等于 spawn");
+  assert(r.facts.end_snapped_to === "landmark", "终点吸附到 landmark，得到 " + r.facts.end_snapped_to);
+  assert(r.points[r.points.length - 1][0] === landmark[0] && r.points[r.points.length - 1][1] === landmark[1], "终点坐标精确等于 landmark");
+  assert(JSON.stringify(r.facts.levels_crossed) === "[0,1,2,3]", "层序列 " + JSON.stringify(r.facts.levels_crossed));
+  assert(r.facts.crosses_stream === false, "没有溪");
+  between(r.facts.max_slope, 0.3, 10, "经过台地边缘应有坡度 " + r.facts.max_slope);
+  between(r.facts.length_m, 80, 130, "长度");
+});
+
+test("strokeToPath：超出 snap 半径不吸附；吸附到路 / 溪，crosses_stream 判定", () => {
+  const sid = valleySid();
+  const T = buildTerrain(sid, { res: 2 });
+  const stream = sid.paths[0].points;
+  const spawn = spawnOf(sid);
+  // 从西岸横穿溪到东岸：起点离 spawn 很远 → null；终点停在溪上 → stream
+  const r = strokeToPath([[-40, 0], [-20, 1], [0.3, 0.2]], { T, anchors: { spawn, streamPoints: stream }, snap: 6 });
+  assert(r.facts.start_snapped_to === null, "起点不吸附 " + r.facts.start_snapped_to);
+  assert(r.facts.end_snapped_to === "stream", "终点吸附到溪 " + r.facts.end_snapped_to);
+  // 穿越：从西到东整条跨过溪流中线
+  const r2 = strokeToPath([[-40, 10], [40, 12]], { T, anchors: { streamPoints: stream }, snap: 0 });
+  assert(r2.facts.crosses_stream === true, "横穿溪流");
+  assert(r2.facts.start_snapped_to === null && r2.facts.end_snapped_to === null, "snap=0 不吸附");
+  // 吸附到路：路点列表当作折线，起点落到最近投影点
+  const path = [[0, 50], [0, 30], [10, 10]];
+  const r3 = strokeToPath([[3, 40], [20, 40]], { T, anchors: { pathPoints: path }, snap: 5 });
+  assert(r3.facts.start_snapped_to === "path", "吸附到路");
+  close(r3.points[0][0], 0, 1e-9, "投影到路上 x");
+  close(r3.points[0][1], 40, 1e-9, "投影到路上 z");
+  // 两种锚点都在范围内时取更近的
+  const r4 = strokeToPath([[1, 50], [20, 50]], { T, anchors: { spawn: [0, 54], pathPoints: path }, snap: 10 });
+  assert(r4.facts.start_snapped_to === "path", "更近的路优先 " + r4.facts.start_snapped_to);
+});
+
+test("strokeToPolygon：点数 ≤ 10，面积与 polygonArea 一致且接近圆面积，质心在圆心", () => {
+  const T = buildTerrain(villageSid(), { res: 2 });
+  const raw = circle(5, 20, 10, 60);
+  const g = strokeToPolygon(raw, { T, maxPoints: 10 });
+  between(g.polygon.length, 3, 10, "多边形点数");
+  close(g.area_m2, polygonArea(g.polygon), 0.011, "面积 = polygonArea");
+  between(g.area_m2, Math.PI * 100 * 0.8, Math.PI * 100 * 1.02, "面积接近 πr²");
+  close(g.centroid[0], 5, 1.0, "质心 x"); close(g.centroid[1], 20, 1.0, "质心 z");
+  // 圆周 z ∈ [10,30]，跨台地 0/1/2 的边界区域
+  assert(Array.isArray(g.levels_touched) && g.levels_touched.length >= 1, "有触及层号");
+  for (let i = 1; i < g.levels_touched.length; i++) assert(g.levels_touched[i] > g.levels_touched[i - 1], "升序唯一");
+  // 退化输入
+  const d = strokeToPolygon([[0, 0], [1, 1]], { T });
+  assert(d.area_m2 === 0 && d.polygon.length === 2, "两点退化");
+});
+
+test("strokeToPolygon：矩形手绘（含往返抖动）面积接近真值，levels_touched 单层", () => {
+  const T = buildTerrain(villageSid(), { res: 2 });
+  const t0 = T.terraces[0]; // 底层台地中心附近画一个 20×10 的矩形
+  const [cx, cz] = t0.centroid;
+  const rect = [];
+  const corners = [[cx - 10, cz - 5], [cx + 10, cz - 5], [cx + 10, cz + 5], [cx - 10, cz + 5]];
+  for (let k = 0; k < 4; k++) { const a = corners[k], b = corners[(k + 1) % 4]; for (let i = 0; i < 25; i++) { const t = i / 25; rect.push([a[0] + (b[0] - a[0]) * t + 0.2 * Math.sin(i), a[1] + (b[1] - a[1]) * t + 0.2 * Math.cos(i)]); } }
+  const g = strokeToPolygon(rect, { T, maxPoints: 10 });
+  between(g.area_m2, 180, 215, "面积 ≈ 200");
+  assert(g.polygon.length <= 10, "≤ 10 点");
+  assert(JSON.stringify(g.levels_touched) === "[0]", "只在底层 " + JSON.stringify(g.levels_touched));
+});
+
+test("确定性：同输入两次调用结果逐字节相同（纯函数）", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid, { res: 2 });
+  const anchors = { spawn: spawnOf(sid), landmark: landmarkOf(sid), pathPoints: [[0, 50], [5, 20], [0, -10]] };
+  const raw = wobblyLine([1, 55], [2, -38]);
+  const a = JSON.stringify(strokeToPath(raw, { T, anchors }));
+  const b = JSON.stringify(strokeToPath(raw, { T, anchors }));
+  assert(a === b, "strokeToPath 相同");
+  const c = JSON.stringify(strokeToPolygon(circle(0, 0, 15), { T }));
+  const d = JSON.stringify(strokeToPolygon(circle(0, 0, 15), { T }));
+  assert(c === d, "strokeToPolygon 相同");
+  assert(JSON.stringify(simplifyTo(raw, 12)) === JSON.stringify(simplifyTo(raw, 12)), "simplifyTo 相同");
+  // 输入不被修改
+  const copy = JSON.stringify(raw); strokeToPath(raw, { T, anchors }); assert(JSON.stringify(raw) === copy, "不修改输入");
+});
+
+test("性能：200 点笔画 strokeToPath + strokeToPolygon 各 20 次 < 1500 ms", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid, { res: 2 });
+  const anchors = { spawn: spawnOf(sid), landmark: landmarkOf(sid), streamPoints: valleySid().paths[0].points };
+  const raw = wobblyLine([0, 56], [0, -40]);
+  const ring = circle(0, 0, 20, 200);
+  const t0 = performance.now();
+  for (let i = 0; i < 20; i++) { strokeToPath(raw, { T, anchors }); strokeToPolygon(ring, { T }); }
+  const dt = performance.now() - t0;
+  assert(dt < 1500, "耗时 " + dt.toFixed(1) + " ms");
+});
+
+run();
+</script>

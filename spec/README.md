@@ -23,7 +23,16 @@
 有 Python 时：
 
 ```bash
-python -I -c "import json,jsonschema,sys; s=json.load(open('spec/sid.schema.json',encoding='utf-8')); d=json.load(open('spec/examples/village-square.sid.json',encoding='utf-8')); jsonschema.validate(d,s); print('ok')"
+python -X utf8 -c "import json,jsonschema,sys; s=json.load(open('spec/sid.schema.json',encoding='utf-8')); d=json.load(open('spec/examples/village-square.sid.json',encoding='utf-8')); jsonschema.validate(d,s); print('ok')"
 ```
 
 有 Node 时用 ajv（后续编辑器内置）。
+
+## v0.2 增补（「场景对话」正式版用到的字段）
+
+- `terrain.features[]`：`kind: plateau` 的台地可以用 `polygon`（俯视多边形）+ `level`（层号）+ `skirt`（边缘坡面宽）表达，`height = level × meta.layer_height_m`；高度场取各台地贡献的最大值，上层多边形落在下层之内就形成叠落。圆形 `center/radius` 仍然可用。
+- `meta.layer_height_m`（一层多少米，默认 3）、`meta.archetype`（地形原型名）、`meta.card`（AI 与人商定的结构卡）。
+- `volumes[] / paths[]`：`generated`（引擎按规则生成，重算会重放）、`locked`（人确认，不动）、`user_drawn`（人手画的路）、`terrace_level`。
+- `regions[]`：新增 `kind` 取值 `plaza`、`terrace`；`density` 上限 1.6；`terrace_level`、`user_set`。
+- `views[]`：新增 `kind: section`（侧剖面）。
+引擎如何生成与消费这些字段见 [medium/engine/SPEC.md](../medium/engine/SPEC.md)，引擎侧 AI 怎么读见 [PROTOCOL.md](PROTOCOL.md) 第 0 节。

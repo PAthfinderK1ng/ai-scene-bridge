@@ -19,3 +19,10 @@ dist/
 /sandbox/**/Intermediate/
 /sandbox/**/DerivedDataCache/
 /sandbox/**/Binaries/
+
+# Desktop build
+.venv/
+build/
+dist/
+*.spec
+__pycache__/

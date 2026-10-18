@@ -1,0 +1,283 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain } from "../terrain.js";
+import { analyze, lineOfSight, reachable, reachSet, unreachedTerraces, landmarkWalk, CHECK_ORDER, findActors } from "../relations.js";
+import { validate, boxCorners, obbOverlap } from "../validate.js";
+import { villageSid, valleySid } from "./fixtures.js";
+
+// 手工搭一个小村：villageSid（之字坡 4 层，台地 z 区间约 [20,42] / [−2,20] / [−24,−2] / [−46,−24]），
+// 地标在顶 (0,−35)，出生点在南边山脚 (0,54)，3 栋房 + 一条沿 x=0 直上的 main_trail。
+const house = (id, x, z, rot = 0, extra = {}) => Object.assign({ id, kind: "building", shape: "box", position: [x, 0, z], size: [6, 4, 5], rotation_y: rot, importance: "secondary", color_role: "wall" }, extra);
+function scene(opts = {}) {
+  const sid = villageSid();
+  sid.volumes.push(house("h1", -12, 31, 270), house("h2", -12, 23, 270), house("h3", 14, 9, 90));
+  const pts = opts.trail === null ? null : opts.trail || [[0, 54], [0, 40], [0, 20], [0, 0], [0, -20], [0, -35]];
+  if (pts) sid.paths.push({ id: "main_trail", kind: "trail", width: 2, points: pts, surface: "stone", label: "主路" });
+  return sid;
+}
+const checkMap = (res) => Object.fromEntries(res.checks.map((c) => [c.id, c]));
+const plain = (res) => JSON.stringify({ relations: res.relations, checks: res.checks.map((c) => ({ id: c.id, text: c.text, ok: c.ok, detail: c.detail, severity: c.severity, fixes: c.fixes.map((f) => f.label) })) });
+
+test("视线：出生点在山脚、地标在顶 → 看得见", () => {
+  const sid = scene();
+  const T = buildTerrain(sid);
+  const r = lineOfSight(T, sid.volumes, [0, 54], [0, -35], { eye: 1.7, targetHeight: 9 });
+  assert(r.visible === true && r.blockedBy === null, "应可见，得到 " + JSON.stringify(r));
+  // 站在二层台地的墙根下看不到顶：被地形挡
+  const r2 = lineOfSight(T, sid.volumes, [0, 0], [0, -35], { eye: 1.7, targetHeight: 0.5 });
+  assert(r2.visible === false && r2.blockedBy === "terrain", "墙根下应被地形挡，得到 " + JSON.stringify(r2));
+});
+
+test("视线：视线中间放 20 m 高体块 → 不可见且 blockedBy 是该体块", () => {
+  const sid = scene();
+  sid.volumes.push({ id: "blocker", kind: "blocker", shape: "box", position: [0, 0, 10], size: [12, 20, 12], rotation_y: 0 });
+  const T = buildTerrain(sid);
+  const r = lineOfSight(T, sid.volumes, [0, 54], [0, -35], { eye: 1.7, targetHeight: 9 });
+  assert(r.visible === false, "应被挡");
+  assert(r.blockedBy === "volume:blocker", "blockedBy 应为 volume:blocker，得到 " + r.blockedBy);
+  const res = analyze(sid, T);
+  const c = checkMap(res).spawn_sees_landmark;
+  assert(c.ok === false && c.detail.includes("blocker"), "检查项应为 false 并点名 blocker：" + c.detail);
+  assert(!res.relations.some((x) => x.type === "visible_from"), "被挡时不生成 visible_from");
+});
+
+test("analyze：完整小村全部检查通过，checks 顺序固定，relations 五类齐全", () => {
+  const sid = scene();
+  const T = buildTerrain(sid);
+  const res = analyze(sid, T);
+  assert(res.checks.map((c) => c.id).join(",") === CHECK_ORDER.join(","), "顺序：" + res.checks.map((c) => c.id).join(","));
+  for (const c of res.checks) assert(c.ok === true, `${c.id} 应通过：${c.detail}`);
+  for (const c of res.checks) { assert(typeof c.text === "string" && ["error", "warn"].includes(c.severity), "字段齐全"); for (const f of c.fixes) assert(typeof f.label === "string" && typeof f.patch === "function", "fix 结构"); }
+  assert(checkMap(res).spawn_sees_landmark.text === "入口 能看见 山顶寺", "文案：" + checkMap(res).spawn_sees_landmark.text);
+  assert(checkMap(res).landmark_on_top.text === "山顶寺 在 顶层台地", "文案");
+  const by = (t) => res.relations.filter((r) => r.type === t);
+  const onTop = Object.fromEntries(by("on_top_of").map((r) => [r.a, r.b]));
+  assert(onTop.landmark === "terrace_3" && onTop.h1 === "terrace_0" && onTop.h2 === "terrace_0" && onTop.h3 === "terrace_1", "on_top_of：" + JSON.stringify(onTop));
+  assert(by("adjacent").length === 1 && by("adjacent")[0].a === "h1" && by("adjacent")[0].b === "h2", "h1/h2 相距 8 m 应 adjacent");
+  assert(by("faces").length === 3 && by("faces").every((r) => r.b === "main_trail"), "三栋房都朝最近的主路：" + JSON.stringify(by("faces")));
+  assert(by("visible_from").length === 1 && by("visible_from")[0].a === "landmark" && by("visible_from")[0].b === "spawn", "visible_from");
+  assert(by("connects").map((r) => r.b).join(",") === "terrace_0,terrace_1,terrace_2,terrace_3", "connects 按高度升序：" + by("connects").map((r) => r.b).join(","));
+  assert(res.relations.every((r) => r.generated === true && typeof r.a === "string" && typeof r.b === "string"), "关系结构");
+});
+
+test("landmark_on_top：地标挪到底层 → false；fix「挪到顶层」后 → true", () => {
+  const sid = scene();
+  const T = buildTerrain(sid);
+  const t0 = T.terraces[0];
+  sid.volumes[0].position = [t0.centroid[0], 0, t0.centroid[1]];
+  let c = checkMap(analyze(sid, T)).landmark_on_top;
+  assert(c.ok === false && c.detail.includes("terrace_0"), "应为 false：" + c.detail);
+  const fix = c.fixes.find((f) => f.label === "挪到顶层");
+  assert(fix, "有「挪到顶层」");
+  fix.patch(sid);
+  const lm = sid.volumes[0];
+  assert(T.terraceAt(lm.position[0], lm.position[2]).id === "terrace_3", "地标现在在顶层台地");
+  close(lm.position[1], 9, 0.6, "position.y 贴地到 9 m");
+  c = checkMap(analyze(sid, T)).landmark_on_top;
+  assert(c.ok === true, "修复后应通过：" + c.detail);
+});
+
+test("houses_no_overlap：两栋重叠的房 → false，fix 删掉 generated 的那栋", () => {
+  const sid = scene();
+  sid.volumes.push(house("h4", -12, 29, 0, { generated: true }));
+  const T = buildTerrain(sid);
+  let c = checkMap(analyze(sid, T)).houses_no_overlap;
+  assert(c.ok === false && c.severity === "error", "应为 false");
+  assert(c.detail.includes("h1") && c.detail.includes("h4"), "detail 点名 h1 与 h4：" + c.detail);
+  assert(c.fixes.length === 1 && c.fixes[0].label === "让 AI 重排", "fix 是让 AI 重排");
+  c.fixes[0].patch(sid);
+  assert(!sid.volumes.some((v) => v.id === "h4") && sid.volumes.some((v) => v.id === "h1"), "generated 的 h4 被删，h1 保留");
+  assert(sid.meta.relayout_requests.includes("houses_no_overlap"), "记下重排请求");
+  c = checkMap(analyze(sid, T)).houses_no_overlap;
+  assert(c.ok === true && c.fixes.length === 0, "修复后通过且无 fix");
+  // 旋转 45° 的 OBB 相切不算重叠，错开一点才算
+  assert(obbOverlap(boxCorners([0, 0, 0], [6, 4, 5], 45), boxCorners([3, 0, 3], [6, 4, 5], 45)) === true, "斜放相交");
+  assert(obbOverlap(boxCorners([0, 0, 0], [6, 4, 5], 0), boxCorners([6, 0, 0], [6, 4, 5], 0)) === false, "正好相切不算");
+});
+
+test("reachable：无路时台地墙坡度 > maxSlope → false；沿路 → true；溪不是走廊", () => {
+  const sid = scene({ trail: null });
+  const T = buildTerrain(sid);
+  assert(reachable(T, [], [0, 54], [0, -35]) === false, "无路爬不上三层台地");
+  assert(reachable(T, [], [0, 54], [0, 30]) === true, "同一层（底层）走得到");
+  const trail = { id: "main_trail", kind: "trail", width: 2, points: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -20], [0, -35]] };
+  assert(reachable(T, [trail], [0, 54], [0, -35]) === true, "沿主路可达");
+  assert(reachable(T, [trail], [0, 54], [-10, -35], { maxSlope: 0.7 }) === true, "上到顶后在台地上走到旁边");
+  assert(reachable(T, [trail], [0, 54], [0, -35], { maxSlope: 2 }) === true, "maxSlope 很大时无所谓");
+  assert(reachable(T, [], [0, 54], [0, -35], { maxSlope: 2 }) === true, "坡度上限放到 2 时无路也能爬");
+  const river = { id: "stream", kind: "river", width: 4, points: [[0, 54], [0, -35]] };
+  assert(reachable(T, [river], [0, 54], [0, -35]) === false, "溪流不算走廊");
+});
+
+test("houses_clear_of_paths：房子压在主路上 → false，并点名房子", () => {
+  const sid = scene();
+  sid.volumes.push(house("h5", 1.5, 30, 0, { generated: true }));
+  const T = buildTerrain(sid);
+  const res = analyze(sid, T);
+  const c = checkMap(res).houses_clear_of_paths;
+  assert(c.ok === false && c.detail.includes("h5") && c.detail.includes("main_trail"), "应为 false：" + c.detail);
+  assert(!c.detail.includes("h1"), "h1 距路 12 m 不应被点名");
+  c.fixes[0].patch(sid);
+  assert(!sid.volumes.some((v) => v.id === "h5"), "fix 删掉压路的 generated 房");
+  assert(checkMap(analyze(sid, T)).houses_clear_of_paths.ok === true, "修复后通过");
+  // 房子底面斜着伸进路面（中心距勉强够、底面不够）也算压路
+  const sid2 = scene();
+  sid2.volumes.push(house("h6", 4.2, 30, 45));
+  const c2 = checkMap(analyze(sid2, buildTerrain(sid2))).houses_clear_of_paths;
+  assert(c2.ok === false && c2.detail.includes("h6"), "斜放伸进路面：" + c2.detail);
+});
+
+test("trail_reaches_landmark：主路半途而止 → false；fix「把路接到地标」后 → true", () => {
+  const sid = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -10]] });
+  const T = buildTerrain(sid);
+  let c = checkMap(analyze(sid, T)).trail_reaches_landmark;
+  assert(c.ok === false && c.detail.includes("25"), "终点距地标 25 m：" + c.detail);
+  c.fixes.find((f) => f.label === "把路接到地标").patch(sid);
+  const last = sid.paths[0].points[sid.paths[0].points.length - 1];
+  assert(last[0] === 0 && last[1] === -35, "主路最后一点改为地标位置：" + last);
+  c = checkMap(analyze(sid, T)).trail_reaches_landmark;
+  assert(c.ok === true, "修复后应通过：" + c.detail);
+});
+
+test("terraces_reachable：主路只到二层 → 三、四层不可达；fix「补一段支路」后全部可达", () => {
+  const sid = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 10]] });
+  const T = buildTerrain(sid);
+  let c = checkMap(analyze(sid, T)).terraces_reachable;
+  assert(c.ok === false && c.detail.includes("terrace_2") && c.detail.includes("terrace_3") && !c.detail.includes("terrace_1"), "三、四层应失败：" + c.detail);
+  c.fixes.find((f) => f.label === "补一段支路").patch(sid);
+  const spurs = sid.paths.filter((p) => p.id.startsWith("spur_"));
+  assert(spurs.length === 2 && spurs.every((p) => p.kind === "trail" && p.points.length === 2 && p.generated), "补了两条支路：" + spurs.map((p) => p.id));
+  c = checkMap(analyze(sid, T)).terraces_reachable;
+  assert(c.ok === true, "补路后全部可达：" + c.detail);
+  // 完全没有路：每层都失败，严重度 warn
+  const bare = scene({ trail: null });
+  const cb = checkMap(analyze(bare, T)).terraces_reachable;
+  assert(cb.ok === false && cb.severity === "warn" && cb.detail.split("、").length === 4, "无路时四层都失败：" + cb.detail);
+});
+
+test("fix「入口挪到路口」：被体块挡住时把出生点沿主路前移到看得见的位置", () => {
+  const sid = scene();
+  sid.volumes.push({ id: "blocker", kind: "blocker", shape: "box", position: [0, 0, 10], size: [12, 20, 12], rotation_y: 0 });
+  const T = buildTerrain(sid);
+  let c = checkMap(analyze(sid, T)).spawn_sees_landmark;
+  assert(c.ok === false, "先被挡");
+  c.fixes.find((f) => f.label === "入口挪到路口").patch(sid);
+  const sp = sid.markers.find((m) => m.kind === "player_spawn");
+  assert(sp.position[2] < 4, "出生点应越过体块：z=" + sp.position[2]);
+  assert(T.terraceAt(sp.position[0], sp.position[2]) !== null, "落在台地上");
+  c = checkMap(analyze(sid, T)).spawn_sees_landmark;
+  assert(c.ok === true, "挪后应看得见：" + c.detail);
+  // 「地标再高一层」：高度 +layer
+  const sid2 = scene();
+  checkMap(analyze(sid2, T)).spawn_sees_landmark.fixes.find((f) => f.label === "地标再高一层").patch(sid2);
+  close(sid2.volumes[0].size[1], 12, 1e-9, "9 + 3");
+  // 「不重要」：写进 meta.ignored_checks，再分析时 ignored = true 但 ok 仍按事实
+  const sid3 = scene(); sid3.volumes.push({ id: "blocker", kind: "blocker", shape: "box", position: [0, 0, 10], size: [12, 20, 12], rotation_y: 0 });
+  checkMap(analyze(sid3, T)).spawn_sees_landmark.fixes.find((f) => f.label === "不重要").patch(sid3);
+  const c3 = checkMap(analyze(sid3, buildTerrain(sid3))).spawn_sees_landmark;
+  assert(c3.ignored === true && c3.ok === false && c3.detail.startsWith("已标记不重要"), "ignored 标记：" + JSON.stringify(c3.detail));
+});
+
+test("溪谷样例：地标在东坡顶层；只有溪流时从入口走不到地标", () => {
+  const sid = valleySid();
+  const T = buildTerrain(sid);
+  const { landmark, spawn } = findActors(sid);
+  const res = analyze(sid, T);
+  const cm = checkMap(res);
+  assert(cm.landmark_on_top.ok === true, "水车在顶层：" + cm.landmark_on_top.detail);
+  assert(cm.trail_reaches_landmark.ok === false && cm.trail_reaches_landmark.detail.includes("主路"), "没有主路：" + cm.trail_reaches_landmark.detail);
+  assert(reachable(T, sid.paths, [spawn.position[0], spawn.position[2]], [landmark.position[0], landmark.position[2]]) === false, "溪不是路，爬不上两层");
+  assert(res.relations.some((r) => r.type === "on_top_of" && r.a === "landmark" && r.b === "terrace_e_2"), "on_top_of terrace_e_2");
+});
+
+test("确定性：同参数两次 analyze / lineOfSight / reachable 结果逐字节相同", () => {
+  const a = scene(), b = scene();
+  a.volumes.push(house("h4", -12, 29)); b.volumes.push(house("h4", -12, 29));
+  const Ta = buildTerrain(a), Tb = buildTerrain(b);
+  assert(plain(analyze(a, Ta)) === plain(analyze(b, Tb)), "analyze 相同");
+  assert(plain(analyze(a, Ta)) === plain(analyze(a, Ta)), "同一对象重复调用相同（analyze 不改 sid）");
+  assert(JSON.stringify(lineOfSight(Ta, a.volumes, [3, 50], [-5, -30], { targetHeight: 9 })) === JSON.stringify(lineOfSight(Tb, b.volumes, [3, 50], [-5, -30], { targetHeight: 9 })), "lineOfSight 相同");
+  assert(reachable(Ta, a.paths, [0, 54], [10, -30]) === reachable(Tb, b.paths, [0, 54], [10, -30]), "reachable 相同");
+  const before = JSON.stringify(a); analyze(a, Ta); assert(JSON.stringify(a) === before, "analyze 不修改 sid");
+});
+
+test("validate：polygon 台地合法；重复 id / 少于 3 点 / 重叠 / 未贴地 各有消息", () => {
+  const sid = scene();
+  const msgs = validate(sid);
+  assert(!msgs.some((m) => m.level === "error"), "正常样例无 error：" + JSON.stringify(msgs.filter((m) => m.level === "error")));
+  assert(!msgs.some((m) => m.msg.includes("center") || m.msg.includes("radius")), "有 polygon 的台地不要求 center/radius");
+  const T = buildTerrain(sid); // 先建地形，再塞坏数据（terrain.js 不校验缺 center 的 hill）
+  sid.volumes.push(house("h1", 20, 31), house("h7", -12, 30));
+  sid.regions.push({ id: "bad_region", kind: "other", polygon: [[0, 0], [1, 1]] });
+  sid.terrain.features.push({ id: "lonely_hill", kind: "hill", height: 3 });
+  const m2 = validate(sid, T);
+  const has = (lv, s) => m2.some((m) => m.level === lv && m.msg.includes(s));
+  assert(has("error", "重复"), "重复 id");
+  assert(has("error", "少于 3 个点"), "多边形点数");
+  assert(has("error", "center"), "无 polygon 的 hill 要 center");
+  assert(has("warn", "h1 与 h7 重叠") || has("warn", "h7 与 h1 重叠"), "重叠 warn：" + JSON.stringify(m2.map((m) => m.msg)));
+  assert(has("warn", "landmark 未贴地"), "地标 y=0 却在 9 m 台地上 → 未贴地");
+  // faces 一致性：h1 rotation 270 朝东，对着 x=0 的主路 → 不警告；改成朝北则警告
+  const sid3 = scene(); sid3.relations = analyze(sid3).relations;
+  assert(!validate(sid3).some((m) => m.msg.includes("应朝向")), "朝向正确不警告：" + JSON.stringify(validate(sid3).filter((m) => m.msg.includes("朝向"))));
+  sid3.volumes.find((v) => v.id === "h1").rotation_y = 0;
+  assert(validate(sid3).some((m) => m.msg.includes("h1 应朝向 main_trail")), "朝向偏了要警告");
+});
+
+test("性能：32 栋房的村子 analyze 单次 < 1500 ms", () => {
+  const sid = scene();
+  sid.volumes = sid.volumes.filter((v) => !/^h\d$/.test(v.id)); // 只留地标，房子按网格重铺
+  const T = buildTerrain(sid);
+  let n = 0;
+  for (const t of T.terraces) for (const x of [-20, -12, 12, 20]) for (const dz of [-5, 5]) sid.volumes.push(house("house_" + t.level + "_" + n++, x, t.centroid[1] + dz, x < 0 ? 270 : 90, { generated: true }));
+  assert(n === 32, "32 栋");
+  const t0 = performance.now();
+  const res = analyze(sid, T);
+  const dt = performance.now() - t0;
+  assert(res.checks.length === 6 && res.relations.length > 40, "有结果：" + res.relations.length);
+  assert(dt < 1500, `耗时 ${dt.toFixed(1)} ms`);
+  assert(checkMap(res).houses_no_overlap.ok === true && checkMap(res).houses_clear_of_paths.ok === true, "网格摆放不重叠不压路：" + checkMap(res).houses_no_overlap.detail + " / " + checkMap(res).houses_clear_of_paths.detail);
+});
+
+test("trail_reaches_landmark：地标贴台地边缘、主路终点在门前（下一层坡脚）→ 地标底面视为可走，判定为可达", () => {
+  // walkPolys 语义：无路时爬不上三层台地；给一条 6 m 宽的「可走带」多边形（例如地标底面）后就能到
+  const bare = scene({ trail: null });
+  const Tb = buildTerrain(bare);
+  const strip = [[-3, 54], [3, 54], [3, -35], [-3, -35]];
+  assert(reachSet(Tb, [], [0, 54]).at(0, -35) === false, "无路、无可走带：不可达");
+  assert(reachSet(Tb, [], [0, 54], { walkPolys: [strip] }).at(0, -35) === true, "可走带内的格视为走廊：可达");
+  assert(reachSet(Tb, [], [0, 54], { walkPolys: [strip] }).at(-10, -35) === true, "到顶后在台地上走到旁边");
+  assert(landmarkWalk(bare.volumes[0])[0].length === 4 && landmarkWalk(null).length === 0, "landmarkWalk：地标底面外扩 1 m 的四边形");
+  // 端到端：顶层台地北缘在 z≈−24；地标中心放在 z=−27（距边 3 m），门前点 (0,−22) 已在第 3 层台地外，仍判为可达
+  const sid = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -22]] });
+  sid.volumes[0].position = [0, 0, -27];
+  const T = buildTerrain(sid);
+  assert(T.terraceAt(0, -27).id === "terrace_3" && (T.terraceAt(0, -22) || {}).id !== "terrace_3", "门前点与地标中心不在同一台地（测试前提）");
+  const c = checkMap(analyze(sid, T)).trail_reaches_landmark;
+  assert(c.ok === true, "应判为可达：" + c.detail);
+  assert(/距地标 [45](\.\d+)? m/.test(c.detail), "终点距地标 5 m：" + c.detail);
+  // 终点离地标 ≥ 6 m 仍然不算
+  const far = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -16]] }); far.volumes[0].position = [0, 0, -27];
+  assert(checkMap(analyze(far, buildTerrain(far))).trail_reaches_landmark.ok === false, "11 m 外不算到达");
+});
+
+test("unreachedTerraces：主路只到二层 → 列出三、四层及目标点；补路后为空；无出生点无主路 → origin null", () => {
+  const sid = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 10]] });
+  const T = buildTerrain(sid);
+  const u = unreachedTerraces(sid, T);
+  assert(u.origin && u.origin[0] === 0 && u.origin[1] === 54, "起点 = 出生点");
+  assert(u.failing.map((f) => f.t.id).join(",") === "terrace_2,terrace_3", "失败台地：" + u.failing.map((f) => f.t.id));
+  for (const f of u.failing) { assert(Array.isArray(f.target) && f.nearPt && typeof f.why === "string", "字段"); assert(T.terraceAt(f.target[0], f.target[1]).id === f.t.id, "目标点在台地内"); }
+  checkMap(analyze(sid, T)).terraces_reachable.fixes.find((f) => f.label === "补一段支路").patch(sid);
+  assert(unreachedTerraces(sid, T).failing.length === 0, "补路后全部可达");
+  const empty = scene({ trail: null }); empty.markers = [];
+  assert(unreachedTerraces(empty, buildTerrain(empty)).origin === null, "无起点");
+  // 与 analyze 的 terraces_reachable 口径一致
+  const sid2 = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 10]] });
+  const detail = checkMap(analyze(sid2, T)).terraces_reachable.detail;
+  for (const f of unreachedTerraces(sid2, T).failing) assert(detail.includes(f.t.id), "analyze 点名 " + f.t.id);
+});
+
+run();
+</script>

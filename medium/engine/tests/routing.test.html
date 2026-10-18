@@ -1,0 +1,202 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain, pointInPolygon, distToPolygon, DEFAULT_BOUNDS } from "../terrain.js";
+import { routeTrail, zigzagTrail, routeStream, pathFacts, simplify } from "../routing.js";
+import { villageSid, valleySid, baseSid } from "./fixtures.js";
+
+const same = (a, b) => a[0] === b[0] && a[1] === b[1];
+function village() { const sid = villageSid(); return { sid, T: buildTerrain(sid, { res: 2 }), from: sid._archetype.entries.S, to: sid._archetype.spots.top }; }
+
+test("A*：出生点到山顶地标可达，首尾精确，≤ 24 点，坡度 ≤ 0.75，爬升 ≈ 9", () => {
+  const { T, from, to } = village();
+  const r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2 });
+  assert(r.points, "应可达：" + (r.facts && r.facts.reason));
+  assert(same(r.points[0], from) && same(r.points[r.points.length - 1], to), "首尾精确");
+  between(r.points.length, 2, 24, "点数");
+  assert(r.facts.max_slope <= 0.75, "max_slope " + r.facts.max_slope);
+  close(r.facts.climb_m, 9, 1, "爬升");
+  assert(r.facts.steps_estimate > 40, "台阶估算 " + r.facts.steps_estimate);
+  for (const [x, z] of r.points) { between(x, -60, 60, "x"); between(z, -60, 60, "z"); }
+  // 整体向北（入口在南、地标在北）
+  assert(r.facts.length_m >= Math.hypot(to[0] - from[0], to[1] - from[1]), "长度 ≥ 直线距离");
+});
+
+test("A*：未简化的格点路径每一步坡度都 ≤ maxSlope（可走判定与 facts 同口径）", () => {
+  const { T, from, to } = village();
+  const r = routeTrail(T, from, to, { maxSlope: 0.7 });
+  assert(r.raw && r.raw.length > 20, "有原始格点路径");
+  for (let i = 1; i < r.raw.length - 1; i++) {
+    const a = r.raw[i], b = r.raw[i + 1];
+    if (i + 1 === r.raw.length - 1) break; // 最后一步连到精确终点，不是格点
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const s = Math.abs(T.heightAt(b[0], b[1]) - T.heightAt(a[0], a[1])) / L;
+    assert(s <= 0.7 + 1e-9, `第 ${i} 步坡度 ${s}`);
+  }
+  assert(r.facts.expanded > 0 && r.facts.raw_points === r.raw.length, "附加事实");
+});
+
+test("A*：终点在禁行区内 → points null 且有 reason", () => {
+  const { T, from, to } = village();
+  const box = [[to[0] - 5, to[1] - 5], [to[0] + 5, to[1] - 5], [to[0] + 5, to[1] + 5], [to[0] - 5, to[1] + 5]];
+  const r = routeTrail(T, from, to, { avoidPolys: [box] });
+  assert(r.points === null, "不可达");
+  assert(typeof r.facts.reason === "string" && r.facts.reason.length > 0, "reason");
+  assert(r.facts.length_m === 0 && Array.isArray(r.facts.segments), "facts 结构完整");
+});
+
+test("A*：避开禁行多边形（带缺口的墙），路径绕开且不穿墙", () => {
+  const { T, from, to } = village();
+  // 在 z∈[30,34] 筑两段墙，中间 x∈(-5,5) 留缺口
+  const wallW = [[-60, 30], [-5, 30], [-5, 34], [-60, 34]], wallE = [[5, 30], [60, 30], [60, 34], [5, 34]];
+  const r = routeTrail(T, from, to, { avoidPolys: [wallW, wallE] });
+  assert(r.points, "应可达：" + (r.facts && r.facts.reason));
+  const prof = T.sampleProfile(r.points, 0.5);
+  for (const s of prof) for (const poly of [wallW, wallE]) {
+    if (pointInPolygon([s.x, s.z], poly)) assert(distToPolygon([s.x, s.z], poly) < 0.6, `穿墙 (${s.x.toFixed(1)}, ${s.z.toFixed(1)})`);
+  }
+  const through = prof.filter((s) => s.z > 30 && s.z < 34);
+  assert(through.length > 0 && through.every((s) => Math.abs(s.x) < 5.6), "从缺口穿过");
+  // 完全封死 → 不可达
+  const wallAll = [[-60, 30], [60, 30], [60, 34], [-60, 34]];
+  const r2 = routeTrail(T, from, to, { avoidPolys: [wallAll] });
+  assert(r2.points === null && /不可达/.test(r2.facts.reason), "封死后不可达：" + r2.facts.reason);
+});
+
+test("A*：坡度上限极小 → 不可达；from === to → 退化为两点", () => {
+  const { T, from, to } = village();
+  const r = routeTrail(T, from, to, { maxSlope: 0.05 });
+  assert(r.points === null, "0.05 坡度上限应不可达（要爬 9 m）");
+  const r2 = routeTrail(T, from, from);
+  assert(r2.points && r2.points.length === 2 && r2.facts.length_m === 0, "退化");
+});
+
+test("之字：folds=3 → facts.folds === 3（或超坡加折后 ≥ 3），点数 = folds + 2，首尾精确", () => {
+  const { T, from, to } = village();
+  const r = zigzagTrail(T, from, to, { folds: 3, maxSlope: 0.7 });
+  assert(r.facts.folds >= 3, "folds " + r.facts.folds);
+  if (r.facts.folds_added === 0) assert(r.facts.folds === 3, "未加折时恰好 3 折，得到 " + r.facts.folds);
+  assert(r.points.length === 3 + r.facts.folds_added + 2, "点数 " + r.points.length);
+  assert(same(r.points[0], from) && same(r.points[r.points.length - 1], to), "首尾精确");
+  assert(r.facts.max_slope <= 0.7 || r.facts.folds_added >= 12, "坡度达标或加折到上限");
+  for (const [x, z] of r.points) { between(x, -59, 59, "x"); between(z, -59, 59, "z"); }
+  // 折点交替在主方向两侧
+  const signs = r.points.slice(1, -1).map((p) => Math.sign(p[0] - from[0]));
+  for (let i = 1; i < signs.length; i++) assert(signs[i] === -signs[i - 1], "左右交替 " + signs);
+  // 折点落在台地内（摆幅只占台地宽度的 0.6）
+  for (const p of r.points.slice(1, -1)) assert(T.terraceAt(p[0], p[1]) !== null || T.heightAt(p[0], p[1]) < 0.3, "折点在台地上或山脚 " + p);
+});
+
+test("之字：folds=0 且坡度允许 → 两点直线；比 A* 更短", () => {
+  const { T, from, to } = village();
+  const r = zigzagTrail(T, from, to, { folds: 0, maxSlope: 0.7 });
+  assert(r.points.length === 2 && r.facts.folds === 0 && r.facts.folds_added === 0, "直线");
+  close(r.facts.length_m, Math.hypot(to[0] - from[0], to[1] - from[1]), 0.01, "长度");
+  close(r.facts.climb_m, 9, 1, "爬升");
+});
+
+test("之字：陡峭山丘上直上超坡 → 自动加折直到达标", () => {
+  const sid = baseSid("陡丘");
+  sid.terrain.features = [{ id: "hill", kind: "hill", center: [0, 0, 0], radius: 24, height: 30 }];
+  const T = buildTerrain(sid, { res: 2 });
+  const r = zigzagTrail(T, [0, 30], [0, 0], { folds: 0, maxSlope: 0.7 });
+  assert(r.facts.folds_added >= 1, "应自动加折，加了 " + r.facts.folds_added);
+  assert(r.facts.max_slope <= 0.7 || r.facts.folds_added >= 12, "最终坡度 " + r.facts.max_slope);
+  assert(r.facts.folds === r.facts.folds_added, "折返数与折点数一致");
+});
+
+test("溪流：valleySid 上沿谷线自北向南，|x| < 10，起终点在 bounds 南北边缘", () => {
+  const sid = valleySid();
+  const T = buildTerrain(sid, { res: 2 });
+  const s = routeStream(T, sid.bounds);
+  assert(s.length >= 2 && s.length <= 32, "点数 " + s.length);
+  assert(s[0][1] === -60 && s[s.length - 1][1] === 60, "首尾在南北边缘");
+  for (const [x, z] of s) { assert(Math.abs(x) < 10, "x=" + x); between(z, -60, 60, "z"); }
+  for (let i = 1; i < s.length; i++) assert(s[i][1] >= s[i - 1][1], "z 单调（自北向南）");
+  // 溪底应该低：中段高度接近 0
+  const mid = s[Math.floor(s.length / 2)];
+  close(T.heightAt(mid[0], mid[1]), 0, 0.6, "溪底高度");
+  const s2 = routeStream(T);
+  assert(JSON.stringify(s2) === JSON.stringify(s), "缺省 bounds 等价");
+});
+
+test("pathFacts：已知折线的长度、爬升/下降、折返、台阶", () => {
+  const sid = baseSid("平地");
+  sid.terrain.features = [{ id: "p", kind: "plateau", level: 1, polygon: [[-40, -40], [40, -40], [40, -10], [-40, -10]] }];
+  const T = buildTerrain(sid, { res: 2 });
+  const pts = [[0, 40], [10, 20], [-10, 0], [10, -20], [0, -30]];
+  const f = pathFacts(pts, T);
+  const L = Math.hypot(10, 20) + Math.hypot(20, 20) * 2 + Math.hypot(10, 10);
+  close(f.length_m, L, 0.02, "长度");
+  assert(f.folds === 3, "折返 3，得到 " + f.folds);
+  close(f.climb_m, 3, 0.3, "爬一层");
+  assert(f.descent_m < 0.3, "几乎不下降 " + f.descent_m);
+  assert(f.steps_estimate === Math.round(f.climb_m / 0.17) || Math.abs(f.steps_estimate - f.climb_m / 0.17) < 1, "台阶 " + f.steps_estimate);
+  assert(f.segments.length === 4 && f.segments[0].length === r(Math.hypot(10, 20)), "逐段");
+  assert(f.max_slope >= 0 && f.max_slope <= 1, "坡度范围");
+  const empty = pathFacts(null, T);
+  assert(empty.length_m === 0 && empty.segments.length === 0, "空输入");
+  function r(v) { return Math.round(v * 100) / 100; }
+});
+
+test("simplify：保留首尾、去掉共线点、容差越大点越少", () => {
+  const pts = [[0, 0], [1, 0.1], [2, -0.1], [3, 0.05], [4, 0], [4, 5], [8, 5]];
+  const s1 = simplify(pts, 0.2);
+  assert(s1[0] === pts[0] && s1[s1.length - 1] === pts[pts.length - 1], "首尾");
+  assert(s1.length === 4, "去掉抖动点 → [0,0],[4,0],[4,5],[8,5]，得到 " + JSON.stringify(s1));
+  const s2 = simplify(pts, 10);
+  assert(s2.length === 2, "大容差只剩首尾");
+  assert(simplify([[1, 1]], 1).length === 1 && simplify([], 1).length === 0, "退化输入");
+  // segOk 约束：禁止某段时强制保留中间点
+  const s3 = simplify(pts, 10, (a, b) => !(a === pts[0] && b === pts[pts.length - 1]));
+  assert(s3.length >= 3, "被禁止的段会再分");
+});
+
+test("确定性：同参数两次结果逐字节相同；不同 seed 结果仍合法", () => {
+  const { T, from, to } = village();
+  const a = JSON.stringify(routeTrail(T, from, to, { seed: 11, avoidPolys: [[[10, 10], [20, 10], [20, 20], [10, 20]]] }));
+  const b = JSON.stringify(routeTrail(T, from, to, { seed: 11, avoidPolys: [[[10, 10], [20, 10], [20, 20], [10, 20]]] }));
+  assert(a === b, "routeTrail 相同");
+  const c = routeTrail(T, from, to, { seed: 12 });
+  assert(c.points && same(c.points[0], from) && same(c.points[c.points.length - 1], to) && c.facts.max_slope <= 0.75, "另一 seed 合法");
+  assert(JSON.stringify(zigzagTrail(T, from, to, { folds: 2 })) === JSON.stringify(zigzagTrail(T, from, to, { folds: 2 })), "zigzag 相同");
+  const V = buildTerrain(valleySid());
+  assert(JSON.stringify(routeStream(V)) === JSON.stringify(routeStream(V)), "stream 相同");
+  assert(JSON.stringify(pathFacts(c.points, T)) === JSON.stringify(pathFacts(c.points, T)), "facts 相同");
+});
+
+test("性能：61×61 格点 A* 单次 < 1500 ms", () => {
+  const { T, from, to } = village();
+  const t0 = performance.now();
+  const r = routeTrail(T, from, to, { res: 2, seed: 1 });
+  const dt = performance.now() - t0;
+  assert(r.points, "可达");
+  assert(dt < 1500, `耗时 ${dt.toFixed(1)} ms`);
+  const t1 = performance.now();
+  for (let i = 0; i < 5; i++) zigzagTrail(T, from, to, { folds: 3 });
+  routeStream(buildTerrain(valleySid()));
+  assert(performance.now() - t1 < 1500, "其余函数也很快");
+});
+
+test("局部坡度：pathFacts.max_local_slope 按 sampleProfile 1 m 口径，≥ 段坡度；台地墙上的直线段局部坡度 > 0.7 且 steep_length_m > 0", () => {
+  const { sid, T, from, to } = village();
+  const r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2 });
+  assert(r.facts.max_local_slope >= r.facts.max_slope - 1e-9, `局部坡度 ${r.facts.max_local_slope} 应 ≥ 段坡度 ${r.facts.max_slope}`);
+  // 独立按 sampleProfile 复算，必须一致
+  const prof = T.sampleProfile(r.points, 1);
+  let mx = 0, steep = 0;
+  for (let i = 1; i < prof.length; i++) { const dd = prof[i].d - prof[i - 1].d; if (dd < 1e-9) continue; const s = Math.abs(prof[i].h - prof[i - 1].h) / dd; mx = Math.max(mx, s); if (s > 0.7) steep += dd; }
+  close(r.facts.max_local_slope, Math.round(mx * 100) / 100, 1e-9, "max_local_slope 与独立复算一致");
+  close(r.facts.steep_length_m, Math.round(steep * 100) / 100, 1e-9, "steep_length_m 与独立复算一致");
+  // 直接跨过第 1 层台地墙（z≈20 处 3 m 台阶 / 2.4 m 坡裙）的 12 m 直线：段坡度 0.25 但局部坡度 ≈ 1.25
+  const wall = pathFacts([[0, 26], [0, 14]], T);
+  assert(wall.max_slope < 0.7, "2 m 格点口径看不到墙：" + wall.max_slope);
+  assert(wall.max_local_slope > 0.7 && wall.steep_length_m > 0, `局部口径看得到墙：${wall.max_local_slope} / ${wall.steep_length_m} m`);
+  // 平地：两者都为 0；没有 T：为 0
+  const flat = pathFacts([[0, 50], [20, 50]], T);
+  assert(flat.max_local_slope === 0 && flat.steep_length_m === 0, "山脚平地局部坡度 0");
+  assert(pathFacts([[0, 0], [10, 0]]).max_local_slope === 0, "无 T 时为 0");
+});
+
+run();
+</script>

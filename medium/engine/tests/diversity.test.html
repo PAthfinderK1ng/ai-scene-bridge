@@ -1,0 +1,126 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { signature, distance, distinctEnough, axisOverrides, AXES, bearingDeg, bearingDiff } from "../diversity.js";
+import { paletteShift } from "../color.js";
+import { villageSid, valleySid } from "./fixtures.js";
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+/** 给 sid 塞 n 栋假房子（只为计数，不关心坐标是否合理） */
+function withHouses(sid, n) {
+  const s = clone(sid);
+  for (let i = 0; i < n; i++) s.volumes.push({ id: "house_0_" + i, kind: "building", shape: "box", position: [i * 8 - 40, 0, 30], size: [6, 4, 5], rotation_y: 0, importance: "secondary", color_role: "wall", generated: true });
+  return s;
+}
+
+test("signature(villageSid)：archetype 为 slope_zigzag、levels === 4、地标在顶、入口方位朝南、调色板 Lab 合理", () => {
+  const sid = villageSid();
+  const t0 = performance.now();
+  const sig = signature(sid);
+  assert(performance.now() - t0 < 1500, "耗时");
+  assert(sig.archetype === "slope_zigzag", "archetype=" + sig.archetype);
+  assert(sig.levels === 4, "levels=" + sig.levels);
+  assert(sig.houses === 0, "fixture 里没有房子");
+  const [lx, lz] = sid._archetype.spots.top;
+  close(sig.landmark[0], lx, 1e-9, "地标 x"); close(sig.landmark[1], lz, 1e-9, "地标 z");
+  between(sig.entry_bearing_deg, 150, 210, "入口在南");
+  assert(sig.palette_lab.length === 3, "palette_lab 三元");
+  between(sig.palette_lab[0], 30, 95, "平均 L");
+});
+
+test("signature(valleySid)：levels === 3，archetype valley_two_banks；meta.archetype 作后备；缺项为 null", () => {
+  const sig = signature(valleySid());
+  assert(sig.levels === 3, "levels=" + sig.levels);
+  assert(sig.archetype === "valley_two_banks", sig.archetype);
+  const s2 = clone(valleySid()); delete s2._archetype; s2.meta.archetype = "ring_terrace";
+  assert(signature(s2).archetype === "ring_terrace", "meta.archetype 后备");
+  const bare = { meta: {}, terrain: { features: [] }, volumes: [], markers: [], style: { palette: [] } };
+  const sb = signature(bare);
+  assert(sb.archetype === null && sb.landmark === null && sb.levels === 0 && sb.entry_bearing_deg === null && sb.palette_lab === null, "缺项 null");
+});
+
+test("levels 也能从 height / layer_height_m 推算（features 没有 level 时）", () => {
+  const s = clone(villageSid());
+  s.terrain.features.forEach((f, i) => { delete f.level; f.height = i * 3; });
+  assert(signature(s).levels === 4, "由 height 推算 4 层");
+});
+
+test("bearing：东 90、南 180、西 270、北 0；差值折到 0..180", () => {
+  close(bearingDeg([0, 0], [10, 0]), 90, 1e-9, "东");
+  close(bearingDeg([0, 0], [0, 10]), 180, 1e-9, "南");
+  close(bearingDeg([0, 0], [-10, 0]), 270, 1e-9, "西");
+  close(bearingDeg([0, 0], [0, -10]), 0, 1e-9, "北");
+  close(bearingDiff(10, 350), 20, 1e-9, "跨 0 的差");
+  close(bearingDiff(90, 270), 180, 1e-9, "对向");
+  close(bearingDiff(180, 180), 0, 1e-9, "相同为 0");
+});
+
+test("distance：同一 sid 为 0；地标挪 30 m 后 ≥ 1；层数差 1 加 1；房屋差 15 加 1", () => {
+  const sid = villageSid();
+  const a = signature(sid);
+  close(distance(a, signature(clone(sid))), 0, 1e-9, "自身距离 0");
+  const moved = clone(sid); moved.volumes[0].position[0] += 30;
+  assert(distance(a, signature(moved)) >= 1 - 1e-9, "地标挪 30 m");
+  const fewer = clone(sid); fewer.terrain.features.pop();
+  close(distance(a, signature(fewer)), 1, 1e-9, "少一层");
+  close(distance(a, signature(withHouses(sid, 15))), 1, 1e-9, "多 15 栋房");
+  const east = clone(sid); east.markers[0].position = [58, 0, 0];
+  close(distance(a, signature(east)), 90 / 90, 0.2, "入口南→东 约 1");
+});
+
+test("distance：原型不同的 village 与 valley 距离明显 > 1；色板偏暖后距离 > 0 且对称", () => {
+  const a = signature(villageSid()), b = signature(valleySid());
+  assert(distance(a, b) > 1, "两种原型 " + distance(a, b));
+  close(distance(a, b), distance(b, a), 1e-12, "对称");
+  const warm = clone(villageSid()); warm.style.palette = paletteShift(warm.style.palette, "warm");
+  const dw = distance(a, signature(warm));
+  between(dw, 0.2, 0.8, "色板偏暖 ΔE≈12.6/30");
+});
+
+test("distinctEnough：三个一样的为 false，地标/层数/入口各不同的为 true，阈值可调", () => {
+  const sid = villageSid();
+  const same = [signature(sid), signature(clone(sid)), signature(clone(sid))];
+  assert(!distinctEnough(same), "全同应为 false");
+  const b = clone(sid); b.terrain.features.pop(); b.volumes[0].position[0] += 20;
+  const c = clone(sid); c.markers[0].position = [-58, 0, 0]; c.volumes[0].position[2] += 20;
+  const sigs = [signature(sid), signature(b), signature(c)];
+  assert(distinctEnough(sigs), "三个不同 " + [distance(sigs[0], sigs[1]), distance(sigs[0], sigs[2]), distance(sigs[1], sigs[2])]);
+  assert(!distinctEnough(sigs, 5), "阈值 5 时不够");
+  assert(distinctEnough([signature(sid)]), "单个为 true");
+});
+
+test("axisOverrides：每个轴返回 3 个互不相同的 override，形状为卡片参数子集", () => {
+  const base = { params: { terraces: 4, entry_side: "S" }, landmark: { placement: "top" } };
+  for (const axis of Object.keys(AXES)) {
+    const ov = axisOverrides(axis, base);
+    assert(ov.length === 3, axis + " 应 3 个");
+    assert(new Set(ov.map((o) => JSON.stringify(o))).size === 3, axis + " 互不相同");
+    assert(typeof AXES[axis] === "string" && AXES[axis].length, axis + " 有中文名");
+  }
+  assert(JSON.stringify(axisOverrides("landmark", base).map((o) => o.landmark.placement)) === '["top","ridge_end","cliff_edge"]', "landmark 三选");
+  assert(JSON.stringify(axisOverrides("terraces", base).map((o) => o.params.terraces)) === "[3,4,5]", "terraces n±1");
+  assert(JSON.stringify(axisOverrides("entry", base).map((o) => o.params.entry_side)) === '["S","E","W"]', "entry");
+  assert(JSON.stringify(axisOverrides("density", base).map((o) => o.density_scale)) === "[0.6,1,1.4]", "density");
+  assert(JSON.stringify(axisOverrides("palette", base).map((o) => o.palette_shift)) === '["cool","neutral","warm"]', "palette");
+  assert(axisOverrides("nope", base).length === 0, "未知轴 []");
+});
+
+test("axisOverrides terraces：边界 3 / 7 仍给出三个不同且在 3..7 内的值；无 base 默认以 4 为中心", () => {
+  for (const n of [3, 7, 1, 20]) {
+    const t = axisOverrides("terraces", { params: { terraces: n } }).map((o) => o.params.terraces);
+    assert(new Set(t).size === 3, `n=${n} 互不相同 ${t}`);
+    for (const v of t) between(v, 3, 7, `n=${n}`);
+  }
+  assert(JSON.stringify(axisOverrides("terraces").map((o) => o.params.terraces)) === "[3,4,5]", "默认 4");
+});
+
+test("确定性：同参数两次 signature / axisOverrides 逐字节相同", () => {
+  const s1 = JSON.stringify(signature(villageSid())), s2 = JSON.stringify(signature(villageSid()));
+  assert(s1 === s2, "signature 确定");
+  const v1 = JSON.stringify(signature(valleySid())), v2 = JSON.stringify(signature(valleySid()));
+  assert(v1 === v2, "valley signature 确定");
+  for (const axis of Object.keys(AXES)) assert(JSON.stringify(axisOverrides(axis, { params: { terraces: 5 } })) === JSON.stringify(axisOverrides(axis, { params: { terraces: 5 } })), axis + " 确定");
+});
+
+run();
+</script>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>场景对话 · 交互原型</title>
+  <link rel="stylesheet" href="proto.css" />
+</head>
+<body>
+  <header id="top">
+    <div class="brand">场景对话 <span class="tag">交互原型 · AI 回复为脚本，只用于评审交互方式</span></div>
+    <ol id="steps">
+      <li data-step="1">说</li><li data-step="2">选</li><li data-step="3">答</li><li data-step="4">画</li><li data-step="5">核</li><li data-step="6">出</li>
+    </ol>
+    <div class="budget" id="budget" title="AI 最多问四个问题，每个都可以「你定」跳过">问题 0/4</div>
+    <div class="meter" id="meter" title="这一轮沟通里人做了多少动作">指点 0 · 选择 0 · 打字 0 · 坐标 0</div>
+  </header>
+
+  <main>
+    <section id="chat">
+      <div id="log"></div>
+      <div id="chips"></div>
+      <form id="composer">
+        <input id="input" type="text" placeholder="说一句你想要的场景，或者直接在右边图上改" autocomplete="off" />
+        <button type="submit">发送</button>
+      </form>
+    </section>
+
+    <section id="stage">
+      <div id="tabs">
+        <button class="tab active" data-view="map">俯视语义图</button>
+        <button class="tab" data-view="profile">侧剖面</button>
+        <button class="tab" data-view="eye">玩家视角</button>
+        <div class="spacer"></div>
+        <div id="tools" class="disabled">
+          <button data-tool="select" class="tool active" title="点一下看它是什么">选择</button>
+          <button data-tool="path" class="tool" title="在图上画一笔，这就是主路">画路</button>
+          <button data-tool="region" class="tool" title="圈一块地，然后说它是什么">圈区域</button>
+          <button data-tool="pin" class="tool" title="拖动地标和入口">图钉</button>
+          <button data-tool="erase" class="tool" title="点掉一个区域，或把路恢复默认">擦除</button>
+        </div>
+      </div>
+      <div id="views">
+        <div id="view-map" class="view active"></div>
+        <div id="view-profile" class="view"></div>
+        <div id="view-eye" class="view"></div>
+        <div id="popup" hidden></div>
+      </div>
+      <aside id="side">
+        <section id="understand">
+          <h3>我理解为 <small>逐条点对错</small></h3>
+          <div class="body"><div class="empty">AI 出了草案之后，这里会列出它对你意图的复述。</div></div>
+        </section>
+        <section id="relcheck">
+          <h3>关系检查 <small>程序算的 ✓/✗，不是 AI 自述</small></h3>
+          <div class="body"></div>
+        </section>
+        <section id="assume">
+          <h3>我假设了 <small>AI 没问你就定的</small></h3>
+          <div class="body"></div>
+        </section>
+        <section id="refs">
+          <h3>参考 <small>长相和颜色靠图，不靠形容词</small></h3>
+          <div class="body"></div>
+        </section>
+        <section id="palette">
+          <h3>色板 <small>给 AI 的是 hex，不是「暖色」</small></h3>
+          <div class="body"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <div id="modal" hidden>
+    <div class="box">
+      <h3 id="modal-title"></h3>
+      <div id="modal-body"></div>
+      <div class="actions"><button id="modal-close">关闭</button></div>
+    </div>
+  </div>
+
+  <script src="proto.js"></script>
+</body>
+</html>

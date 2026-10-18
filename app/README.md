@@ -4,7 +4,9 @@
 
 ## 启动
 
-双击仓库根目录的 `run-editor.bat`，或在仓库根目录执行：
+**桌面版**：双击 `dist\SIDEditor\SIDEditor.exe`（独立窗口，用系统自带的 WebView2，不需要浏览器）。没有 dist 目录就先双击 `desktop\build.bat` 打包一次（需要本机 Python 3.10+，会自动建 `.venv` 并装 pywebview、PyInstaller），产物约几十 MB。桌面壳的源码在 `desktop/sid_editor.py`。
+
+**网页版**：双击仓库根目录的 `run-editor.bat`，或在仓库根目录执行：
 
 ```bash
 python -m http.server 8765 --bind 127.0.0.1

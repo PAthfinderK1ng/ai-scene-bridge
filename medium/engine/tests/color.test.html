@@ -1,0 +1,112 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { extractPalette, assignRoles, paletteShift, hexToLab, labToHex, deltaE, hexToRgb, rgbToHex, ROLES } from "../color.js";
+
+/** 合成一张 64×64 四块纯色图（左上红、右上绿、左下蓝、右下米黄） */
+const QUAD = ["#c0392b", "#3a7d44", "#2c5aa0", "#e8dcb5"];
+function quadImage(size = 64, colors = QUAD) {
+  const data = new Uint8ClampedArray(size * size * 4);
+  const rgb = colors.map(hexToRgb);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const q = (y < size / 2 ? 0 : 2) + (x < size / 2 ? 0 : 1);
+    const o = (y * size + x) * 4;
+    data[o] = rgb[q][0]; data[o + 1] = rgb[q][1]; data[o + 2] = rgb[q][2]; data[o + 3] = 255;
+  }
+  return { data, width: size, height: size };
+}
+
+test("hex ↔ Lab 往返：白 L≈100、黑 L≈0、往返误差 < 1", () => {
+  close(hexToLab("#ffffff")[0], 100, 0.1, "白 L");
+  close(hexToLab("#000000")[0], 0, 0.1, "黑 L");
+  for (const h of ["#4a4a4a", "#d9c9a3", "#4f6b3a", "#dde6f0", "#c0392b"]) {
+    const back = labToHex(hexToLab(h));
+    assert(deltaE(h, back) < 1, `${h} → ${back} ΔE 过大`);
+  }
+  assert(rgbToHex(hexToRgb("#ABC")) === "#aabbcc", "短写 hex 展开");
+});
+
+test("deltaE：同色为 0，黑白约 100，红绿远大于近似色", () => {
+  close(deltaE("#4a4a4a", "#4a4a4a"), 0, 1e-9, "同色");
+  close(deltaE("#000000", "#ffffff"), 100, 0.5, "黑白");
+  assert(deltaE("#ff0000", "#00ff00") > 100, "红绿差大");
+  assert(deltaE("#d9c9a3", "#dacaa4") < 1.5, "近似色差小");
+});
+
+test("extractPalette：四色图 k=4 得到四个接近的颜色（ΔE < 8），weight 之和 ≈ 1", () => {
+  const img = quadImage();
+  const t0 = performance.now();
+  const pal = extractPalette(img, { k: 4, seed: 11 });
+  const dt = performance.now() - t0;
+  assert(dt < 1500, "耗时 " + dt.toFixed(1) + " ms");
+  assert(pal.length === 4, "4 个颜色，得到 " + pal.length);
+  close(pal.reduce((s, p) => s + p.weight, 0), 1, 1e-6, "weight 之和");
+  for (const c of QUAD) {
+    const best = Math.min(...pal.map((p) => deltaE(p.hex, c)));
+    assert(best < 8, `${c} 最近 ΔE=${best.toFixed(2)}`);
+  }
+  for (const p of pal) between(p.weight, 0.2, 0.3, "每块约 1/4");
+});
+
+test("extractPalette：k 大于真实色数时空簇被丢弃，k=1 得到一色且占比 1", () => {
+  const img = quadImage(32);
+  const pal8 = extractPalette(img, { k: 8, seed: 3 });
+  assert(pal8.length >= 1 && pal8.length <= 8, "簇数合法");
+  assert(pal8.every((p) => p.weight > 0), "无空簇");
+  const pal1 = extractPalette(img, { k: 1, seed: 3 });
+  assert(pal1.length === 1, "k=1");
+  close(pal1[0].weight, 1, 1e-9, "占比 1");
+  assert(extractPalette({ data: new Uint8ClampedArray(0), width: 0, height: 0 }, { k: 4 }).length === 0, "空图返回 []");
+});
+
+test("确定性：同参数两次 extractPalette 逐字节相同，不同 seed 结果仍覆盖四色", () => {
+  const img = quadImage();
+  const a = JSON.stringify(extractPalette(img, { k: 4, seed: 42 }));
+  const b = JSON.stringify(extractPalette(img, { k: 4, seed: 42 }));
+  assert(a === b, "两次结果应完全一致");
+  const c = extractPalette(img, { k: 4, seed: 99 });
+  for (const q of QUAD) assert(Math.min(...c.map((p) => deltaE(p.hex, q))) < 8, "另一个 seed 也应收敛到四色");
+});
+
+test("assignRoles：最绿给 foliage、最亮给 wall、最暗给 roof，五个角色齐全", () => {
+  const roles = assignRoles(["#4a4a4a", "#d9c9a3", "#9a9890", "#4f6b3a", "#dde6f0"]);
+  assert(roles.length === 5 && roles.map((r) => r.role).join() === ROLES.join(), "角色顺序固定");
+  const by = Object.fromEntries(roles.map((r) => [r.role, r.hex]));
+  assert(by.foliage === "#4f6b3a", "foliage=" + by.foliage);
+  assert(by.wall === "#dde6f0", "wall=" + by.wall);
+  assert(by.roof === "#4a4a4a", "roof=" + by.roof);
+  assert(by.stone === "#9a9890", "stone=" + by.stone);
+  assert(by.mist === "#d9c9a3", "mist 退到次亮=" + by.mist);
+  assert(roles.every((r) => typeof r.note === "string" && r.note.length), "带说明");
+  // 也接受 {hex, weight} 形状；颜色不足 5 个时允许复用
+  const few = assignRoles([{ hex: "#222222", weight: 0.5 }, { hex: "#eeeeee", weight: 0.5 }]);
+  assert(few.length === 5, "两色也输出五角色");
+  assert(few.find((r) => r.role === "wall").hex === "#eeeeee" && few.find((r) => r.role === "roof").hex === "#222222", "两色分配");
+});
+
+test("paletteShift：warm 后 b* 变大、cool 后 b* 变小、desaturate 彩度减半、neutral 原样，且不改入参", () => {
+  const base = [{ role: "roof", hex: "#4a4a4a", note: "青瓦" }, { role: "wall", hex: "#d9c9a3", note: "墙" }, { role: "foliage", hex: "#4f6b3a", note: "树" }];
+  const snapshot = JSON.stringify(base);
+  const warm = paletteShift(base, "warm"), cool = paletteShift(base, "cool"), des = paletteShift(base, "desaturate"), neu = paletteShift(base, "neutral");
+  assert(JSON.stringify(base) === snapshot, "入参未被修改");
+  for (let i = 0; i < base.length; i++) {
+    const b0 = hexToLab(base[i].hex), bw = hexToLab(warm[i].hex), bc = hexToLab(cool[i].hex), bd = hexToLab(des[i].hex);
+    assert(bw[2] > b0[2] + 6, `${base[i].role} warm b* 应变大`);
+    assert(bc[2] < b0[2] - 6, `${base[i].role} cool b* 应变小`);
+    assert(warm[i].role === base[i].role && warm[i].note === base[i].note, "role/note 保留");
+    if (Math.hypot(b0[1], b0[2]) > 5) assert(Math.hypot(bd[1], bd[2]) < Math.hypot(b0[1], b0[2]) * 0.7, `${base[i].role} desaturate 彩度应减小`);
+  }
+  assert(neu.every((p, i) => p.hex === base[i].hex), "neutral 原样");
+  assert(paletteShift(base, "nonsense").every((p, i) => p.hex === base[i].hex), "未知模式按 neutral");
+});
+
+test("确定性：assignRoles 与 paletteShift 同参数两次逐字节相同", () => {
+  const pal = extractPalette(quadImage(), { k: 4, seed: 5 });
+  const r1 = JSON.stringify(assignRoles(pal)), r2 = JSON.stringify(assignRoles(pal));
+  assert(r1 === r2, "assignRoles 确定");
+  const roles = assignRoles(pal);
+  assert(JSON.stringify(paletteShift(roles, "cool")) === JSON.stringify(paletteShift(roles, "cool")), "paletteShift 确定");
+});
+
+run();
+</script>

@@ -1,0 +1,102 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain, generateArchetype, ARCHETYPES, pointInPolygon, polygonArea, DEFAULT_BOUNDS } from "../terrain.js";
+import { villageSid, valleySid } from "./fixtures.js";
+
+test("之字坡原型：4 层台地，高度递增，均在 bounds 内", () => {
+  const g = generateArchetype("slope_zigzag", { terraces: 4, layer_height_m: 3 }, DEFAULT_BOUNDS, 1);
+  assert(g.features.length === 4, "4 个台地");
+  const hs = g.features.map((f) => f.height);
+  for (let i = 1; i < hs.length; i++) assert(hs[i] > hs[i - 1], "高度递增");
+  close(hs[3], 9, 1e-9, "顶层 3 层 × 3 m");
+  for (const f of g.features) for (const [x, z] of f.polygon) { between(x, -60, 60, "x"); between(z, -60, 60, "z"); }
+  assert(g.spots.top && g.entries.S && g.entries.E && g.entries.W, "候选点齐全");
+});
+
+test("高度函数：台地内等于层高，远离台地回到 0，levelAt 正确", () => {
+  const sid = villageSid();
+  const T = buildTerrain(sid, { res: 2 });
+  const top = T.topTerrace();
+  const [cx, cz] = top.centroid;
+  close(T.heightAt(cx, cz), 9, 0.6, "顶层中心高度");
+  assert(T.levelAt(cx, cz) === 3, "顶层 level 3，得到 " + T.levelAt(cx, cz));
+  const t0 = T.terraces[0];
+  close(T.heightAt(t0.centroid[0], t0.centroid[1]), 0, 0.3, "最低层高 0");
+  close(T.heightAt(0, 56), 0, 0.3, "入口处高 0");
+  assert(T.terraceAt(cx, cz).id === top.id, "terraceAt 顶层");
+  assert(T.terraceAt(0, 58) === null, "入口不在任何台地");
+});
+
+test("坡度与梯度：台地边缘有坡，台地中心平", () => {
+  const T = buildTerrain(villageSid());
+  const t = T.terraces[2];
+  assert(T.slopeAt(t.centroid[0], t.centroid[1]) < 0.15, "中心平坦 " + T.slopeAt(t.centroid[0], t.centroid[1]));
+  // 顶层南边缘（朝入口一侧）应有明显坡度
+  const top = T.topTerrace();
+  const zs = Math.max(...top.polygon.map((p) => p[1]));
+  const s = T.slopeAt(top.centroid[0], zs + 1.5);
+  assert(s > 0.3, "台地边缘坡度 " + s);
+});
+
+test("等高线：每层一组线段，线段落在 bounds 内", () => {
+  const T = buildTerrain(villageSid());
+  const cs = T.contours();
+  assert(cs.length === 3, "3 条等高线（4 层之间），得到 " + cs.length);
+  for (const c of cs) { assert(c.segments.length > 20, "有足够线段 " + c.segments.length); for (const [a, b] of c.segments) { between(a[0], -60, 60); between(b[1], -60, 60); } }
+});
+
+test("溪谷原型：有溪流中心线，两岸各 3 层，谷线靠近溪", () => {
+  const sid = valleySid();
+  assert(sid.terrain.features.length === 6, "两岸各 3 层");
+  assert(sid.paths[0].points.length > 10, "溪流折线");
+  const T = buildTerrain(sid);
+  const v = T.valleyLine();
+  assert(v.length === T.nz, "谷线每行一点");
+  const mid = v[Math.floor(v.length / 2)];
+  assert(Math.abs(mid[0]) < 10, "谷线在中间附近 x=" + mid[0]);
+  close(T.heightAt(0, 0), 0, 0.5, "溪底高 0");
+});
+
+test("环台原型：中层广场在中心，层数正确", () => {
+  const g = generateArchetype("ring_terrace", { terraces: 5 }, DEFAULT_BOUNDS, 2);
+  assert(g.features.length === 5, "5 层");
+  const plaza = g.features.find((f) => f.level === 2);
+  assert(plaza && pointInPolygon([0, 2], plaza.polygon), "广场包含中心");
+  assert(polygonArea(plaza.polygon) > 200, "广场面积");
+});
+
+test("入口方位旋转：E 入口在东侧，上坡朝西", () => {
+  const g = generateArchetype("slope_zigzag", { terraces: 4, entry_side: "E" }, DEFAULT_BOUNDS, 1);
+  assert(g.entries.E[0] > 40, "入口在东 " + g.entries.E);
+  const top = g.features[3], bottom = g.features[0];
+  assert(top.center[0] < bottom.center[0], "顶层在西、底层在东");
+  const sid = villageSid(); sid.terrain.features = g.features;
+  const T = buildTerrain(sid);
+  assert(T.heightAt(-40, 0) > T.heightAt(40, 0), "西高东低");
+});
+
+test("确定性：同参数两次生成逐字节相同；不同 seed 不同", () => {
+  const a = JSON.stringify(generateArchetype("slope_zigzag", { terraces: 5 }, DEFAULT_BOUNDS, 9));
+  const b = JSON.stringify(generateArchetype("slope_zigzag", { terraces: 5 }, DEFAULT_BOUNDS, 9));
+  const c = JSON.stringify(generateArchetype("slope_zigzag", { terraces: 5 }, DEFAULT_BOUNDS, 10));
+  assert(a === b, "相同");
+  assert(a !== c, "不同 seed 应不同");
+});
+
+test("剖面采样：沿南北线高度单调不减（从入口到顶）", () => {
+  const T = buildTerrain(villageSid());
+  const prof = T.sampleProfile([[0, 56], [0, -40]], 2);
+  let last = -1;
+  for (const s of prof) { assert(s.h >= last - 0.2, `高度回落 d=${s.d} h=${s.h} last=${last}`); last = Math.max(last, s.h); }
+  assert(prof[prof.length - 1].h > 8, "终点接近 9 m");
+});
+
+test("ARCHETYPES 常量与未知原型回退", () => {
+  assert(ARCHETYPES.length === 3);
+  const g = generateArchetype("unknown", {}, DEFAULT_BOUNDS, 1);
+  assert(g.archetype === "unknown" && g.features.length === 4, "未知名字按之字坡处理");
+});
+
+run();
+</script>

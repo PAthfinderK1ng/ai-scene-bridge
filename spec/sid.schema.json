@@ -21,14 +21,20 @@
         "north": { "type": "string", "enum": ["-Z"] },
         "player_height": { "type": "number", "default": 1.8 },
         "grid": { "type": "number", "default": 0.5 },
-        "description": { "type": "string" }
+        "description": { "type": "string" },
+        "layer_height_m": { "type": "number", "minimum": 0.5, "default": 3, "description": "一「层」等于多少米；界面上高度以层显示（D15）" },
+        "archetype": { "type": "string", "description": "地形原型名（slope_zigzag / ring_terrace / valley_two_banks），由「场景对话」写入" },
+        "card": { "type": "object", "description": "「场景对话」当前方案卡（结构级参数，LLM 只改这里，不写坐标）" }
       }
     },
     "intent": {
       "type": "object",
       "properties": {
         "summary": { "type": "string" },
-        "mood": { "type": "array", "items": { "type": "string" } },
+        "mood": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "gameplay": { "type": "string" },
         "scale_reference": { "type": "string" }
       }
@@ -56,7 +62,10 @@
             "properties": {
               "path": { "type": "string" },
               "note": { "type": "string" },
-              "applies_to": { "type": "array", "items": { "$ref": "#/definitions/id" } }
+              "applies_to": {
+                "type": "array",
+                "items": { "$ref": "#/definitions/id" }
+              }
             }
           }
         },
@@ -101,7 +110,16 @@
               "radius": { "type": "number", "exclusiveMinimum": 0 },
               "height": { "type": "number", "description": "正为凸起，负为凹陷" },
               "label": { "type": "string" },
-              "notes": { "type": "string" }
+              "notes": { "type": "string" },
+              "polygon": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 32,
+                "items": { "$ref": "#/definitions/vec2" },
+                "description": "台地俯视多边形（D13）；有它时 center/radius 由引擎回填为质心与外接半径"
+              },
+              "level": { "type": "integer", "minimum": 0, "description": "层号（0 = 最低），height = level × meta.layer_height_m" },
+              "skirt": { "type": "number", "minimum": 0, "description": "台地边缘坡面宽度（米），默认 clamp(height×0.8, 2, 10)" }
             }
           }
         }
@@ -114,7 +132,10 @@
         "required": ["id", "kind", "shape", "position", "size"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": { "type": "string", "enum": ["building", "wall", "platform", "rock", "prop", "water", "cover", "blocker", "placeholder"] },
+          "kind": {
+            "type": "string",
+            "enum": ["building", "wall", "platform", "rock", "prop", "water", "cover", "blocker", "placeholder"]
+          },
           "shape": { "type": "string", "enum": ["box", "cylinder", "ramp", "custom"] },
           "position": { "$ref": "#/definitions/vec3", "description": "底面中心" },
           "size": { "$ref": "#/definitions/vec3", "description": "x 宽、y 高、z 深（米）" },
@@ -123,7 +144,12 @@
           "material_intent": { "type": "string" },
           "color_role": { "type": "string", "description": "引用 style.palette 中的 role" },
           "importance": { "type": "string", "enum": ["landmark", "primary", "secondary", "detail"] },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "generated": { "type": "boolean", "description": "由引擎按规则生成（重算时会被清掉重放）；人手放 / 锁住的不带这个" },
+          "locked": { "type": "boolean", "description": "人确认锁住，重算与出变体时不动" },
+          "terrace_level": { "type": "integer", "description": "所在台地层号" },
+          "region_id": { "type": "string" },
+          "kind_hint": { "type": "string", "description": "地标种类（temple/pagoda/tree/wheel/gate）等语义提示" }
         }
       }
     },
@@ -134,12 +160,35 @@
         "required": ["id", "kind", "polygon"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": { "type": "string", "enum": ["gathering", "forest", "farmland", "water", "grass", "sand", "danger", "encounter", "safe", "other"] },
-          "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的顶点，按顺序" },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "danger",
+              "encounter",
+              "farmland",
+              "forest",
+              "gathering",
+              "grass",
+              "other",
+              "plaza",
+              "safe",
+              "sand",
+              "terrace",
+              "water"
+            ]
+          },
+          "polygon": {
+            "type": "array",
+            "minItems": 3,
+            "items": { "$ref": "#/definitions/vec2" },
+            "description": "XZ 平面上的顶点，按顺序"
+          },
           "surface": { "type": "string", "description": "引用 style.palette 中的 role 或材质意图键" },
-          "density": { "type": "number", "minimum": 0, "maximum": 1 },
+          "density": { "type": "number", "minimum": 0, "maximum": 1.6 },
           "label": { "type": "string" },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "terrace_level": { "type": "integer", "description": "这个区域对应的台地层号" },
+          "user_set": { "type": "boolean", "description": "人圈出来 / 改过标签的区域（重算时保留）" }
         }
       }
     },
@@ -151,11 +200,19 @@
         "properties": {
           "id": { "$ref": "#/definitions/id" },
           "kind": { "type": "string", "enum": ["road", "trail", "river", "wall_line", "fence", "bridge", "other"] },
-          "points": { "type": "array", "minItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的折线" },
+          "points": {
+            "type": "array",
+            "minItems": 2,
+            "items": { "$ref": "#/definitions/vec2" },
+            "description": "XZ 平面上的折线"
+          },
           "width": { "type": "number", "exclusiveMinimum": 0 },
           "surface": { "type": "string" },
           "label": { "type": "string" },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "generated": { "type": "boolean" },
+          "user_drawn": { "type": "boolean", "description": "人画的一笔（经简化 / 吸附），重算时保留" },
+          "facts": { "type": "object", "description": "引擎算出的路径事实（length_m / climb_m / folds / max_slope / steps_estimate）" }
         }
       }
     },
@@ -166,12 +223,16 @@
         "required": ["id", "kind", "position"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": { "type": "string", "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "other"] },
+          "kind": {
+            "type": "string",
+            "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "other"]
+          },
           "position": { "$ref": "#/definitions/vec3" },
           "rotation_y": { "type": "number" },
           "size": { "$ref": "#/definitions/vec3" },
           "label": { "type": "string" },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "placement": { "type": "string", "description": "放置类（valley_bottom/side_slope/summit/S/E/W）" }
         }
       }
     },
@@ -181,7 +242,20 @@
         "type": "object",
         "required": ["type", "a", "b"],
         "properties": {
-          "type": { "type": "string", "enum": ["faces", "adjacent", "on_top_of", "inside", "visible_from", "connects", "blocks", "aligned_with", "far_from"] },
+          "type": {
+            "type": "string",
+            "enum": [
+              "faces",
+              "adjacent",
+              "on_top_of",
+              "inside",
+              "visible_from",
+              "connects",
+              "blocks",
+              "aligned_with",
+              "far_from"
+            ]
+          },
           "a": { "$ref": "#/definitions/id" },
           "b": { "$ref": "#/definitions/id" },
           "notes": { "type": "string" }
@@ -194,8 +268,15 @@
         "type": "object",
         "required": ["type"],
         "properties": {
-          "type": { "type": "string", "enum": ["locked", "min_clearance", "keep_inside", "max_count", "must_reach", "no_overlap"] },
-          "targets": { "type": "array", "items": { "type": "string" }, "description": "id 列表，\"*\" 表示全部" },
+          "type": {
+            "type": "string",
+            "enum": ["locked", "min_clearance", "keep_inside", "max_count", "must_reach", "no_overlap"]
+          },
+          "targets": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "id 列表，\"*\" 表示全部"
+          },
           "from": { "$ref": "#/definitions/id" },
           "region": { "type": "string" },
           "meters": { "type": "number" },
@@ -210,7 +291,7 @@
         "type": "object",
         "required": ["kind", "image"],
         "properties": {
-          "kind": { "type": "string", "enum": ["top_down", "perspective", "isometric"] },
+          "kind": { "type": "string", "enum": ["isometric", "perspective", "section", "top_down"] },
           "image": { "type": "string", "description": "相对路径" },
           "scale_m_per_px": { "type": "number", "description": "俯视图用" },
           "north_up": { "type": "boolean", "default": true },
@@ -223,7 +304,8 @@
               "aspect": { "type": "number" }
             }
           },
-          "labels_drawn": { "type": "boolean", "description": "图上是否已画出 id/label" }
+          "labels_drawn": { "type": "boolean", "description": "图上是否已画出 id/label" },
+          "note": { "type": "string" }
         }
       }
     },
@@ -236,7 +318,12 @@
           "search": { "type": "string", "description": "资产库检索词" },
           "generator_prompt": { "type": "string", "description": "3D 生成服务的提示词" },
           "file": { "type": "string", "description": "导出包内的素材相对路径（assets/…），由编辑器导入素材时写入；只是提示，文件可能不存在" },
-          "front_axis": { "type": "string", "enum": ["+Z", "-Z"], "default": "+Z", "description": "素材模型的正面朝向。glTF 规范为 +Z；SID 的 rotation_y 0 朝 −Z，编辑器与 glb 导出对 +Z 素材补偿 180°" },
+          "front_axis": {
+            "type": "string",
+            "enum": ["+Z", "-Z"],
+            "default": "+Z",
+            "description": "素材模型的正面朝向。glTF 规范为 +Z；SID 的 rotation_y 0 朝 −Z，编辑器与 glb 导出对 +Z 素材补偿 180°"
+          },
           "fit": { "type": "string", "enum": ["scale_to_volume", "scale_uniform", "keep_size"] },
           "scatter": {
             "type": "object",
@@ -253,7 +340,17 @@
   "definitions": {
     "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
     "hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
-    "vec2": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
-    "vec3": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+    "vec2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "vec3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    }
   }
 }
