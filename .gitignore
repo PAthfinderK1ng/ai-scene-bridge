@@ -1,0 +1,21 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Node (future web prototype)
+node_modules/
+dist/
+.env
+.env.*
+
+# Unity / UE scratch projects (keep out until decided)
+/sandbox/**/Library/
+/sandbox/**/Temp/
+/sandbox/**/Logs/
+/sandbox/**/Saved/
+/sandbox/**/Intermediate/
+/sandbox/**/DerivedDataCache/
+/sandbox/**/Binaries/
