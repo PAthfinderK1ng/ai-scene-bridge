@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SID 编辑器 · ai-scene-bridge</title>
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <header id="toolbar">
+    <div class="group">
+      <span class="brand">SID 编辑器</span>
+      <button id="btn-new" title="新建空场景">新建</button>
+      <button id="btn-open" title="打开 .sid.json">打开</button>
+      <button id="btn-save" title="保存为 .sid.json">保存</button>
+      <button id="btn-example" title="加载 spec/examples/village-square.sid.json">示例</button>
+    </div>
+    <div class="group">
+      <button id="btn-add-box">+ 盒子</button>
+      <button id="btn-add-cyl">+ 圆柱</button>
+      <button id="btn-add-marker">+ 标记</button>
+      <button id="btn-add-region">+ 区域</button>
+      <button id="btn-draw-path" title="在地面上点击加点，双击或回车结束，Esc 取消">✎ 画路径</button>
+      <button id="btn-add-hill">+ 山丘</button>
+      <button id="btn-import" title="导入 glTF / GLB 素材，按包围盒作为体块">导入素材</button>
+    </div>
+    <div class="group">
+      <button id="mode-translate" class="mode active" title="移动 (W)">移动</button>
+      <button id="mode-rotate" class="mode" title="绕 Y 旋转 (E)">旋转</button>
+      <button id="mode-scale" class="mode" title="缩放 (R)">缩放</button>
+      <button id="btn-top" title="俯视 / 透视 (T)">俯视</button>
+      <button id="btn-fit" title="视角回到整个场景 (F)">全景</button>
+      <button id="btn-labels" title="显示 / 隐藏标签 (L)">标签</button>
+    </div>
+    <div class="group">
+      <button id="btn-undo" title="Ctrl+Z">撤销</button>
+      <button id="btn-redo" title="Ctrl+Y">重做</button>
+      <button id="btn-delete" title="Delete">删除</button>
+    </div>
+    <div class="group right">
+      <button id="btn-validate">校验</button>
+      <button id="btn-export" class="primary" title="导出 zip：scene.sid.json + views/top.png + views/iso.png + scene.glb + PROTOCOL.md">导出实验包</button>
+      <button id="btn-help">?</button>
+    </div>
+    <input type="file" id="file-open" accept=".json,application/json" hidden />
+    <input type="file" id="file-import" accept=".glb,.gltf" hidden />
+  </header>
+
+  <main>
+    <div id="viewport"></div>
+    <aside id="panel">
+      <details open id="sec-selection"><summary>选中对象</summary><div class="body"></div></details>
+      <details id="sec-objects"><summary>对象列表</summary><div class="body"></div></details>
+      <details id="sec-scene"><summary>场景与意图</summary><div class="body"></div></details>
+      <details id="sec-palette"><summary>调色板</summary><div class="body"></div></details>
+      <details id="sec-relations"><summary>关系</summary><div class="body"></div></details>
+      <details id="sec-validate"><summary>校验结果</summary><div class="body"></div></details>
+    </aside>
+  </main>
+
+  <footer id="status">正在加载 three.js（首次需联网，来自 cdn.jsdelivr.net）…</footer>
+
+  <dialog id="help">
+    <h3>怎么用</h3>
+    <ul>
+      <li><b>选中</b>：点对象。<b>W / E / R</b> 切换移动 / 旋转 / 缩放，拖 gizmo；移动吸附到网格（场景面板的「网格 m」，默认 0.5 m），缩放吸附 0.5 m，旋转吸附 5°。区域 / 路径 / 山丘只能移动，标记不能缩放。</li>
+      <li><b>视角</b>：鼠标左键旋转、右键平移、滚轮缩放；<b>T</b> 俯视 / 透视；<b>F</b> 全景；<b>L</b> 标签。</li>
+      <li><b>添加</b>：工具栏按钮在视角中心放一个新对象；<b>画路径</b>后在地面点击加点，双击或回车结束。</li>
+      <li><b>属性</b>：右侧面板改数字、种类、标签、颜色角色、备注；改完按回车或点别处生效。</li>
+      <li><b>导出实验包</b>：zip 里是 <code>scene.sid.json</code>、<code>views/top.png</code>（俯视）、<code>views/iso.png</code>（鸟瞰透视）、<code>scene.glb</code>、<code>PROTOCOL.md</code>、导入过的素材 <code>assets/</code>，解压后整个目录交给 AI。</li>
+      <li><b>约定</b>：单位米，+Y 上，北 = −Z（俯视图上方），位置是底面中心，rotation_y 0 = 朝北、逆时针为正。</li>
+      <li><b>Ctrl+Z / Ctrl+Y</b> 撤销重做，<b>Delete</b> 删除，<b>Esc</b> 取消选择 / 取消画路径。</li>
+    </ul>
+    <form method="dialog"><button>关闭</button></form>
+  </dialog>
+
+  <script>
+    // 经典脚本：模块加载失败（file:// 打开、CDN 不可达）时也能给出可读的提示
+    (function () {
+      var el = document.getElementById("status");
+      var hint = " 请双击仓库根目录的 run-editor.bat（或在仓库根目录执行 python -m http.server 8765），然后打开 http://localhost:8765/app/ ，且首次需能访问 cdn.jsdelivr.net。";
+      function fail(why) { el.textContent = "编辑器加载失败：" + why + "。" + hint; el.style.color = "#b8452b"; }
+      window.__sidLoadFailed = fail;
+      if (location.protocol === "file:") { fail("不能直接双击 index.html 打开，浏览器禁止 file:// 加载模块脚本"); return; }
+      window.addEventListener("error", function (e) { if (!window.sidEditor) fail((e && e.message) || "脚本执行出错"); });
+      setTimeout(function () { if (!window.sidEditor) fail("15 秒内没有加载完成（网络慢或 CDN 不可达）"); }, 15000);
+    })();
+  </script>
+  <script type="module" src="main.js" onerror="window.__sidLoadFailed && window.__sidLoadFailed('main.js 或 three.js 下载失败')"></script>
+</body>
+</html>

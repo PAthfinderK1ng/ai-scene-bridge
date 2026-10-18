@@ -254,14 +254,16 @@ def render_topdown(sid: dict, out_png: Path, dpi: int = 150, px_width: int = 240
         cx, _, cz = v["position"]
         w, h, d = v["size"]
         rot = v.get("rotation_y", 0.0)
+        round_cyl = v.get("shape") == "cylinder" and abs(w - d) < 1e-6
         if v.get("shape") == "cylinder":
-            ax.add_patch(patches.Ellipse((cx, -cz), w, d, fc=col, ec="#111111", lw=1.0, alpha=0.95, zorder=4))
+            # 椭圆柱也按 rotation_y 转（与编辑器 / glb / 引擎一致）；图上 y = −z，所以角度取负
+            ax.add_patch(patches.Ellipse((cx, -cz), w, d, angle=-rot, fc=col, ec="#111111", lw=1.0, alpha=0.95, zorder=4))
             arrow_len = min(w, d) / 2 * 0.9
         else:
             pts = [(x, -z) for x, z in box_corners(v["position"], v["size"], rot)]
             ax.add_patch(patches.Polygon(pts, closed=True, fc=col, ec="#111111", lw=1.0, alpha=0.95, zorder=4))
             arrow_len = d / 2 * 0.9
-        if v.get("shape") != "cylinder":  # 圆柱没有朝向意义，不画箭头
+        if not round_cyl:  # 正圆柱（w == d）没有朝向意义，不画箭头
             fx, fz = facing(rot)
             ax.annotate("", xy=(cx + fx * arrow_len, -(cz + fz * arrow_len)), xytext=(cx, -cz),
                         arrowprops=dict(arrowstyle="-|>", color="#111111", lw=1.0), zorder=5)
@@ -347,6 +349,7 @@ def render_iso(sid: dict, out_png: Path, dpi: int = 150) -> None:
 
     fig = plt.figure(figsize=(15, 10), dpi=dpi)
     ax = fig.add_subplot(111, projection="3d")
+    ax.set_proj_type("ortho")  # 正交投影，名副其实的"等轴测"示意（编辑器导出的是透视鸟瞰，kind=perspective）
     # 绘图坐标：X = x（东）, Y = −z（北）, Z = y（上）
     P = lambda x, y, z: (x, -z, y)  # noqa: E731
     # mplot3d 不做跨 artist 的深度排序：关掉自动 zorder，自己按"离相机远→近"排
@@ -405,7 +408,10 @@ def render_iso(sid: dict, out_png: Path, dpi: int = 150) -> None:
         rot = v.get("rotation_y", 0.0)
         if v.get("shape") == "cylinder":
             n = 24
-            ring = [(cx + (w / 2) * math.cos(a), cz + (d / 2) * math.sin(a)) for a in np.linspace(0, 2 * math.pi, n, endpoint=False)]
+            ring = []
+            for a in np.linspace(0, 2 * math.pi, n, endpoint=False):
+                rx, rz = rot_xz((w / 2) * math.cos(a), (d / 2) * math.sin(a), rot)
+                ring.append((cx + rx, cz + rz))
         else:
             ring = box_corners(v["position"], v["size"], rot)
         bottom = [P(x, py, z) for x, z in ring]
@@ -469,6 +475,9 @@ def emit_sid(sid: dict, out_dir: Path, scale_m_per_px: float, iso: bool) -> Path
 
 
 def main(argv=None) -> int:
+    for s in (sys.stdout, sys.stderr):  # Windows 下重定向 / 管道时默认是 GBK，中文会崩
+        if s is not None and hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="从 SID 渲染俯视图 / 等轴测图")
     ap.add_argument("sid", type=Path, help="SID 文件路径")
     ap.add_argument("--out-dir", type=Path, default=None, help="输出目录（默认 = SID 所在目录）")

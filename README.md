@@ -19,10 +19,16 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 
 这四个痛点是否成立、「中间层」方案是否可行，见调研报告。
 
+## 先用起来：SID 编辑器（MVP v0）
+
+双击 `run-editor.bat`（或在仓库根目录执行 `python -m http.server 8765`），打开 <http://localhost:8765/app/>。
+点「示例」加载村口广场，点对象后用 W / E / R 移动 / 旋转 / 缩放，右侧面板改语义与颜色，「导出实验包」得到一个 zip（SID + 俯视图 + 等轴测图 + glb + PROTOCOL），解压后整个目录交给 AI。
+详细说明与已知限制见 [app/README.md](app/README.md)。需要联网加载 three.js。
+
 ## 文档
 
 - [docs/00-项目愿景.md](docs/00-项目愿景.md) —— 原始想法、要回答的问题、成功标准
-- [docs/01-调研-痛点验证与可行性.md](docs/01-调研-痛点验证与可行性.md) —— 多智能体调研报告（生成中）
+- [docs/01-调研-痛点验证与可行性.md](docs/01-调研-痛点验证与可行性.md) —— 多智能体调研报告：P1 / P3 / P4 部分成立、P2 成立；方案技术可行但"独立 Web 工具摆方块导 JSON"没有必要性，价值在语义标注 + 预计算关系 + 校验器，首发形态应为 Unity 插件 + Claude Code Skill，先做四组对照实验（124 个来源）
 - [docs/02-中间层设计草案-v0.md](docs/02-中间层设计草案-v0.md) —— 中间层是什么、两条流程、SID 格式、导出包与 AI 协议、引擎编译、编辑器 MVP、分期计划、外观层（未解决）
 - [spec/](spec/README.md) —— SID 的 JSON Schema、手写示例、给 AI 的 [PROTOCOL.md](spec/PROTOCOL.md)
 - [experiments/week0-ab/](experiments/week0-ab/README.md) —— 第 0 周实验包：A1 自然描述 / A2 尽力描述 / B SID + 俯视图 三份输入、评分表
@@ -31,11 +37,12 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 ## 当前状态
 
 - [x] 立项，整理四个痛点与方案假设
-- [x] 第一轮调研工作流启动（学术 / Unity / UE / 商业产品 / 色彩 / 场景格式 / 社区需求 / 技术可行性）
+- [x] 第一轮调研完成（8 维度 → 逐条核查 → 两位反方 → 补查 → 报告；170 条发现，66 核实 / 101 修正 / 1 推翻）；结论对设计的影响见 [docs/02 §0.5](docs/02-中间层设计草案-v0.md)
 - [x] 设计草案 v0 + SID v0.1 Schema + 示例场景
 - [x] 第 0 周实验包：渲染脚本、三份输入、PROTOCOL、评分脚本（脚本已自检，实验本身待跑）
-- [ ] 第 0 周实验：同一场景「纯文字」vs「SID + 俯视图」，让 Claude Code 在 Unity 中复现，比较还原度
-- [ ] 外观层怎么传（素材导入 / 参考图 / 生成资产 / 地形高度图）：等调研报告后决定
+- [x] 网页版 SID 编辑器 MVP v0（app/）：摆体块 / 标记 / 区域 / 路径 / 山丘，属性、调色板、关系、校验，导出实验包，glTF 素材导入
+- [ ] 第 0 周实验（已按报告改为四组：A 纯文字 / B 文字 + 俯视图 / C JSON + 关系 / D 引擎内灰盒读层级），在 Unity + MCP 上跑
+- [ ] 待决定：按报告建议转向「Unity 插件 + Skill」、网页编辑器降级为实验输入端，还是继续打磨网页编辑器
 - [ ] 第 1–2 周：Web 编辑器 MVP（Three.js），能摆体块、标语义、取色、导出包
 - [ ] 第 3 周：Unity 导入 / 读回脚本 + PROTOCOL.md，跑通全流程
 - [ ] 第 4 周：UE Python 导入 / 读回，校验器，diff
@@ -45,6 +52,8 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 ```
 ai-scene-bridge/
 ├── README.md
+├── run-editor.bat                启动本地服务并打开编辑器
+├── app/                          网页版 SID 编辑器（three.js，无构建）
 ├── docs/
 │   ├── 00-项目愿景.md
 │   ├── 01-调研-痛点验证与可行性.md

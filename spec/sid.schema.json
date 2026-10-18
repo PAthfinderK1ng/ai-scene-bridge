@@ -219,7 +219,8 @@
             "properties": {
               "position": { "$ref": "#/definitions/vec3" },
               "look_at": { "$ref": "#/definitions/vec3" },
-              "fov_deg": { "type": "number" }
+              "fov_deg": { "type": "number", "description": "垂直视场角（three.js / Unity 口径；UE 的 FOV 是水平，需换算）" },
+              "aspect": { "type": "number" }
             }
           },
           "labels_drawn": { "type": "boolean", "description": "图上是否已画出 id/label" }
@@ -230,9 +231,12 @@
       "type": "object",
       "additionalProperties": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "search": { "type": "string", "description": "资产库检索词" },
           "generator_prompt": { "type": "string", "description": "3D 生成服务的提示词" },
+          "file": { "type": "string", "description": "导出包内的素材相对路径（assets/…），由编辑器导入素材时写入；只是提示，文件可能不存在" },
+          "front_axis": { "type": "string", "enum": ["+Z", "-Z"], "default": "+Z", "description": "素材模型的正面朝向。glTF 规范为 +Z；SID 的 rotation_y 0 朝 −Z，编辑器与 glb 导出对 +Z 素材补偿 180°" },
           "fit": { "type": "string", "enum": ["scale_to_volume", "scale_uniform", "keep_size"] },
           "scatter": {
             "type": "object",

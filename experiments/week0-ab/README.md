@@ -78,14 +78,36 @@
 - 结果不理想时先看最大的错误是什么（南北颠倒？陷进地里？朝向全反？），这些是 PROTOCOL 该补的坑，不是 SID 格式的问题。
 - 手写 SID 时朝向最容易错：第一版示例里四栋房子的 `rotation_y` 全部背对了井，路还从井上穿过，渲染成俯视图一眼就看出来、纯看 JSON 看不出来。改 SID 后务必重跑渲染并看图，再开实验。
 
+## 调研报告后的修订：改为四组对照（v2）
+
+调研报告（[docs/01 §5.2](../../docs/01-调研-痛点验证与可行性.md)）指出两点必须改：(1) **"JSON" 与 "JSON + 图" 要分开测**，因为 LayoutVLM 的消融显示图像主要改善碰撞而非位置 / 旋转，合在一起测分不清是谁的功劳；(2) 必须加一组**引擎内灰盒由 Agent 经 MCP 读层级**的对照，否则无法证明中间层优于这条免费替代路线。修订后的四组：
+
+| 条件 | 输入 | 怎么准备 | 目录 |
+| --- | --- | --- | --- |
+| A | 纯文字（A1 随手写 / A2 尽力描述） | 现有 | A1-natural / A2-verbose |
+| B | 文字 + 标注俯视图 PNG（无 JSON） | 用 B 包里的 `views/top.png` + A1 的文字 | B-image |
+| C | SID JSON + 预计算关系 + PROTOCOL（**无图**） | 用编辑器或脚本导出，删掉 `views/` | C-sid-json |
+| D | 引擎内灰盒 | 把编辑器导出的 `scene.glb` 导入 Unity（或人用 ProBuilder 照俯视图搭），新会话让 Agent 经 MCP 读层级，要求"不改布局，只做材质 / 灯光 / 标记" | D-engine-greybox |
+
+原来的 B（SID + 俯视图 + PROTOCOL）保留为 B+C 的合并组，可选跑。
+
+**判读规则**（来自报告）：C ≫ A/B 且 C ≈ D → 中间层的价值只剩"不开引擎 + 预计算关系 + 语义 / 色彩标注"，做 Unity 插件而不是独立工具；D ≫ C → 放弃独立输入端，只做"标注 + 校验"插件；A ≈ C → 重新审视 P2。
+
+**新增度量**：AABB 重叠 > 5 cm 的计数、越出 bounds 计数、对话轮数、总 token（Claude Code `/usage`）、MCP 调用数、墙钟时间。`score_readback.py` 目前只算位置 / 尺寸 / 朝向 / 缺漏，重叠与越界先手数或用编辑器的「校验」按钮对读回文件跑一遍。
+
+**场景**：先用村口广场（户外、有视线与高差，P2 更敏感）；报告建议再加一个 8×6×3 m、14 物体的室内房间作为第二场景（4 墙 + 门 + 2 窗 + 桌 + 4 椅 + 吊灯 + 台灯 + 书架），室内是求解器路线覆盖最好的领域，能看出中间层相对学术方案的增量。
+
 ## 本目录
 
 ```
 week0-ab/
 ├── README.md
-├── A1-natural/prompt.md
-├── A2-verbose/prompt.md
-├── B-sid/
+├── A1-natural/prompt.md          A 纯文字（随手写）
+├── A2-verbose/prompt.md          A 纯文字（尽力描述）
+├── B-image/prompt.md             B 文字 + 标注俯视图，无 JSON（图从 B-sid/views 复制）
+├── C-sid-json/prompt.md          C SID JSON + 关系 + PROTOCOL，无图（从 B-sid 复制后删 views/）
+├── D-engine-greybox/prompt.md    D 引擎内灰盒（导入 scene.glb），Agent 读层级只做上装
+├── B-sid/                        B+C 合并组（可选）
 │   ├── prompt.md
 │   ├── scene.sid.json        （由 render_topdown.py --emit-sid 生成，含 views）
 │   ├── views/top.png
