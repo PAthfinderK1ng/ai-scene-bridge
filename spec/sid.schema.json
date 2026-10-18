@@ -1,0 +1,255 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/PAthfinderK1ng/ai-scene-bridge/spec/sid.schema.json",
+  "title": "Scene Intent Document (SID) v0.1",
+  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。",
+  "type": "object",
+  "required": ["sid_version", "meta", "volumes"],
+  "additionalProperties": false,
+  "properties": {
+    "sid_version": { "type": "string", "const": "0.1" },
+    "meta": {
+      "type": "object",
+      "required": ["name", "units", "up_axis", "handedness", "north"],
+      "properties": {
+        "name": { "type": "string" },
+        "author": { "type": "string" },
+        "created": { "type": "string" },
+        "units": { "type": "string", "enum": ["meters"] },
+        "up_axis": { "type": "string", "enum": ["+Y"] },
+        "handedness": { "type": "string", "enum": ["right"] },
+        "north": { "type": "string", "enum": ["-Z"] },
+        "player_height": { "type": "number", "default": 1.8 },
+        "grid": { "type": "number", "default": 0.5 },
+        "description": { "type": "string" }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "properties": {
+        "summary": { "type": "string" },
+        "mood": { "type": "array", "items": { "type": "string" } },
+        "gameplay": { "type": "string" },
+        "scale_reference": { "type": "string" }
+      }
+    },
+    "style": {
+      "type": "object",
+      "properties": {
+        "palette": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["role", "hex"],
+            "properties": {
+              "role": { "type": "string" },
+              "hex": { "$ref": "#/definitions/hex" },
+              "note": { "type": "string" }
+            }
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string" },
+              "note": { "type": "string" },
+              "applies_to": { "type": "array", "items": { "$ref": "#/definitions/id" } }
+            }
+          }
+        },
+        "lighting": {
+          "type": "object",
+          "properties": {
+            "time_of_day": { "type": "string", "enum": ["dawn", "morning", "noon", "afternoon", "dusk", "night", "overcast"] },
+            "sun_azimuth_deg": { "type": "number", "minimum": 0, "maximum": 360 },
+            "sun_elevation_deg": { "type": "number", "minimum": -10, "maximum": 90 },
+            "note": { "type": "string" }
+          }
+        },
+        "material_intents": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "$ref": "#/definitions/vec3" },
+        "max": { "$ref": "#/definitions/vec3" }
+      }
+    },
+    "terrain": {
+      "type": "object",
+      "properties": {
+        "base": { "type": "string", "enum": ["flat", "heightmap", "none"] },
+        "base_height": { "type": "number" },
+        "heightmap": { "type": "string", "description": "可选：灰度图路径" },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "kind", "center", "radius", "height"],
+            "properties": {
+              "id": { "$ref": "#/definitions/id" },
+              "kind": { "type": "string", "enum": ["hill", "pit", "plateau", "cliff", "ridge"] },
+              "center": { "$ref": "#/definitions/vec3" },
+              "radius": { "type": "number", "exclusiveMinimum": 0 },
+              "height": { "type": "number", "description": "正为凸起，负为凹陷" },
+              "label": { "type": "string" },
+              "notes": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "shape", "position", "size"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" },
+          "kind": { "type": "string", "enum": ["building", "wall", "platform", "rock", "prop", "water", "cover", "blocker", "placeholder"] },
+          "shape": { "type": "string", "enum": ["box", "cylinder", "ramp", "custom"] },
+          "position": { "$ref": "#/definitions/vec3", "description": "底面中心" },
+          "size": { "$ref": "#/definitions/vec3", "description": "x 宽、y 高、z 深（米）" },
+          "rotation_y": { "type": "number", "default": 0, "description": "绕 +Y 的角度，0 = 面朝北(-Z)，逆时针为正（俯视）" },
+          "label": { "type": "string" },
+          "material_intent": { "type": "string" },
+          "color_role": { "type": "string", "description": "引用 style.palette 中的 role" },
+          "importance": { "type": "string", "enum": ["landmark", "primary", "secondary", "detail"] },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "polygon"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" },
+          "kind": { "type": "string", "enum": ["gathering", "forest", "farmland", "water", "grass", "sand", "danger", "encounter", "safe", "other"] },
+          "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的顶点，按顺序" },
+          "surface": { "type": "string", "description": "引用 style.palette 中的 role 或材质意图键" },
+          "density": { "type": "number", "minimum": 0, "maximum": 1 },
+          "label": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "points", "width"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" },
+          "kind": { "type": "string", "enum": ["road", "trail", "river", "wall_line", "fence", "bridge", "other"] },
+          "points": { "type": "array", "minItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的折线" },
+          "width": { "type": "number", "exclusiveMinimum": 0 },
+          "surface": { "type": "string" },
+          "label": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "markers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "position"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" },
+          "kind": { "type": "string", "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "other"] },
+          "position": { "$ref": "#/definitions/vec3" },
+          "rotation_y": { "type": "number" },
+          "size": { "$ref": "#/definitions/vec3" },
+          "label": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "relations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "a", "b"],
+        "properties": {
+          "type": { "type": "string", "enum": ["faces", "adjacent", "on_top_of", "inside", "visible_from", "connects", "blocks", "aligned_with", "far_from"] },
+          "a": { "$ref": "#/definitions/id" },
+          "b": { "$ref": "#/definitions/id" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["locked", "min_clearance", "keep_inside", "max_count", "must_reach", "no_overlap"] },
+          "targets": { "type": "array", "items": { "type": "string" }, "description": "id 列表，\"*\" 表示全部" },
+          "from": { "$ref": "#/definitions/id" },
+          "region": { "type": "string" },
+          "meters": { "type": "number" },
+          "count": { "type": "integer" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "views": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "image"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["top_down", "perspective", "isometric"] },
+          "image": { "type": "string", "description": "相对路径" },
+          "scale_m_per_px": { "type": "number", "description": "俯视图用" },
+          "north_up": { "type": "boolean", "default": true },
+          "camera": {
+            "type": "object",
+            "properties": {
+              "position": { "$ref": "#/definitions/vec3" },
+              "look_at": { "$ref": "#/definitions/vec3" },
+              "fov_deg": { "type": "number" }
+            }
+          },
+          "labels_drawn": { "type": "boolean", "description": "图上是否已画出 id/label" }
+        }
+      }
+    },
+    "asset_hints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "search": { "type": "string", "description": "资产库检索词" },
+          "generator_prompt": { "type": "string", "description": "3D 生成服务的提示词" },
+          "fit": { "type": "string", "enum": ["scale_to_volume", "scale_uniform", "keep_size"] },
+          "scatter": {
+            "type": "object",
+            "properties": {
+              "min_spacing": { "type": "number" },
+              "scale_jitter": { "type": "number" }
+            }
+          },
+          "fallback": { "type": "string" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+    "vec2": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+    "vec3": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+  }
+}

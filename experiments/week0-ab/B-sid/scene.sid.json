@@ -1,0 +1,528 @@
+{
+  "sid_version": "0.1",
+  "meta": {
+    "name": "村口广场",
+    "author": "PAthfinderK1ng",
+    "created": "2026-10-17",
+    "units": "meters",
+    "up_axis": "+Y",
+    "handedness": "right",
+    "north": "-Z",
+    "player_height": 1.8,
+    "grid": 0.5,
+    "description": "第 0 周 A/B 实验用的手写示例：一口井、四栋房子、一条路、背后一座山。"
+  },
+  "intent": {
+    "summary": "黄昏时分的小村口。石板广场中央一口井，四栋木屋围着广场、门都朝向井；一条土路从南边进村、接上广场、再从广场北边出来往西北绕过山脚出村；村子北面靠着一座缓坡山丘，东侧是一片林子。玩家从南边路口出生，第一眼看到井和背后的山。",
+    "mood": [
+      "宁静",
+      "黄昏",
+      "低饱和",
+      "有人气但没人"
+    ],
+    "gameplay": "探索 / 叙事起点，无战斗",
+    "scale_reference": "玩家 1.8 m；木屋一层高 4 m；井口到腰"
+  },
+  "style": {
+    "palette": [
+      {
+        "role": "ground",
+        "hex": "#8B7D5B",
+        "note": "干土路、踩实的泥地"
+      },
+      {
+        "role": "stone",
+        "hex": "#9A9890",
+        "note": "广场石板、井口石"
+      },
+      {
+        "role": "wall",
+        "hex": "#D9C9A3",
+        "note": "夯土 / 浅色木板墙"
+      },
+      {
+        "role": "roof",
+        "hex": "#6B3F2A",
+        "note": "深棕木瓦或茅草"
+      },
+      {
+        "role": "foliage",
+        "hex": "#4F6B3A",
+        "note": "树冠，偏黄绿、不要鲜绿"
+      },
+      {
+        "role": "accent",
+        "hex": "#B8452B",
+        "note": "门、窗框、一两面小旗"
+      },
+      {
+        "role": "sky",
+        "hex": "#E8A86A",
+        "note": "黄昏天光"
+      }
+    ],
+    "references": [
+      {
+        "path": "refs/village-ref-1.jpg",
+        "note": "屋顶坡度与比例参考（待放入）"
+      }
+    ],
+    "lighting": {
+      "time_of_day": "dusk",
+      "sun_azimuth_deg": 250,
+      "sun_elevation_deg": 12,
+      "note": "逆光，长阴影，井和山形成剪影"
+    },
+    "material_intents": {
+      "building": "粗糙木板 + 夯土，少量苔藓",
+      "ground": "干土，有车辙",
+      "stone": "风化石板，缝里长草"
+    }
+  },
+  "bounds": {
+    "min": [
+      -40,
+      0,
+      -45
+    ],
+    "max": [
+      40,
+      25,
+      40
+    ]
+  },
+  "terrain": {
+    "base": "flat",
+    "base_height": 0,
+    "features": [
+      {
+        "id": "hill_back",
+        "kind": "hill",
+        "center": [
+          5,
+          0,
+          -30
+        ],
+        "radius": 18,
+        "height": 10,
+        "label": "村后山丘",
+        "notes": "缓坡，草地，顶上两三棵树；从出生点看是村子的背景"
+      }
+    ]
+  },
+  "volumes": [
+    {
+      "id": "house_1",
+      "kind": "building",
+      "shape": "box",
+      "position": [
+        -10,
+        0,
+        -6
+      ],
+      "size": [
+        6,
+        4,
+        5
+      ],
+      "rotation_y": 240,
+      "label": "木屋·西北",
+      "material_intent": "木板墙 + 茅草顶，门朝广场",
+      "color_role": "wall",
+      "importance": "primary",
+      "notes": "村里最大的一栋，门口有两级台阶；正面（宽 6 m 的一侧）朝东南对着井"
+    },
+    {
+      "id": "house_2",
+      "kind": "building",
+      "shape": "box",
+      "position": [
+        10,
+        0,
+        -7
+      ],
+      "size": [
+        7,
+        4.5,
+        6
+      ],
+      "rotation_y": 125,
+      "label": "木屋·东北",
+      "material_intent": "夯土墙 + 木瓦顶",
+      "color_role": "wall",
+      "importance": "primary",
+      "notes": "带一个小院，院墙矮"
+    },
+    {
+      "id": "house_3",
+      "kind": "building",
+      "shape": "box",
+      "position": [
+        -11,
+        0,
+        8
+      ],
+      "size": [
+        5,
+        3.5,
+        5
+      ],
+      "rotation_y": 305,
+      "label": "木屋·西南",
+      "material_intent": "木板墙 + 茅草顶",
+      "color_role": "wall",
+      "importance": "secondary",
+      "notes": "最旧的一栋，略歪"
+    },
+    {
+      "id": "house_4",
+      "kind": "building",
+      "shape": "box",
+      "position": [
+        9,
+        0,
+        9
+      ],
+      "size": [
+        6,
+        4,
+        5
+      ],
+      "rotation_y": 45,
+      "label": "木屋·东南",
+      "material_intent": "夯土墙 + 木瓦顶，门上挂一面小旗",
+      "color_role": "wall",
+      "importance": "secondary",
+      "notes": ""
+    },
+    {
+      "id": "well",
+      "kind": "prop",
+      "shape": "cylinder",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "size": [
+        1.6,
+        1.2,
+        1.6
+      ],
+      "rotation_y": 0,
+      "label": "石井",
+      "material_intent": "石砌井口，木架 + 吊桶",
+      "color_role": "stone",
+      "importance": "landmark",
+      "notes": "整个场景的视觉中心"
+    },
+    {
+      "id": "fence_east",
+      "kind": "wall",
+      "shape": "box",
+      "position": [
+        16,
+        0,
+        0
+      ],
+      "size": [
+        0.3,
+        1.2,
+        14
+      ],
+      "rotation_y": 0,
+      "label": "东侧木栅栏",
+      "material_intent": "歪斜的木栅栏",
+      "color_role": "roof",
+      "importance": "detail",
+      "notes": "把广场和林子分开，有一处缺口"
+    }
+  ],
+  "regions": [
+    {
+      "id": "plaza",
+      "kind": "gathering",
+      "polygon": [
+        [
+          -8,
+          -8
+        ],
+        [
+          8,
+          -8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          -8,
+          8
+        ]
+      ],
+      "surface": "stone",
+      "label": "石板广场",
+      "notes": "以井为中心，石板向外逐渐变成土"
+    },
+    {
+      "id": "forest_east",
+      "kind": "forest",
+      "polygon": [
+        [
+          18,
+          -30
+        ],
+        [
+          38,
+          -30
+        ],
+        [
+          38,
+          30
+        ],
+        [
+          18,
+          30
+        ]
+      ],
+      "surface": "ground",
+      "density": 0.6,
+      "label": "东侧林地",
+      "notes": "落叶树，树冠 6–8 m，靠栅栏一侧稀，往东越密"
+    }
+  ],
+  "paths": [
+    {
+      "id": "main_road_s",
+      "kind": "road",
+      "width": 4,
+      "points": [
+        [
+          0,
+          38
+        ],
+        [
+          0,
+          8
+        ]
+      ],
+      "surface": "ground",
+      "label": "进村土路（南段）",
+      "notes": "从场景南端笔直向北，接到广场南边；广场本身就是路的一部分"
+    },
+    {
+      "id": "main_road_n",
+      "kind": "road",
+      "width": 4,
+      "points": [
+        [
+          0,
+          -8
+        ],
+        [
+          -9,
+          -17
+        ],
+        [
+          -18,
+          -25
+        ],
+        [
+          -26,
+          -34
+        ]
+      ],
+      "surface": "ground",
+      "label": "出村土路（北段）",
+      "notes": "从广场北边出来，向西北绕过山脚出村，始终贴着山丘外缘"
+    }
+  ],
+  "markers": [
+    {
+      "id": "spawn",
+      "kind": "player_spawn",
+      "position": [
+        0,
+        0,
+        34
+      ],
+      "rotation_y": 0,
+      "label": "玩家出生点",
+      "notes": "面朝北，正对井和山"
+    },
+    {
+      "id": "poi_well_view",
+      "kind": "poi",
+      "position": [
+        0,
+        0,
+        12
+      ],
+      "rotation_y": 0,
+      "label": "井的最佳观看点",
+      "notes": "走到这里时四栋房子和山刚好都在画面里"
+    },
+    {
+      "id": "light_lantern_1",
+      "kind": "light",
+      "position": [
+        -7,
+        2.5,
+        -3
+      ],
+      "label": "house_1 门口的灯笼",
+      "notes": "暖色点光，黄昏时唯一的人造光"
+    }
+  ],
+  "relations": [
+    {
+      "type": "faces",
+      "a": "house_1",
+      "b": "well"
+    },
+    {
+      "type": "faces",
+      "a": "house_2",
+      "b": "well"
+    },
+    {
+      "type": "faces",
+      "a": "house_3",
+      "b": "well"
+    },
+    {
+      "type": "faces",
+      "a": "house_4",
+      "b": "well"
+    },
+    {
+      "type": "inside",
+      "a": "well",
+      "b": "plaza"
+    },
+    {
+      "type": "adjacent",
+      "a": "house_1",
+      "b": "plaza"
+    },
+    {
+      "type": "adjacent",
+      "a": "house_2",
+      "b": "plaza"
+    },
+    {
+      "type": "adjacent",
+      "a": "house_3",
+      "b": "plaza"
+    },
+    {
+      "type": "adjacent",
+      "a": "house_4",
+      "b": "plaza"
+    },
+    {
+      "type": "connects",
+      "a": "main_road_s",
+      "b": "plaza"
+    },
+    {
+      "type": "connects",
+      "a": "main_road_n",
+      "b": "plaza"
+    },
+    {
+      "type": "far_from",
+      "a": "main_road_n",
+      "b": "hill_back",
+      "notes": "路贴着山脚外缘走，不上坡"
+    },
+    {
+      "type": "visible_from",
+      "a": "hill_back",
+      "b": "spawn"
+    },
+    {
+      "type": "visible_from",
+      "a": "well",
+      "b": "spawn"
+    },
+    {
+      "type": "blocks",
+      "a": "fence_east",
+      "b": "forest_east",
+      "notes": "栅栏挡在广场与林地之间"
+    }
+  ],
+  "constraints": [
+    {
+      "type": "locked",
+      "targets": [
+        "well",
+        "spawn"
+      ]
+    },
+    {
+      "type": "min_clearance",
+      "targets": [
+        "main_road_s",
+        "main_road_n"
+      ],
+      "meters": 3,
+      "notes": "路两侧 3 m 内不放 volumes；markers 可以在路上"
+    },
+    {
+      "type": "keep_inside",
+      "targets": [
+        "*"
+      ],
+      "region": "bounds"
+    },
+    {
+      "type": "must_reach",
+      "from": "spawn",
+      "targets": [
+        "well",
+        "house_1",
+        "house_2",
+        "house_3",
+        "house_4"
+      ]
+    }
+  ],
+  "views": [
+    {
+      "kind": "top_down",
+      "image": "views/top.png",
+      "scale_m_per_px": 0.04902,
+      "north_up": true,
+      "labels_drawn": true
+    },
+    {
+      "kind": "isometric",
+      "image": "views/iso.png",
+      "labels_drawn": true
+    }
+  ],
+  "asset_hints": {
+    "house_1": {
+      "search": "medieval wooden cottage thatched roof low poly",
+      "generator_prompt": "a rustic one-story wooden cottage with thatched roof, two steps at the door, low-poly game asset",
+      "fit": "scale_to_volume",
+      "fallback": "primitive"
+    },
+    "well": {
+      "search": "stone water well wooden frame bucket",
+      "generator_prompt": "a round stone water well with a wooden frame and bucket, game prop",
+      "fit": "scale_to_volume",
+      "fallback": "primitive"
+    },
+    "forest_east": {
+      "search": "deciduous tree low poly autumn",
+      "scatter": {
+        "min_spacing": 4,
+        "scale_jitter": 0.3
+      },
+      "fallback": "cylinder+sphere"
+    }
+  }
+}

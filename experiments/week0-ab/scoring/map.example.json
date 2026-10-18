@@ -1,0 +1,11 @@
+{
+  "_comment": "A 条件用：把 AI 自己起的名字映射到 SID 的 id。键是 readback.json 里的 name，值是意图 id。用法：score_readback.py ... --map map.json",
+  "big_house_nw": "house_1",
+  "house_northeast": "house_2",
+  "old_house_sw": "house_3",
+  "house_se": "house_4",
+  "stone_well": "well",
+  "wooden_fence": "fence_east",
+  "player_spawn_point": "spawn",
+  "lantern": "light_lantern_1"
+}
