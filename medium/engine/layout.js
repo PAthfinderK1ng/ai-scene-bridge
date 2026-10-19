@@ -10,8 +10,8 @@ export const HOUSE_SIZES = Object.freeze({ width: [5, 7], height: [3.5, 4.5], de
 /** 树的尺寸基准 [直径, 高, 直径]，抖动 ±20% */
 export const TREE_SIZE = Object.freeze([5, 7, 5]);
 
-/** 不放房子的区域类型（forest 另行出树；其余只铺地） */
-const NO_HOUSE_KINDS = new Set(["forest", "plaza", "gathering", "farmland", "terrace", "water", "danger"]);
+/** 不放房子的区域类型（forest 另行出树；其余只铺地）。gathering「聚落」= 密集民居，照常放房。 */
+const NO_HOUSE_KINDS = new Set(["forest", "plaza", "farmland", "terrace", "water", "danger"]);
 
 const DEG = Math.PI / 180;
 const DEFAULTS = Object.freeze({
@@ -175,7 +175,7 @@ export function houseFacing(T, x, z, roads, centroid, within = DEFAULTS.faceRoad
  * @param {object} sid  场景文档（读 regions / paths / volumes / bounds）
  * @param {object} T    buildTerrain 的结果
  * @param {object} [opts] { seed, density（全局倍率）, inset, pathClearance, streamClearance, landmarkClearance, houseGap, faceRoadWithin, maxSlope }
- * @returns {{ volumes: object[], perTerrace: Object<number, number>, rejected: Object<string, number> }}
+ * @returns {{ volumes: object[], perTerrace: Object<number, number>, rejected: Object<string, number>, filled: number }}
  *   volumes 含房子（kind building）与 forest 区域的树（kind prop）；perTerrace 以层号为键；rejected 统计各规则淘汰的候选数。
  */
 export function layoutHouses(sid, T, opts = {}) {
@@ -184,14 +184,18 @@ export function layoutHouses(sid, T, opts = {}) {
   const paths = (sid.paths || []).filter((p) => p && Array.isArray(p.points) && p.points.length >= 2);
   const roads = paths.filter((p) => p.kind !== "river").map((p) => p.points);
   const obstacles = (sid.volumes || []).filter((v) => v && !v.generated && v.position && v.size)
-    .map((v) => ({ rect: boxCorners(v.position, v.size, v.rotation_y || 0), clearance: v.importance === "landmark" ? o.landmarkClearance : 1 }));
+    .map((v) => ({ rect: boxCorners(v.position, v.size, v.rotation_y || 0), clearance: v.importance === "landmark" ? o.landmarkClearance : 1 }))
+    // 多层空间的连接点（楼梯口 / 井口 / 梯子）按 3×3 m 占地避让
+    .concat((sid.markers || []).filter((m) => m && m.kind === "connector" && Array.isArray(m.position)).map((m) => ({ rect: boxCorners(m.position, [3, 1, 3], 0), clearance: 1.5 })));
   const bounds = sid.bounds || { min: [T.xmin, 0, T.zmin], max: [T.xmax, 40, T.zmax] };
 
   // placed：已放房子的底面；treeRects：已放树的底面（圆柱按外接正方形）。房与树互相避让，区域重叠（用户在台地上圈一块林子）时也不压。
   const volumes = [], placed = [], treeRects = [], perTerrace = {}, rejected = {};
   const reject = (why) => { rejected[why] = (rejected[why] || 0) + 1; };
   const counters = {};
+  let filled = 0; // 兜底（fillBand）放下的房子数
 
+  const houseRegions = [];
   regions.forEach((rg, ri) => {
     const density = clamp((Number(rg.density) || 0) * o.density, 0, 1.6);
     const seed = (o.seed * 7919 + ri * 131 + 17) >>> 0;
@@ -203,44 +207,93 @@ export function layoutHouses(sid, T, opts = {}) {
     const rand = rng(seed);
     const centroid = polygonCentroid(rg.polygon);
     const spacing = spacingForDensity(density);
-    const minCenterDist = spacing * o.minDistFactor;
     // 窄台地（环带 / 溪谷两岸只有 8–10 m 宽）：内缩按宽度自适应，房子进深也跟着收，否则一栋都放不下。
     // 不跨崖仍由下面的「四角同一台地」保证。
     const meanWidth = regionMeanWidth(rg.polygon);
     const inset = clamp(meanWidth * 0.15, 0.5, o.inset);
     const depthMax = Math.max(HOUSE_SIZES.depth[0] - 0.5, meanWidth - 2 * inset - 0.5);
-    const oo = Object.assign({}, o, { inset });
+    const R = { rg, rand, centroid, density, minCenterDist: spacing * o.minDistFactor, oo: Object.assign({}, o, { inset }), centers: [], n: 0 };
+    houseRegions.push(R);
     // 泊松盘近似：候选点铺到 spacing/2 的抖动网格并种子化打乱，再用「中心距 ≥ minCenterDist」筛，密度由此可控
-    const centers = [];
     for (const [x, z] of shuffle(jitteredGrid(rg.polygon, spacing / 2, rand), rand)) {
-      if (centers.some(([cx, cz]) => Math.hypot(cx - x, cz - z) < minCenterDist)) { reject("too_close"); continue; }
+      if (R.centers.some(([cx, cz]) => Math.hypot(cx - x, cz - z) < R.minCenterDist)) { reject("too_close"); continue; }
       // 尺寸与朝向先定（它们决定 OBB），再逐条规则检查
       const size = [r2(lerpRange(HOUSE_SIZES.width, rand())), r2(lerpRange(HOUSE_SIZES.height, rand())), r2(lerpRange([Math.min(HOUSE_SIZES.depth[0], depthMax), Math.min(HOUSE_SIZES.depth[1], depthMax)], rand()))];
-      const px = r2(x), pz = r2(z);
-      const { facing, faces } = houseFacing(T, px, pz, roads, centroid, o.faceRoadWithin);
-      const rotation_y = facingToRotation(facing);
-      const rect = boxCorners([px, 0, pz], size, rotation_y);
-      const why = checkHouse(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds, oo);
-      if (why) { reject(why); continue; }
-      const level = rg.level;
-      counters[level] = (counters[level] || 0) + 1;
-      // terrace_level / region_id 是 schema 字段；level / terrace_id / faces_toward 是引擎附加（level 为 terrace_level 的别名）
-      const vol = {
-        id: `house_${level}_${counters[level]}`, kind: "building", shape: "box",
-        position: [px, r2(T.heightAt(px, pz)), pz], size, rotation_y,
-        label: "民居", importance: "secondary", color_role: "wall", generated: true,
-        terrace_level: level, region_id: rg.id, terrace_id: rg.terraceId, level, faces_toward: faces,
-      };
-      volumes.push(vol); placed.push(rect); centers.push([px, pz]);
-      perTerrace[level] = (perTerrace[level] || 0) + 1;
+      const why = tryHouse(R, x, z, size, null);
+      if (why) reject(why);
     }
+    // 窄带兜底：这一块一栋都没放下（或不到 2 栋）时，沿带长方向找最宽处，用最小的房子再放
+    if (density >= 0.3) fillBand(R, density >= 0.75 ? 2 : 1);
   });
-  return { volumes, perTerrace, rejected };
+  // 全图兜底：密度正常（≥ 0.75）却不到 6 栋时，按面积从大到小每块再多放一栋，直到够数或放不下
+  if (o.density >= 0.75) {
+    const byArea = houseRegions.filter((R) => R.density >= 0.75).sort((a, b) => polygonArea(b.rg.polygon) - polygonArea(a.rg.polygon) || String(a.rg.id).localeCompare(String(b.rg.id)));
+    // 一轮每块多放一栋；某一轮一栋都没放下就停（只有一层住人时也能补够）
+    for (let round = 0; round < 6 && placed.length < 6; round++) {
+      const before = placed.length;
+      for (const R of byArea) { if (placed.length >= 6) break; fillBand(R, R.n + 1); }
+      if (placed.length === before) break;
+    }
+  }
+
+  /** 放一栋：朝向按规则（12 m 内朝路 / 朝下坡 / 朝外）；facing 给定时用它。成功返回 null，否则返回淘汰原因 */
+  function tryHouse(R, x, z, size, facingIn) {
+    const px = r2(x), pz = r2(z), rg = R.rg;
+    const F = facingIn || houseFacing(T, px, pz, roads, R.centroid, o.faceRoadWithin);
+    const rotation_y = facingToRotation(F.facing);
+    const rect = boxCorners([px, 0, pz], size, rotation_y);
+    const why = checkHouse(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds, R.oo);
+    if (why) return why;
+    const level = rg.level;
+    counters[level] = (counters[level] || 0) + 1;
+    // terrace_level / region_id 是 schema 字段；level / terrace_id / faces_toward 是引擎附加（level 为 terrace_level 的别名）
+    volumes.push({
+      id: `house_${level}_${counters[level]}`, kind: "building", shape: "box",
+      position: [px, r2(T.heightAt(px, pz)), pz], size, rotation_y,
+      label: "民居", importance: "secondary", color_role: "wall", generated: true,
+      terrace_level: level, region_id: rg.id, terrace_id: rg.terraceId, level, faces_toward: F.faces,
+    });
+    placed.push(rect); R.centers.push([px, pz]); R.n++;
+    perTerrace[level] = (perTerrace[level] || 0) + 1;
+    return null;
+  }
+  /** 兜底放房：区域内 1.5 m 网格点按「离边最远」排序（带的中线优先），房子取最小宽、进深按当地带宽收（≥ 3.5 m）；
+   *  朝向先按规则，放不下再试朝下坡 / 朝外（门仍朝坡下或外侧，长边自然顺着带）。中心距放宽到 0.7 倍。确定性：无随机。 */
+  function fillBand(R, target) {
+    if (R.n >= target) return;
+    const rg = R.rg, inset = 0.5;
+    const pts = interiorPoints(rg.polygon, 1.5).filter((q) => q.d >= 2.2).sort((a, b) => b.d - a.d || a.p[0] - b.p[0] || a.p[1] - b.p[1]);
+    const oo = R.oo; R.oo = Object.assign({}, oo, { inset });
+    const h = r2((HOUSE_SIZES.height[0] + HOUSE_SIZES.height[1]) / 2);
+    for (const { p, d } of pts) {
+      if (R.n >= target) break;
+      if (R.centers.some(([cx, cz]) => Math.hypot(cx - p[0], cz - p[1]) < R.minCenterDist * 0.7)) continue;
+      const depth = r2(clamp(2 * (d - inset) - 0.4, HOUSE_SIZES.depth[0] - 0.5, HOUSE_SIZES.depth[0]));
+      const size = [HOUSE_SIZES.width[0], h, depth];
+      const rule = houseFacing(T, p[0], p[1], roads, R.centroid, o.faceRoadWithin);
+      const dh = downhillDir(T, p[0], p[1]);
+      const out = Math.hypot(p[0] - R.centroid[0], p[1] - R.centroid[1]) > 1e-6 ? [(p[0] - R.centroid[0]), (p[1] - R.centroid[1])] : null;
+      const opts = [rule];
+      if (dh && rule.faces !== "downhill") opts.push({ facing: dh, faces: "downhill" });
+      if (out && rule.faces !== "outward") { const m = Math.hypot(out[0], out[1]); opts.push({ facing: [out[0] / m, out[1] / m], faces: "outward" }); }
+      for (const F of opts) if (!tryHouse(R, p[0], p[1], size, F)) { filled++; break; }
+    }
+    R.oo = oo;
+  }
+  return { volumes, perTerrace, rejected, filled };
 }
 
 function lerpRange([a, b], t) { return a + (b - a) * t; }
 /** 多边形的「平均宽度」= 2·面积 / 周长（长条形区域时就是它的宽） */
 function regionMeanWidth(poly) { const A = Math.abs(polygonArea(poly)); let P = 0; for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; P += Math.hypot(a[0] - b[0], a[1] - b[1]); } return P > 0 ? (2 * A) / P : 0; }
+/** 多边形内 step 网格点（行优先）及其离边距离 d */
+function interiorPoints(poly, step) {
+  let xmin = Infinity, zmin = Infinity, xmax = -Infinity, zmax = -Infinity;
+  for (const [x, z] of poly) { xmin = Math.min(xmin, x); xmax = Math.max(xmax, x); zmin = Math.min(zmin, z); zmax = Math.max(zmax, z); }
+  const out = [];
+  for (let z = zmin + step / 2; z < zmax; z += step) for (let x = xmin + step / 2; x < xmax; x += step) { const p = [r2(x), r2(z)]; if (pointInPolygon(p, poly)) out.push({ p, d: distToPolygon(p, poly) }); }
+  return out;
+}
 /** 种子化 Fisher–Yates 打乱（原地），保证确定性 */
 function shuffle(arr, rand) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; } return arr; }
 

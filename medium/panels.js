@@ -1,8 +1,6 @@
-// panels.js — 右栏三面板 + 色板：我理解为（可确认 / 翻替代 / 锁）、关系检查（✓/✗ + 修法）、我假设了（默认值可改）、参考与色板。
-// 所有文案都从「卡 + 引擎事实」生成，不写死几何。
-import { el, ARCH_LABEL, TOD_LABEL, WIDTH_LABEL } from "./cards.js";
-import { LANDMARK_LABEL, PLACEMENT_LABEL, SPAWN_LABEL } from "./views/map.js";
-import { slopeLabel } from "./views/profile.js";
+// panels.js — 右栏的关系检查（✓/✗ + 修法，全 ✓ 折成一行）与参考 / 色板；人话化 id 的小工具。
+// 参数面板在 params.js，空间层 / 选中在 sidepanels.js。所有文案都从「卡 + 引擎事实」生成，不写死几何。
+import { el } from "./cards.js";
 
 /** 引擎内部 id → 人话：terrace_3（第 4 层）→ 第 4 层台地，main_trail → 主路，house_2_1 → 第 3 层第 2 栋 */
 export function humanize(s) {
@@ -11,71 +9,13 @@ export function humanize(s) {
     .replace(/terrace_(w_|e_)?(\d+)/g, (_, side, n) => `${side === "w_" ? "西坡" : side === "e_" ? "东坡" : ""}第 ${+n + 1} 层台地`)
     .replace(/main_trail/g, "主路")
     .replace(/house_(\d+)_(\d+)/g, (_, l, i) => `第 ${+l + 1} 层第 ${+i + 1} 栋`)
+    .replace(/u_house_(\d+)/g, "你挪的第 $1 栋")
     .replace(/tree_\w+/g, "一棵树")
     .replace(/spur_\w+/g, "支路");
 }
 
 /** 主路步行时间（分钟）：平路 70 m/min，每爬 10 m 多一分钟，最少半分钟 */
 export function walkMinutes(t) { if (!t) return 0; return Math.max(0.5, Math.round(((t.length_m || 0) / 70 + (t.climb_m || 0) / 10) * 10) / 10); }
-
-// ------------------------------------------------------------ 我理解为
-/**
- * @param ctx { card, facts, eye, checks, sid }
- * @returns [{ key, text, detail, alternatives: [{label, patch}] | [], lockable }]
- */
-export function understandingItems(ctx) {
-  const { card, facts = {}, eye = {} } = ctx;
-  if (!card) return [];
-  const p = card.params || {};
-  const lmLabel = card.landmark.label || LANDMARK_LABEL[card.landmark.kind] || "地标";
-  const t = facts.trail || {};
-  const items = [];
-  items.push({ key: "archetype", text: `整体是「${ARCH_LABEL[card.archetype] || card.archetype}」`, detail: card.one_liner || "", lockable: true,
-    alternatives: Object.entries(ARCH_LABEL).filter(([k]) => k !== card.archetype).map(([k, l]) => ({ label: `改成「${l}」`, patch: { archetype: k } })) });
-  items.push({ key: "terraces", text: `${p.terraces} 层台地，每层约 ${p.layer_height_m} m，${WIDTH_LABEL[p.plateau_width] || ""}`, detail: `村子总高差约 ${Math.round((p.terraces - 1) * p.layer_height_m)} m`, lockable: true,
-    alternatives: [
-      p.terraces > 3 ? { label: `少一层（${p.terraces - 1} 层）`, patch: { params: { terraces: p.terraces - 1 } } } : null,
-      p.terraces < 7 ? { label: `多一层（${p.terraces + 1} 层）`, patch: { params: { terraces: p.terraces + 1 } } } : null,
-      p.layer_height_m < 5.5 ? { label: `更陡（每层 ${Math.min(6, p.layer_height_m + 1.5)} m）`, patch: { params: { layer_height_m: Math.min(6, p.layer_height_m + 1.5) } } } : null,
-      p.layer_height_m > 3 ? { label: `更缓（每层 ${Math.max(2.5, p.layer_height_m - 1.5)} m）`, patch: { params: { layer_height_m: Math.max(2.5, p.layer_height_m - 1.5) } } } : null,
-      { label: p.plateau_width === "wide" ? "台地窄一点" : "台地宽一点", patch: { params: { plateau_width: p.plateau_width === "wide" ? "medium" : p.plateau_width === "medium" ? "wide" : "medium" } } },
-    ].filter(Boolean) });
-  const lvl = facts.landmark_level, lmH = (card.landmark.size_m || [])[1] || 0;
-  items.push({ key: "landmark", text: `${lmLabel}（${LANDMARK_LABEL[card.landmark.kind] || card.landmark.kind}）在${PLACEMENT_LABEL[card.landmark.placement] || card.landmark.placement}`, detail: lvl != null ? `落在第 ${lvl + 1} 层（+${Math.round(lvl * (p.layer_height_m || 0))} m），高 ${lmH} m ≈ ${Math.max(1, Math.round(lmH / 4))} 栋民居高` : `高 ${lmH} m，不在任何台地上`, lockable: true,
-    alternatives: Object.entries(PLACEMENT_LABEL).filter(([k]) => k !== card.landmark.placement && (k !== "plaza" || card.archetype === "ring_terrace")).map(([k, l]) => ({ label: `放到${l}`, patch: { landmark: { placement: k } } }))
-      .concat(Object.entries(LANDMARK_LABEL).filter(([k]) => k !== card.landmark.kind).map(([k, l]) => ({ label: `换成${l}`, patch: { landmark: { kind: k, label: l } } }))) });
-  const vis = eye.landmark_visible == null ? "" : eye.landmark_visible ? `，第一眼就看见它（画面${eye.landmark_screen || "中"}，仰角 ${eye.landmark_elev_deg}°）` : "，但第一眼看不见它（被挡住）";
-  items.push({ key: "spawn", text: `玩家从${SPAWN_LABEL[card.spawn.placement] || card.spawn.placement}进来${vis}`, detail: eye.landmark_dist_m != null ? `到${lmLabel}直线约 ${eye.landmark_dist_m} m` : "", lockable: true,
-    alternatives: Object.entries(SPAWN_LABEL).filter(([k]) => k !== card.spawn.placement).map(([k, l]) => ({ label: `入口改到${l}`, patch: { spawn: { placement: k } } })) });
-  if (t.length_m != null) items.push({ key: "trail", text: `主路${ctx.userTrail ? "按你画的走" : t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m`, detail: `约 ${Math.round(t.steps_estimate || 0)} 级台阶 · 走约 ${walkMinutes(t)} 分钟 · 最陡 ${slopeLabel(t.max_slope || 0)}${t.max_slope > 0.7 ? "（偏陡，会做成台阶）" : ""}`, lockable: true,
-    alternatives: [[0, "直上"], [2, "之字 2 折"], [3, "之字 3 折"], [5, "盘绕 5 折"]].filter(([f]) => f !== t.folds || ctx.userTrail).map(([f, l]) => ({ label: `主路改成${l}`, action: { trail_folds: f } })).concat(ctx.userTrail ? [{ label: "恢复算出来的路", action: { trail_reset: true } }] : []) });
-  if (facts.perTerrace) {
-    const levels = Object.keys(facts.perTerrace).map(Number).sort((a, b) => a - b);
-    const desc = levels.map((l) => `${l + 1} 层 ${facts.perTerrace[l]} 栋`).join("，");
-    items.push({ key: "density", text: `共 ${facts.houses || 0} 栋民居：${desc}`, detail: card.regions && card.regions.some((r) => r.kind !== "other") ? "特殊用途：" + card.regions.filter((r) => r.kind !== "other").map((r) => `${r.terrace + 1} 层${r.label || r.kind}`).join("、") : "上密下疏", lockable: false,
-      alternatives: [{ label: "整体更密（×1.3）", patch: { density_scale: 1.3 } }, { label: "整体更稀（×0.7）", patch: { density_scale: 0.7 } }] });
-  }
-  if (p.stream) items.push({ key: "stream", text: "一条溪从山上下来走谷底", detail: "宽约 4 m，房子离溪 ≥ 5 m", lockable: false, alternatives: [{ label: "去掉溪", patch: { params: { stream: false } } }] });
-  items.push({ key: "lighting", text: `时段：${TOD_LABEL[(card.lighting || {}).time_of_day] || "黄昏"}，气氛「${(card.mood || []).join("、") || "宁静"}」`, detail: `色板：${(card.palette || []).map((c) => c.note || c.role).join(" / ")}`, lockable: false,
-    alternatives: Object.entries(TOD_LABEL).filter(([k]) => k !== (card.lighting || {}).time_of_day).map(([k, l]) => ({ label: `改成${l}`, patch: { lighting: { time_of_day: k } } })) });
-  return items;
-}
-
-/** 「我理解为」列表：每条「对」（对 = 锁住，再点取消）/「不是」（看替代解释）两键一行 */
-export function renderUnderstanding(ul, items, st, cb) {
-  ul.replaceChildren();
-  for (const it of items) {
-    const confirmed = st.confirmed.has(it.key), locked = st.locked.has(it.key);
-    const li = el("li", { class: confirmed ? "confirmed" : "" },
-      el("span", { class: confirmed ? "ok" : "warn" }, confirmed ? "✓" : "?"),
-      el("div", { class: "t" }, it.text, locked ? el("span", { class: "badge lock", title: "换一批时不动它" }, "锁") : null, it.detail ? el("span", { class: "d" }, it.detail) : null),
-      el("div", { style: "display:flex;gap:3px;flex:none" },
-        el("button", { class: confirmed ? "on" : "", onclick: () => cb.confirm(it.key), title: confirmed ? "取消确认（也解锁）" : "对，就是这样（对 = 锁住，换一批时不动它）" }, "对"),
-        it.alternatives.length ? el("button", { onclick: (ev) => cb.flip(it, ev), title: "不是这样，看替代解释" }, "不是") : null,
-      ));
-    ul.append(li);
-  }
-}
 
 // ------------------------------------------------------------ 关系检查
 /**
@@ -109,31 +49,6 @@ export function renderChecks(ul, checks, st, cb) {
     ul.append(el("li", {}, el("div", { class: "t hint" }, "每条 ✓ / ✗ 都是程序按几何算的"), toggleBtn("收起")));
   } else if (good.length) {
     ul.append(el("li", { class: "confirmed", title: good.map((c) => humanize(c.text)).join(" · ") }, el("span", { class: "ok" }, "✓"), el("div", { class: "t" }, `其余 ${good.length} 项 ✓`), toggleBtn("展开")));
-  }
-}
-
-// ------------------------------------------------------------ 我假设了
-export function assumptionItems(card, userSet) {
-  if (!card) return [];
-  const p = card.params || {};
-  const all = [
-    { key: "lighting.time_of_day", label: "时段", value: TOD_LABEL[(card.lighting || {}).time_of_day] || "黄昏", options: Object.entries(TOD_LABEL).map(([k, l]) => ({ label: l, patch: { lighting: { time_of_day: k } } })) },
-    { key: "params.layer_height_m", label: "每层高差", value: `${p.layer_height_m} m`, options: [2.5, 3, 4, 5, 6].map((v) => ({ label: `${v} m`, patch: { params: { layer_height_m: v } } })) },
-    { key: "params.plateau_width", label: "台地宽度", value: WIDTH_LABEL[p.plateau_width] || p.plateau_width, options: Object.entries(WIDTH_LABEL).map(([k, l]) => ({ label: l, patch: { params: { plateau_width: k } } })) },
-    { key: "params.stream", label: "溪流", value: p.stream ? "有" : "没有", options: [{ label: "有", patch: { params: { stream: true } } }, { label: "没有", patch: { params: { stream: false } } }] },
-    { key: "landmark.size", label: "地标尺寸", value: `${card.landmark.size_m[0]}×${card.landmark.size_m[1]} m（宽×高）`, options: [[6, 7], [8, 9], [8, 14], [10, 18]].map(([w, h]) => ({ label: `${w}×${h} m`, patch: { landmark: { size_m: [w, h, w] } } })) },
-    { key: "house.style", label: "房型", value: "坡顶木屋 5–7 m 宽", options: [] },
-    { key: "wall", label: "挡土墙", value: "石砌", options: [] },
-  ];
-  return all.filter((a) => !userSet.has(a.key));
-}
-
-export function renderAssumptions(ul, items, cb) {
-  ul.replaceChildren();
-  if (!items.length) { ul.append(el("li", {}, el("div", { class: "t hint" }, "你都定过了，没有我替你假设的。"))); return; }
-  for (const a of items) {
-    ul.append(el("li", {}, el("div", { class: "t" }, `${a.label}：${a.value}`, el("span", { class: "badge" }, "默认")),
-      a.options.length ? el("button", { onclick: (ev) => cb.pick(a, ev) }, "改") : el("span", { class: "d" }, "v1 固定")));
   }
 }
 

@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/PAthfinderK1ng/ai-scene-bridge/spec/sid.schema.json",
-  "title": "Scene Intent Document (SID) v0.1",
-  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。",
+  "title": "Scene Intent Document (SID) v0.1（含 v0.3 增补）",
+  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。v0.3 增补（全部可选，sid_version 仍为 0.1）：多层空间 spaces、连接点 markers[kind=connector]、自选剖切 meta.section、台地单独调高 features[].user_height、人拖过的体块 volumes[].user_moved、主路绕行 paths[].detour_around。",
   "type": "object",
   "required": ["sid_version", "meta", "volumes"],
   "additionalProperties": false,
@@ -24,7 +24,16 @@
         "description": { "type": "string" },
         "layer_height_m": { "type": "number", "minimum": 0.5, "default": 3, "description": "一「层」等于多少米；界面上高度以层显示（D15）" },
         "archetype": { "type": "string", "description": "地形原型名（slope_zigzag / ring_terrace / valley_two_banks），由「场景对话」写入" },
-        "card": { "type": "object", "description": "「场景对话」当前方案卡（结构级参数，LLM 只改这里，不写坐标）" }
+        "card": { "type": "object", "description": "「场景对话」当前方案卡（结构级参数，LLM 只改这里，不写坐标）" },
+        "section": {
+          "type": "object",
+          "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上",
+          "properties": {
+            "mode": { "type": "string", "enum": ["trail", "line"] },
+            "line": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "直线模式的两个端点 [x, z]" },
+            "width_m": { "type": "number", "minimum": 2, "maximum": 60, "default": 12 }
+          }
+        }
       }
     },
     "intent": {
@@ -119,7 +128,8 @@
                 "description": "台地俯视多边形（D13）；有它时 center/radius 由引擎回填为质心与外接半径"
               },
               "level": { "type": "integer", "minimum": 0, "description": "层号（0 = 最低），height = level × meta.layer_height_m" },
-              "skirt": { "type": "number", "minimum": 0, "description": "台地边缘坡面宽度（米），默认 clamp(height×0.8, 2, 10)" }
+              "skirt": { "type": "number", "minimum": 0, "description": "台地边缘坡面宽度（米），默认 clamp(height×0.8, 2, 10)" },
+              "user_height": { "type": "boolean", "description": "人在剖面上单独调过这一层的高度：height 是实际值，重算 / 换参数（同原型）时沿用" }
             }
           }
         }
@@ -149,7 +159,8 @@
           "locked": { "type": "boolean", "description": "人确认锁住，重算与出变体时不动" },
           "terrace_level": { "type": "integer", "description": "所在台地层号" },
           "region_id": { "type": "string" },
-          "kind_hint": { "type": "string", "description": "地标种类（temple/pagoda/tree/wheel/gate）等语义提示" }
+          "kind_hint": { "type": "string", "description": "地标种类（temple/pagoda/tree/wheel/gate）等语义提示" },
+          "user_moved": { "type": "boolean", "description": "人在俯视图上拖过（id 改为 u_house_<n>、generated 去掉）：重排不动它，y 跟着地面走" }
         }
       }
     },
@@ -212,6 +223,7 @@
           "notes": { "type": "string" },
           "generated": { "type": "boolean" },
           "user_drawn": { "type": "boolean", "description": "人画的一笔（经简化 / 吸附），重算时保留" },
+          "detour_around": { "type": "array", "items": { "$ref": "#/definitions/id" }, "description": "主路为躲开这几栋人放的房子（user_moved / locked）绕了路（引擎算，只读）" },
           "facts": { "type": "object", "description": "引擎算出的路径事实（length_m / climb_m / folds / max_slope / steps_estimate）" }
         }
       }
@@ -225,14 +237,47 @@
           "id": { "$ref": "#/definitions/id" },
           "kind": {
             "type": "string",
-            "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "other"]
+            "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "connector", "other"]
           },
           "position": { "$ref": "#/definitions/vec3" },
           "rotation_y": { "type": "number" },
           "size": { "$ref": "#/definitions/vec3" },
           "label": { "type": "string" },
           "notes": { "type": "string" },
-          "placement": { "type": "string", "description": "放置类（valley_bottom/side_slope/summit/S/E/W）" }
+          "placement": { "type": "string", "description": "放置类（valley_bottom/side_slope/summit/S/E/W）" },
+          "via": { "type": "string", "enum": ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"], "description": "连接点（kind connector）的形式：楼梯 / 梯子 / 井 / 竖井 / 升降台 / 索桥 / 坡道" },
+          "from": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "description": "连接点一端：\"ground\"（地面）或 spaces[].id" },
+          "to": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "description": "连接点另一端：\"ground\" 或 spaces[].id" },
+          "top_y": { "type": "number", "description": "连接点上端高度（米）" },
+          "bottom_y": { "type": "number", "description": "连接点下端高度（米）；position 是下端" },
+          "generated": { "type": "boolean", "description": "引擎自动放的连接点（重算时按主路重新选位置）" },
+          "user_moved": { "type": "boolean", "description": "人拖过的连接点：重算只改两端高度，不动位置" }
+        }
+      }
+    },
+    "spaces": {
+      "type": "array",
+      "description": "多层空间（D18）：地面之外的地下 / 空中空间，用 markers[kind=connector] 接到地面或彼此",
+      "items": {
+        "type": "object",
+        "required": ["id", "stratum", "kind", "polygon", "floor_y", "height"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" },
+          "stratum": { "type": "string", "enum": ["underground", "sky"] },
+          "kind": { "type": "string", "enum": ["cave", "tunnel", "cellar", "crypt", "platform", "walkway", "island", "bridge"], "description": "地下：cave 溶洞 / tunnel 地道 / cellar 地窖 / crypt 地宫；空中：platform 平台 / walkway 栈道 / island 浮岛 / bridge 天桥" },
+          "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" }, "description": "俯视多边形 [x, z]" },
+          "floor_y": { "type": "number", "description": "可走地面的绝对高度（米）" },
+          "height": { "type": "number", "exclusiveMinimum": 0, "description": "地下为净高；空中为板面以上可用高度（板厚 1 m 在板面之下）" },
+          "label": { "type": "string" },
+          "anchor": { "type": "string", "enum": ["landmark", "village", "top", "plaza", "ridge_end", "cliff_edge", "entry"], "description": "AI 卡片给的锚点类（引擎据此算多边形）" },
+          "size": { "type": "string", "enum": ["small", "medium", "large"] },
+          "depth_layers": { "type": "integer", "minimum": 1, "description": "地下：在地面下几层" },
+          "height_layers": { "type": "integer", "minimum": 1, "description": "空中：在地面上几层" },
+          "connect": { "type": "string", "enum": ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"], "description": "默认连接方式" },
+          "generated": { "type": "boolean", "description": "由卡片 levels 生成（重算时重放）" },
+          "user_set": { "type": "boolean", "description": "人在地下 / 天上层圈出来或接管的空间（重算时保留）" },
+          "user_height": { "type": "boolean", "description": "人在剖面上调过 floor_y / height（重算不覆盖）" },
+          "notes": { "type": "string" }
         }
       }
     },

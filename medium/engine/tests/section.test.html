@@ -1,0 +1,123 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain } from "../terrain.js";
+import { newDoc, applyCard, resolve, setTerraceHeight } from "../sid.js";
+import { defaultSection, sectionPath, sampleSection, rotateSection, widthClamp, projectToPath } from "../section.js";
+
+const card = (extra = {}) => Object.assign({ archetype: "slope_zigzag", params: { entry_side: "S", terraces: 4, layer_height_m: 3, plateau_width: "medium" }, landmark: { kind: "temple", placement: "top" }, spawn: { placement: "valley_bottom" } }, extra);
+const build = (extra) => resolve(applyCard(newDoc(), card(extra)), { seed: 1 });
+const len = (l) => Math.hypot(l[1][0] - l[0][0], l[1][1] - l[0][1]);
+const NS = { mode: "line", line: [[0, 56], [0, -56]], width_m: 12 };
+
+test("defaultSection：沿主路、宽 12 m、line 预置为主路首尾；sectionPath trail 模式 = 主路折线", () => {
+  const { sid, T } = build();
+  const s = defaultSection(sid, T), trail = sid.paths.find((p) => p.id === "main_trail");
+  assert(s.mode === "trail" && s.width_m === 12, "默认值");
+  assert(JSON.stringify(s.line) === JSON.stringify([trail.points[0], trail.points[trail.points.length - 1]]), "line = 主路首尾");
+  assert(JSON.stringify(sectionPath(s, sid)) === JSON.stringify(trail.points), "trail 模式取主路");
+  assert(JSON.stringify(sectionPath({ mode: "line", line: [[1, 2], [3, 40]] }, sid)) === "[[1,2],[3,40]]", "line 模式取两点");
+});
+
+test("没有主路时 trail 模式退回南北中线；line 不合法也退回", () => {
+  const sid = newDoc();
+  const p = sectionPath({ mode: "trail" }, sid);
+  assert(p.length === 2 && p[0][0] === 0 && p[1][0] === 0 && p[0][1] > p[1][1], "南 → 北中线 " + JSON.stringify(p));
+  assert(JSON.stringify(sectionPath({ mode: "line", line: [[0, 0], [0, 0.2]] }, sid)) === JSON.stringify(p), "退化直线退回");
+  const T = buildTerrain(sid);
+  assert(defaultSection(sid, T).line[0][1] === 58, "defaultSection 也退回中线");
+  const S = sampleSection(sid, T, { mode: "trail", width_m: 12 });
+  close(S.length_m, 116, 1e-6, "中线长度");
+});
+
+test("ground 每 1 m 一个采样且 d 单调递增；投影 d 沿线单调", () => {
+  const { sid, T } = build();
+  const S = sampleSection(sid, T, NS);
+  assert(S.ground.length >= Math.floor(S.length_m), "采样数 " + S.ground.length);
+  for (let i = 1; i < S.ground.length; i++) assert(S.ground[i].d > S.ground[i - 1].d, "ground d 单调");
+  const path = sectionPath(NS, sid);
+  let prev = -1;
+  for (let z = 50; z >= -50; z -= 5) { const pr = projectToPath(path, [7, z]); assert(pr.d > prev, "投影单调 " + z); close(pr.off, 7, 1e-6, "横向距离"); prev = pr.d; }
+  const S2 = sampleSection(sid, T, NS);
+  assert(JSON.stringify(S) === JSON.stringify(S2), "确定性");
+});
+
+test("台地段：南北直线穿过 4 层，每段 d0 < d1、层号随 d 递增；单独调高的层带 user_height", () => {
+  const r = build();
+  let S = sampleSection(r.sid, r.T, NS);
+  assert(S.terraces.length >= 4, "段数 " + S.terraces.length);
+  for (const t of S.terraces) assert(t.d0 < t.d1, `${t.id} d0 < d1`);
+  const lv = S.terraces.map((t) => t.level);
+  for (let i = 1; i < lv.length; i++) assert(lv[i] >= lv[i - 1], "层号递增 " + lv.join());
+  assert(S.terraces.every((t) => t.user_height === false), "默认没有单独调");
+  setTerraceHeight(r.sid, "terrace_2", 10.5);
+  const r2 = resolve(r.sid, { seed: 1 });
+  S = sampleSection(r2.sid, r2.T, NS);
+  const t2 = S.terraces.find((t) => t.id === "terrace_2");
+  assert(t2.user_height === true && t2.height === 10.5, "调高后 " + JSON.stringify(t2));
+  const g = S.ground.find((g) => g.d > (t2.d0 + t2.d1) / 2);
+  close(g.h, 10.5, 0.01, "地面高跟着变");
+});
+
+test("宽度带过滤：离剖切线 10 m 的体块 宽 12 不入带、宽 30 入带；体块 y0 / y1 与 [d0, d1]", () => {
+  const { sid, T } = build();
+  sid.volumes.push({ id: "probe", kind: "rock", shape: "box", position: [10, 0, 30], size: [2, 3, 2], rotation_y: 0 });
+  const a = sampleSection(sid, T, Object.assign({}, NS, { width_m: 12 })), b = sampleSection(sid, T, Object.assign({}, NS, { width_m: 30 }));
+  assert(!a.volumes.some((v) => v.id === "probe"), "宽 12 不入带");
+  const p = b.volumes.find((v) => v.id === "probe");
+  assert(p && p.d1 > p.d0, "宽 30 入带");
+  close(p.d1 - p.d0, 2, 0.01, "投影宽 2 m");
+  close(p.d0, 56 - 31, 0.01, "d0");
+  close(p.y1 - p.y0, 3, 1e-6, "高 3 m");
+  const lm = b.volumes.find((v) => v.importance === "landmark");
+  assert(lm && lm.y1 > lm.y0 && lm.label, "地标在带内");
+});
+
+test("rotateSection：旋转 90° 后长度不变、南北线变东西线（俯视逆时针）；4 × 90° 回原样；trail 模式转成 line", () => {
+  const r = rotateSection(NS, 90);
+  assert(r.mode === "line" && r.width_m === 12, "line 模式");
+  close(len(r.line), len(NS.line), 1e-6, "长度不变");
+  close(r.line[0][1], 0, 1e-6, "南端转到东西向"); close(Math.abs(r.line[0][0]), 56, 1e-6, "x = ±56");
+  close(r.line[0][0], 56, 1e-6, "南端（+z）逆时针 90° 到东（+x）");
+  let s = NS; for (let i = 0; i < 4; i++) s = rotateSection(s, 90);
+  for (let i = 0; i < 2; i++) for (let k = 0; k < 2; k++) close(s.line[i][k], NS.line[i][k], 0.02, "转回原样");
+  const p = rotateSection(NS, 45, [0, 56]);
+  close(p.line[0][0], 0, 1e-6, "绕端点转，端点不动"); close(len(p.line), 112, 0.02, "长度不变");
+  const t = rotateSection({ mode: "trail", line: [[0, 10], [0, -10]], width_m: 99 }, 30);
+  assert(t.mode === "line" && t.width_m === 60, "trail → line，宽度夹取");
+});
+
+test("空间与连接点入带：沿主路剖切能看到地标下的溶洞与它的楼梯；远处的平台宽带才看得到", () => {
+  const { sid, T } = build({ levels: [{ stratum: "underground", kind: "cave", anchor: "landmark", size: "medium" }, { stratum: "sky", kind: "platform", anchor: "village", size: "small" }] });
+  const S = sampleSection(sid, T, defaultSection(sid, T));
+  const cave = S.spaces.find((s) => s.stratum === "underground");
+  assert(cave && cave.d1 > cave.d0 && cave.floor_y < 0 + 20 && cave.height === 6, "溶洞入带 " + JSON.stringify(cave));
+  assert(S.connectors.some((c) => c.id === "conn_space_cave_1" && c.top_y > c.bottom_y && c.d >= 0 && c.d <= S.length_m + 0.01), "楼梯入带");
+  const line = { mode: "line", line: [[-58, -50], [-50, -58]], width_m: 2 };
+  const far = sampleSection(sid, T, line);
+  assert(far.spaces.length === 0 && far.connectors.length === 0, "角落的细带看不到空间");
+});
+
+test("paths：直线横穿主路 / 溪时给出交点 d；trail 模式不把主路自己算进去；widthClamp", () => {
+  const { sid, T } = build({ archetype: "valley_two_banks", params: { entry_side: "S", terraces: 3, layer_height_m: 3 } });
+  const EW = { mode: "line", line: [[-58, 0], [58, 0]], width_m: 12 };
+  const S = sampleSection(sid, T, EW);
+  const st = S.paths.find((p) => p.id === "stream");
+  assert(st, "横穿溪 " + JSON.stringify(S.paths));
+  between(st.d, 58 - 8, 58 + 8, "溪在中间");
+  for (let i = 1; i < S.paths.length; i++) assert(S.paths[i].d >= S.paths[i - 1].d, "按 d 排序");
+  const tr = sampleSection(sid, T, defaultSection(sid, T));
+  assert(!tr.paths.some((p) => p.id === "main_trail"), "trail 模式不含主路自己");
+  assert(widthClamp(1) === 2 && widthClamp(100) === 60 && widthClamp("abc") === 12 && widthClamp(12.4) === 12 && widthClamp(undefined) === 12, "widthClamp");
+});
+
+test("meta.section 省略 section 参数时生效", () => {
+  const { sid, T } = build();
+  sid.meta.section = { mode: "line", line: [[0, 50], [0, 20]], width_m: 4 };
+  const S = sampleSection(sid, T);
+  close(S.length_m, 30, 1e-6, "用 meta.section");
+  assert(S.width_m === 4, "宽度");
+});
+
+run();
+</script>

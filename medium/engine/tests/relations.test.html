@@ -2,7 +2,8 @@
 <script type="module">
 import { test, run, assert, close, between } from "./harness.js";
 import { buildTerrain } from "../terrain.js";
-import { analyze, lineOfSight, reachable, reachSet, unreachedTerraces, landmarkWalk, CHECK_ORDER, findActors } from "../relations.js";
+import { analyze, lineOfSight, reachable, reachSet, unreachedTerraces, landmarkWalk, CHECK_ORDER, findActors, offTerrace, nearestHouseSpot } from "../relations.js";
+import { houseFacing, facingToRotation } from "../layout.js";
 import { validate, boxCorners, obbOverlap } from "../validate.js";
 import { villageSid, valleySid } from "./fixtures.js";
 
@@ -85,7 +86,7 @@ test("houses_no_overlap：两栋重叠的房 → false，fix 删掉 generated �
   let c = checkMap(analyze(sid, T)).houses_no_overlap;
   assert(c.ok === false && c.severity === "error", "应为 false");
   assert(c.detail.includes("h1") && c.detail.includes("h4"), "detail 点名 h1 与 h4：" + c.detail);
-  assert(c.fixes.length === 1 && c.fixes[0].label === "让 AI 重排", "fix 是让 AI 重排");
+  assert(c.fixes.length === 1 && c.fixes[0].label === "重排房子", "fix 是重排房子");
   c.fixes[0].patch(sid);
   assert(!sid.volumes.some((v) => v.id === "h4") && sid.volumes.some((v) => v.id === "h1"), "generated 的 h4 被删，h1 保留");
   assert(sid.meta.relayout_requests.includes("houses_no_overlap"), "记下重排请求");
@@ -235,7 +236,7 @@ test("性能：32 栋房的村子 analyze 单次 < 1500 ms", () => {
   const t0 = performance.now();
   const res = analyze(sid, T);
   const dt = performance.now() - t0;
-  assert(res.checks.length === 6 && res.relations.length > 40, "有结果：" + res.relations.length);
+  assert(res.checks.length === 7 && res.relations.length > 40, "有结果：" + res.relations.length);
   assert(dt < 1500, `耗时 ${dt.toFixed(1)} ms`);
   assert(checkMap(res).houses_no_overlap.ok === true && checkMap(res).houses_clear_of_paths.ok === true, "网格摆放不重叠不压路：" + checkMap(res).houses_no_overlap.detail + " / " + checkMap(res).houses_clear_of_paths.detail);
 });
@@ -277,6 +278,56 @@ test("unreachedTerraces：主路只到二层 → 列出三、四层及目标点�
   const sid2 = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 10]] });
   const detail = checkMap(analyze(sid2, T)).terraces_reachable.detail;
   for (const f of unreachedTerraces(sid2, T).failing) assert(detail.includes(f.t.id), "analyze 点名 " + f.t.id);
+});
+
+test("houses_on_terraces：人拖到台地边上的房子 → false；「挪回最近的台地」后四角同一台地、朝向按规则、不压路", () => {
+  const sid = scene();
+  const T0 = buildTerrain(sid);
+  const zEdge = Math.max(...T0.terraces[1].polygon.map((p) => p[1])); // 第 1 / 2 层交界（约 z = 20）
+  sid.volumes.push(house("u_house_1", -20, zEdge, 0, { user_moved: true, locked: true }));
+  const T = buildTerrain(sid);
+  let c = checkMap(analyze(sid, T)).houses_on_terraces;
+  assert(c.ok === false && c.text === "房子 都在台地上" && c.detail.includes("u_house_1"), "应点名 u_house_1：" + c.detail);
+  assert(c.fixes.map((f) => f.label).join() === "挪回最近的台地,不重要", "两个修法：" + c.fixes.map((f) => f.label));
+  c.fixes[0].patch(sid);
+  const h = sid.volumes.find((v) => v.id === "u_house_1");
+  assert(offTerrace(T, boxCorners(h.position, h.size, h.rotation_y)) === null, "挪后四角同一台地");
+  assert(Math.hypot(h.position[0] + 20, h.position[2] - zEdge) < 8, "挪得不远：" + h.position);
+  const roads = sid.paths.filter((p) => p.kind === "trail").map((p) => p.points), t = T.terraceAt(h.position[0], h.position[2]);
+  close(h.rotation_y, facingToRotation(houseFacing(T, h.position[0], h.position[2], roads, t.centroid).facing), 0.01, "朝向按规则");
+  assert(h.user_moved && h.locked && !h.generated, "仍是人放的");
+  const after = checkMap(analyze(sid, T));
+  assert(after.houses_on_terraces.ok && after.houses_clear_of_paths.ok && after.houses_no_overlap.ok, "修好后三项都过：" + after.houses_on_terraces.detail);
+  // 不重要
+  const sid2 = scene(); sid2.volumes.push(house("u_house_1", -20, zEdge, 0, { user_moved: true }));
+  checkMap(analyze(sid2, T)).houses_on_terraces.fixes[1].patch(sid2);
+  assert(checkMap(analyze(sid2, T)).houses_on_terraces.ignored === true, "标记不重要");
+});
+
+test("houses_clear_of_paths 覆盖人拖过的房子：压路 → 「挪开一点」把它挪到最近的空位（不删）", () => {
+  const sid = scene();
+  sid.volumes.push(house("u_house_2", 0.5, 31, 0, { user_moved: true, locked: true }));
+  const T = buildTerrain(sid);
+  const c = checkMap(analyze(sid, T)).houses_clear_of_paths;
+  assert(c.ok === false && c.detail.includes("u_house_2"), "人放的房子也查：" + c.detail);
+  assert(c.fixes.length === 1 && c.fixes[0].label === "挪开一点", "修法是挪开一点：" + c.fixes.map((f) => f.label));
+  c.fixes[0].patch(sid);
+  assert(sid.volumes.some((v) => v.id === "u_house_2"), "没被删");
+  const after = checkMap(analyze(sid, T));
+  assert(after.houses_clear_of_paths.ok && after.houses_on_terraces.ok, "挪后不压路、在台地上：" + after.houses_clear_of_paths.detail);
+  // 主路事实里记了绕行时，文案提一句
+  const sid3 = scene(); sid3.paths[0].detour_around = ["h1"];
+  assert(checkMap(analyze(sid3, T)).houses_clear_of_paths.detail.includes("主路为躲开 h1 绕了一下"), "绕行文案");
+});
+
+test("nearestHouseSpot：已在合格位置时原地返回；找不到时 null", () => {
+  const sid = scene();
+  const T = buildTerrain(sid);
+  const h = sid.volumes.find((v) => v.id === "h1");
+  const sp = nearestHouseSpot(sid, T, h);
+  assert(sp && sp.position[0] === -12 && sp.position[2] === 31, "原地：" + JSON.stringify(sp));
+  const big = house("huge", 0, 0, 0); big.size = [200, 4, 200];
+  assert(nearestHouseSpot(sid, T, big, 5) === null, "放不下 → null");
 });
 
 run();

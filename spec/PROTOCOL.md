@@ -33,9 +33,11 @@
 - `terrain.features[]` 里的台地是**多边形**：`kind: plateau`，`polygon` 是俯视多边形，`level` 是层号（0 最低），`height = level × meta.layer_height_m`，边缘坡面宽 `skirt`。高度场 = 各台地贡献取最大值：多边形内等于 `height`，外侧线性落到 0。请按这个做地形（Unity：Terrain 或按多边形挤出的网格；UE：Landscape 或 ProceduralMesh），不要用圆形山丘近似。
 - `volumes[]` 里 `generated: true` 的是引擎按规则铺的民居 / 树（长边平行等高线、门朝下坡或朝路、不压路、不重叠、不跨崖），坐标同样精确；`locked: true` 的是人确认过的，一毫米不能动；`importance: landmark` 的是地标；`kind: prop` + `shape: cylinder` + `label: 树` 是树冠占位。
 - `paths[]`：`main_trail` 是主路（`user_drawn: true` 表示人手画的），`spur_*` 是为了让每层台地都有路可达而补的支路，`stream` 是溪（`kind: river`）。主路请做成**石阶 + 歇脚平台**，`BRIEF.md` 里有折数、爬升、台阶数估计。
-- `regions[]`：每层台地一个（`terrace_level`），`kind` 为 other（民居）/ plaza（广场，不放房）/ forest（林子，只有树）/ farmland / terrace（梯田）/ gathering；`user_set: true` 的是人圈出来的多边形。
+- `regions[]`：每层台地一个（`terrace_level`），`kind` 为 other（民居）/ plaza（广场，不放房）/ forest（林子，只有树）/ farmland / terrace（梯田）/ gathering（聚落，更密的民居，照常放房）；`user_set: true` 的是人圈出来的多边形。
 - `meta.card` 是 AI 与人商定的结构卡（原型、层数、层高、地标放置类、入口放置类、每层用途与密度、色板、时段），`meta.archetype` 是地形原型名；`meta.ignored_checks` 是人说「不重要」的关系检查。
 - `relations[]` 全部由程序算出（on_top_of / faces / adjacent / visible_from / connects），可用来自检。
+- `spaces[]`（可能没有）：地面之外的**地下空间**（`stratum: underground`：cave 溶洞 / tunnel 地道 / cellar 地窖 / crypt 地宫）与**空中空间**（`stratum: sky`：platform 平台 / walkway 栈道 / island 浮岛 / bridge 天桥），`markers[]` 里 `kind: connector` 的是把它们接到地面或彼此的**连接点**。怎么搭见第 3.4 节。
+- `terrain.features[]` 上 `user_height: true` 的台地是人单独调过高度的层：`height` 是实际值，不再等于 `level × 层高`，照 `height` 做。`volumes[]` 上 `user_moved: true`（id 常为 `u_house_<n>`）的是人拖过的房子，和 `locked` 一样不要动。
 
 ## 1. 读法（按这个顺序）
 
@@ -103,6 +105,40 @@ SID：米，+Y 上，右手系，北 = −Z，`rotation_y` 0 = 朝北，俯视�
 - **数字直接用，不要"大约"。** 吸附到 `meta.grid` 的数字已经是最终值。
 - **一次只做一步，做完就看。** 每完成一类对象截一次俯视图，和 `views/top.png` 对照。
 - **不要向用户提问。** 不确定的写进最后的总结。
+
+### 3.4 多层空间与连接点怎么搭
+
+高度全部是**绝对值**（米，与地形同一基准），引擎已保证：地下空间顶板到地面至少 2 m 岩层，空中空间板底离地面至少 3 m。
+
+| 字段 | 含义 |
+| --- | --- |
+| `spaces[].polygon` | 俯视多边形 `[x, z]`（圆角多边形，或地道 / 栈道 / 天桥的 4 点长条） |
+| `spaces[].floor_y` | 可走地面的高度：地下 = 洞底；空中 = 板面 |
+| `spaces[].height` | 地下 = 净高（洞底到顶板）；空中 = 板面以上可用高度。空中的板**厚 1 m，在板面之下**（板底 = `floor_y − 1`） |
+| `markers[kind=connector]` | `via` 形式，`from` / `to` 是 `"ground"` 或空间 id，`position` 是**下端**，`top_y` / `bottom_y` 是两端高度 |
+
+**地下（underground）**，二选一：
+1. **挖空**：地形支持挖洞（Unity 体素 / Marching Cubes 地形、UE Landscape Hole + 网格）时，按多边形从 `floor_y` 挖到 `floor_y + height`，洞顶以上保留岩层。
+2. **用盒体围合**（地形不能挖时，v0 推荐）：地板 = 多边形挤出 0.5 m 薄片（顶面在 `floor_y`）；墙 = 沿多边形每条边一块 0.5 m 厚、`height` 高的盒子；顶板 = 多边形挤出 0.5 m（底面在 `floor_y + height`）。名字 `aux_<空间 id>_floor / _wall_<n> / _ceiling`，空间本身建一个空物体 `<空间 id>` 放在质心、`floor_y` 高度。
+   连接点处在地形上开一个洞口（或在洞口位置放 `aux_<连接点 id>_mouth` 标出），否则玩家下不去。
+
+**空中（sky）**：
+- **板**：多边形挤出 1 m，顶面在 `floor_y`，名字 `<空间 id>`（几何中心 y = `floor_y − 0.5`）。`walkway` / `bridge` 加 1 m 高栏杆（`aux_<id>_rail_<n>`）。
+- **支撑**：`platform` / `walkway` 在多边形顶点处立柱（`aux_<id>_post_<n>`，0.4 m 见方，从该点地面到板底），柱距 > 8 m 时中间补柱；`bridge` 只在两端落地，不立中柱；`island`（浮岛）不要支撑，板下加一个倒锥形岩体（`aux_<id>_rock`）。
+
+**连接点（connector）**：放在 `position`，从 `bottom_y` 通到 `top_y`，名字 = 连接点 id。
+
+| via | 怎么做 |
+| --- | --- |
+| `stairs` 楼梯 | 直跑或折返楼梯，每级高 0.17 m、深 0.3 m，宽 1.5 m；落差 > 3 m 每 3 m 加一个歇脚平台 |
+| `ladder` 梯子 | 0.6 m 宽竖梯，贴着空间边缘，顶部留 1 m 开口 |
+| `well` 井 | 直径 2 m 圆筒井口（地面以上 0.8 m 井栏）+ 内侧竖梯 |
+| `shaft` 竖井 | 2×2 m 方形竖井 + 竖梯，口部加盖板边框 |
+| `elevator` 升降台 | 2×2 m 平台 + 四角导轨，从 `bottom_y` 到 `top_y` |
+| `rope_bridge` 索桥 | 从 `position` 到所连空间最近的边，悬索步道宽 1.2 m |
+| `ramp` 坡道 | 坡度 ≤ 1:3 的折返坡道，宽 2 m |
+
+自检：从出生点能走到每个连接点的上 / 下端；地下空间的顶板不能露出地面；空中板底下不能有地形穿出。BRIEF.md 的「空间层」一节会列出每个空间与它的连接点。
 
 ## 4. Verify：读回、比对、修正
 

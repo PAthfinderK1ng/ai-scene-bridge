@@ -2,11 +2,12 @@
 // 约定见 SPEC.md 第 4 节。纯函数、确定性（没有随机）；LLM 不写坐标，fixes 的 patch 也只做几何推导后直接改 sid。
 import { buildTerrain, pointInPolygon, distToPolyline, distToPolygon, distToSegment, polygonCentroid, r2 } from "./terrain.js";
 import { boxCorners, obbOverlap, findObject } from "./validate.js";
+import { houseFacing, rectToRectDist } from "./layout.js";
 
 /** 可以走的路类型（溪、墙线、围栏不是走廊） */
 export const WALK_KINDS = new Set(["road", "trail", "bridge", "other"]);
 /** checks 的固定顺序 */
-export const CHECK_ORDER = ["spawn_sees_landmark", "trail_reaches_landmark", "landmark_on_top", "houses_no_overlap", "houses_clear_of_paths", "terraces_reachable"];
+export const CHECK_ORDER = ["spawn_sees_landmark", "trail_reaches_landmark", "landmark_on_top", "houses_no_overlap", "houses_clear_of_paths", "houses_on_terraces", "terraces_reachable"];
 
 const xz = (pos) => [pos[0], pos[2]];
 const dist2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -271,9 +272,17 @@ export function analyze(sid, T) {
     const t = T.terraceAt(lmXZ[0], lmXZ[1]);
     const onTop = !!t && Math.abs(t.height - top.height) < 1e-6;
     // 环台原型把地标放在中层广场是设计本意：所在台地的区域是 plaza 就算对
-    const plazaHere = !!t && !onTop && (sid.regions || []).some((r) => r && r.kind === "plaza" && (r.terrace_level === t.level || (Array.isArray(r.polygon) && pointInPolygon(lmXZ, r.polygon))));
-    const ok = onTop || plazaHere;
-    checks.push(mk("landmark_on_top", `${lmName} 在 ${plazaHere ? "广场" : "顶层台地"}`, ok, t ? `地标在 ${t.id}（第 ${t.level + 1} 层${plazaHere ? "广场，按卡放这里" : ""}）${ok ? "" : `，顶层是 ${top.id}（第 ${top.level + 1} 层）`}` : "地标不在任何台地上", "warn", [
+    // 卡片说放中层广场（placement plaza）：落在中间那层（层数 / 2 取整）也算对
+    const midLevel = Math.floor(new Set(T.terraces.map((x) => x.level)).size / 2);
+    const plazaHere = !!t && !onTop && ((sid.regions || []).some((r) => r && r.kind === "plaza" && (r.terrace_level === t.level || (Array.isArray(r.polygon) && pointInPolygon(lmXZ, r.polygon)))) || (placementOf(sid) === "plaza" && t.level === midLevel));
+    // 卡片说放村口（placement entry）：在最低一层（台地或同高的平地）就算对
+    // 看地标所在的台地（人把最低一层调高后按高度算会错成第 2 层）；不在台地上时才按高度算层号
+    const lowest = Math.min(...T.terraces.map((x) => x.level));
+    const atEntry = !onTop && !plazaHere && placementOf(sid) === "entry" && (t ? t.level === lowest : T.levelAt(lmXZ[0], lmXZ[1]) === lowest);
+    const ok = onTop || plazaHere || atEntry;
+    const where = plazaHere ? "广场" : atEntry ? "村口" : "顶层台地";
+    const detail = atEntry ? `地标在最低一层（${t ? t.id : "台地外平地"}），按卡放村口` : t ? `地标在 ${t.id}（第 ${t.level + 1} 层${plazaHere ? "广场，按卡放这里" : ""}）${ok ? "" : `，顶层是 ${top.id}（第 ${top.level + 1} 层）`}` : "地标不在任何台地上";
+    checks.push(mk("landmark_on_top", `${lmName} 在 ${where}`, ok, detail, "warn", [
       { label: "挪到顶层", patch(s) { const l = findObject(s, landmark.id); if (!l) return; const c = top.centroid; l.obj.position = [r2(c[0]), r2(T.heightAt(c[0], c[1])), r2(c[1])]; } },
       ignoreFix("landmark_on_top"),
     ]));
@@ -286,8 +295,17 @@ export function analyze(sid, T) {
     if (A.y1 <= B.y0 + 1e-6 || B.y1 <= A.y0 + 1e-6) continue;
     if (obbOverlap(A.poly, B.poly)) overlaps.push([A.v.id, B.v.id]);
   }
+  // 修法：生成的房子换种子重排；两栋都是人放的（拖过 / 锁住）时把人后放的那栋挪到最近的空位
+  const byId = new Map(vols.map((v) => [v.id, v]));
+  const ovGen = [], ovMove = [];
+  for (const [a, b] of overlaps) {
+    const A = byId.get(a), B = byId.get(b);
+    const gen = [B, A].find((v) => v.generated && v.importance !== "landmark");
+    if (gen) ovGen.push(gen.id);
+    else { const mv = [B, A].find((v) => v.importance !== "landmark" && v.user_moved) || [B, A].find((v) => v.importance !== "landmark"); if (mv) ovMove.push(mv.id); }
+  }
   checks.push(mk("houses_no_overlap", "房子 不重叠", overlaps.length === 0, overlaps.length ? overlaps.map((p) => p.join(" × ")).join("、") : `${bld.length} 栋互不重叠`, "error",
-    overlaps.length ? [{ label: "让 AI 重排", patch(s) { requestRelayout(s, "houses_no_overlap", overlaps.map((p) => p[1])); } }] : []));
+    overlaps.length ? [houseFix(ovMove, ovGen, "houses_no_overlap", T)] : []));
   // 5. houses_clear_of_paths（中心距 ≥ 路宽/2 + 2.5，溪 + 3；且底面不进路面）
   const pressed = [];
   for (const h of houses) {
@@ -300,9 +318,19 @@ export function analyze(sid, T) {
       if (polyToPolylineDist(poly, p.points) < half) { pressed.push(`${h.id} 的底面压到 ${p.id}`); break; }
     }
   }
-  checks.push(mk("houses_clear_of_paths", "房子 不压路", pressed.length === 0, pressed.length ? pressed.join("、") : `${houses.length} 栋都不压路`, "error",
-    pressed.length ? [{ label: "让 AI 重排", patch(s) { requestRelayout(s, "houses_clear_of_paths", pressed.map((d) => d.split(" ")[0])); } }] : []));
-  // 6. terraces_reachable（每个台地 10 m 内有路点，且从出生点可达；支路也算，这样「补一段支路」才能修好它）
+  // 人放的房子（拖过 / 锁住）也查；主路为躲它绕了路时在文案里提一句
+  const pressedIds = pressed.map((d) => d.split(" ")[0]);
+  const pGen = pressedIds.filter((id) => byId.get(id).generated), pMove = pressedIds.filter((id) => !byId.get(id).generated);
+  const detour = trail && Array.isArray(trail.detour_around) ? trail.detour_around.filter((id) => byId.has(id)) : [];
+  const detourTxt = detour.length ? `；主路为躲开 ${detour.join("、")} 绕了一下` : "";
+  checks.push(mk("houses_clear_of_paths", "房子 不压路", pressed.length === 0, (pressed.length ? pressed.join("、") : `${houses.length} 栋都不压路`) + detourTxt, "error",
+    pressed.length ? [houseFix(pMove, pGen, "houses_clear_of_paths", T)] : []));
+  // 6. houses_on_terraces（每栋非地标建筑——含人拖过的——四角落在同一层台地上；台地外同高的平地也算）
+  const offT = [];
+  if (T.terraces.length) for (const h of houses) { const why = offTerrace(T, footprint(h)); if (why) offT.push({ id: h.id, why }); }
+  checks.push(mk("houses_on_terraces", "房子 都在台地上", offT.length === 0, offT.length ? offT.map((f) => `${f.id} ${f.why}`).join("、") : T.terraces.length ? `${houses.length} 栋都在台地上` : "没有台地", "warn",
+    offT.length ? [{ label: "挪回最近的台地", patch(s) { for (const f of offT) moveHouseToSpot(s, T, f.id); } }, ignoreFix("houses_on_terraces")] : []));
+  // 7. terraces_reachable（每个台地 10 m 内有路点，且从出生点可达；支路也算，这样「补一段支路」才能修好它）
   const failing = R ? unreachedTerraces(sid, T, { R }).failing : [];
   checks.push(mk("terraces_reachable", "每层台地 都有路可达", failing.length === 0 && !!R, !R ? "缺少出生点和主路" : failing.length ? failing.map((f) => `${f.t.id}（${f.why}）`).join("、") : `${T.terraces.length} 层都可达`, "warn", [
     { label: "补一段支路", patch(s) { for (const f of failing) addSpur(s, f.t, f.target, f.nearPt || origin); } },
@@ -327,7 +355,7 @@ function moveSpawnToVisiblePoint(s, T, landmarkId, spawnId, trailId) {
   }
   m.obj.position = [r2(dest[0]), r2(T.heightAt(dest[0], dest[1])), r2(dest[1])];
 }
-/** 「让 AI 重排」：删掉冲突里 generated 的房子，并在 meta 里记下重排请求，交给调用方 / LLM */
+/** 「重排房子」：删掉冲突里 generated 的房子，并在 meta 里记下重排请求，交给调用方 / LLM */
 function requestRelayout(s, checkId, ids) {
   const drop = new Set(ids);
   s.volumes = (s.volumes || []).filter((v) => !(drop.has(v.id) && v.generated));
@@ -341,4 +369,80 @@ function addSpur(s, terrace, target, fromPt) {
   s.paths = s.paths || [];
   const old = s.paths.find((p) => p.id === id);
   if (old) old.points = pts; else s.paths.push({ id, kind: "trail", width: 2, points: pts, surface: "stone", label: "支路", generated: true });
+}
+
+/** 卡片里地标的 placement（没有卡时 null） */
+function placementOf(sid) { const c = sid.meta && sid.meta.card; return (c && c.landmark && c.landmark.placement) || null; }
+
+/**
+ * 房子底面是否不在同一层台地上：四角 terraceAt 相同即可；四角都不在台地上时，四角同层且不陡（台地外同高的平地）也算。
+ * @returns {string|null} 不合格的原因（「跨了台地边」「在坡上」），合格返回 null
+ */
+export function offTerrace(T, rect) {
+  const ids = rect.map(([x, z]) => { const t = T.terraceAt(x, z); return t ? t.id : null; });
+  if (ids.every((id) => id !== null && id === ids[0])) return null;
+  if (ids.some((id) => id !== null)) return "跨了台地边";
+  const lv = T.levelAt(rect[0][0], rect[0][1]);
+  for (const [x, z] of rect) if (T.levelAt(x, z) !== lv || T.slopeAt(x, z) > 0.35) return "在坡上";
+  return null;
+}
+
+/**
+ * 给一栋房子找最近的合格位置（在当前位置周围按半径 1 m 一圈圈找，同半径按角度固定顺序，确定性）：
+ * 四角同一台地且离台地边 ≥ 0.3 m、中心不陡、门朝向按布局规则（12 m 内朝路 / 朝下坡 / 朝外）、
+ * 中心离路 ≥ 路宽/2 + 2.5（溪 + 3）且底面离路面 ≥ 0.5 m、离其它体块 ≥ 0.8 m（地标 4 m）、离连接点 ≥ 1.5 m。
+ * @param {object} s sid
+ * @param {object} T buildTerrain 结果
+ * @param {object} h 房子（volumes 里的对象）
+ * @param {number} [maxR=40] 最远找多远（米）
+ * @returns {{position: number[], rotation_y: number}|null}
+ */
+export function nearestHouseSpot(s, T, h, maxR = 40) {
+  const paths = (s.paths || []).filter((p) => p && Array.isArray(p.points) && p.points.length >= 2);
+  const roads = paths.filter((p) => WALK_KINDS.has(p.kind)).map((p) => p.points);
+  const others = (s.volumes || []).filter((v) => v && v !== h && v.position && v.size).map((v) => ({ rect: footprint(v), gap: v.importance === "landmark" ? 4 : 0.8 }))
+    .concat((s.markers || []).filter((m) => m && m.kind === "connector" && Array.isArray(m.position)).map((m) => ({ rect: boxCorners(m.position, [3, 1, 3], 0), gap: 1.5 })));
+  const p0 = xz(h.position);
+  const ok = (x, z) => {
+    if (!T.inside(x, z)) return null;
+    const t = T.terraceAt(x, z);
+    if (!t || T.slopeAt(x, z) > 0.35) return null;
+    const F = houseFacing(T, x, z, roads, t.centroid);
+    const rot = r2(((Math.atan2(-F.facing[0], -F.facing[1]) * 180) / Math.PI + 360) % 360);
+    const rect = boxCorners([x, 0, z], h.size, rot);
+    for (const c of rect) { const tc = T.terraceAt(c[0], c[1]); if (!tc || tc.id !== t.id || distToPolygon(c, t.polygon) < 0.3) return null; }
+    for (const p of paths) {
+      const half = (p.width || 2) / 2;
+      if (distToPolyline([x, z], p.points) < half + (p.kind === "river" ? 3 : 2.5)) return null;
+      if (polyToPolylineDist(rect, p.points) < half + 0.5) return null;
+    }
+    for (const o of others) if (rectToRectDist(rect, o.rect) < o.gap) return null;
+    return rot;
+  };
+  for (let r = 0; r <= maxR; r++) {
+    const N = r === 0 ? 1 : Math.max(8, Math.ceil(2 * Math.PI * r));
+    for (let k = 0; k < N; k++) {
+      const a = (k / N) * 2 * Math.PI, x = r2(p0[0] + r * Math.cos(a)), z = r2(p0[1] + r * Math.sin(a));
+      const rot = ok(x, z);
+      if (rot != null) return { position: [x, r2(T.heightAt(x, z)), z], rotation_y: rot };
+    }
+  }
+  return null;
+}
+/** 把房子挪到最近的合格位置；生成的房子挪过后算人放的（锁住、不再由布局重放） */
+function moveHouseToSpot(s, T, id) {
+  const f = findObject(s, id);
+  if (!f || !f.obj || !Array.isArray(f.obj.size)) return false;
+  const spot = nearestHouseSpot(s, T, f.obj);
+  if (!spot) return false;
+  Object.assign(f.obj, spot, { locked: true, user_moved: true });
+  delete f.obj.generated;
+  return true;
+}
+/** 房子冲突的修法：人放的挪开一点，生成的换种子重排（本地，不调 AI） */
+function houseFix(moveIds, genIds, checkId, T) {
+  return {
+    label: moveIds.length ? "挪开一点" : "重排房子",
+    patch(s) { for (const id of moveIds) moveHouseToSpot(s, T, id); if (genIds.length) requestRelayout(s, checkId, genIds); },
+  };
 }

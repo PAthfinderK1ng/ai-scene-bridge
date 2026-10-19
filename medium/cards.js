@@ -1,4 +1,4 @@
-// cards.js — 方案卡：三张完整的候选，带缩略图与「差异标签」（只有在三张之间不同的字段才高亮，且不同的字段不过半时才高亮）。
+// cards.js — 小工具 el / settle、中文标签、方案卡的差异标签与中栏三张并排（renderCompare）。
 import { renderMap, LANDMARK_LABEL, PLACEMENT_LABEL, SPAWN_LABEL } from "./views/map.js";
 
 export const ARCH_LABEL = { slope_zigzag: "之字叠落", ring_terrace: "环台广场", valley_two_banks: "溪谷双坡" };
@@ -47,48 +47,23 @@ export function diffTags(cards) {
 }
 
 /**
- * 渲染三张卡。
- * @param cards Card[]；resolved [{sid,T,facts}]（与 cards 对应，可为 null）
- * @param opts { onPick(i, btn), onLock(i)?, locked: Set<i>, axis?: string, notDistinct?: boolean }
+ * 中栏并排放三张方案（点大图 = 选）：缩略图、名字、一句话、差异标签、统计。
+ * @param cards Card[]；resolved [{sid,T,facts}]
+ * @param opts { onPick(i), axis?: string, notDistinct?: boolean, foot?: Node（底部一行按钮） }
  */
-export function renderCards(cards, resolved, opts) {
-  const box = el("div", { class: "cards" });
-  if (opts.axis) box.append(el("div", { class: "hint" }, `这批只在「${opts.axis}」上不同，其它都按你已经定的。`));
-  if (opts.notDistinct) box.append(el("div", { class: "hint" }, opts.axis ? `⚠ 算过几何后这三张差别很小：「${opts.axis}」这条轴在当前卡上影响不大，可以换一条轴。` : "⚠ 这三张差别不够大（算过几何后几乎一样），我已经让 AI 重出过一次；要不要换个说法？"));
+export function renderCompare(cards, resolved, opts) {
   const tags = diffTags(cards);
-  cards.forEach((card, i) => {
-    const r = resolved && resolved[i];
+  const head = opts.axis ? `这批只换「${opts.axis}」，其它都按你现在的。` : ""; // 第一批不再重复聊天里那句「点一张就开始改」
+  const warn = opts.notDistinct ? (opts.axis ? "算过几何后差别很小：这条在当前方案上影响不大。" : "算过几何后三张差别不大，可以换个说法。") : null;
+  const grid = el("div", { class: "cmp-grid" }, ...cards.map((c, i) => {
+    const r = resolved[i], f = (r && r.facts) || {}, t = f.trail || {};
     const thumb = r ? renderMap({ sid: r.sid, T: r.T }, { small: true }) : el("div", { class: "hint" }, "（几何未算出）");
-    const stats = r && r.facts ? `${r.facts.houses || 0} 栋 · 主路 ${Math.round((r.facts.trail || {}).length_m || 0)} m · 爬升 ${Math.round((r.facts.trail || {}).climb_m || 0)} m` : "";
-    const okCount = r && r.checks && r.checks.length ? `关系 ${r.checks.filter((c) => c.ok).length}/${r.checks.length} ✓` : "";
-    const c = el("div", { class: "card" + (opts.locked && opts.locked.has(i) ? " locked" : "") },
-      thumb,
-      el("div", { class: "txt" },
-        el("b", {}, card.name || `方案 ${i + 1}`),
-        el("div", { class: "one" }, card.one_liner || card.summary || ""),
-        el("div", { class: "tags" }, tags[i].map((t) => el("span", { class: "tag" + (t.diff ? " diff" : ""), title: t.diff ? "这张与其它两张不同的地方" : "" }, t.label))),
-        el("div", { class: "hint" }, stats ? el("span", { class: "stat", style: "white-space:nowrap;margin-right:8px" }, stats) : null, okCount ? el("span", { class: "stat", style: "white-space:nowrap" }, okCount) : null),
-        el("div", { class: "row" },
-          el("button", { class: "primary", onclick: (ev) => opts.onPick(i, ev.currentTarget) }, "选这个"),
-          opts.onLock ? el("button", { onclick: () => opts.onLock(i), title: "锁住这张：后面换一批时它留着不动" }, opts.locked && opts.locked.has(i) ? "已锁" : "锁住") : null,
-        ),
-      ),
-    );
-    box.append(c);
-  });
-  return box;
-}
-
-/** 三选项缩略图（答问题用）：每个选项一张小图 + 标签（o.cur 为真时带「现在」角标）；点过后整组失效 */
-export function renderOptions(options, onPick) {
-  const grid = el("div", { class: "opts" });
-  options.forEach((o) => {
-    const node = el("div", { class: "opt" });
-    if (o.svg) node.append(o.svg);
-    node.append(el("div", { class: "lbl" }, o.label, o.cur ? el("span", { class: "tag" }, "现在") : null));
-    if (o.sub) node.append(el("div", { class: "sub" }, o.sub));
-    node.append(el("button", { onclick: (ev) => { settle(ev.currentTarget); onPick(o); } }, o.button || "就这个"));
-    grid.append(node);
-  });
-  return grid;
+    if (thumb.setAttribute) thumb.setAttribute("class", "cmp-map");
+    const pick = () => opts.onPick(i);
+    return el("div", { class: "cmp", tabindex: 0, role: "button", title: "选这张", onclick: pick, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } } },
+      thumb, el("b", {}, c.name || `方案 ${i + 1}`), el("div", { class: "one" }, c.one_liner || c.summary || ""),
+      el("div", { class: "tags" }, tags[i].map((g) => el("span", { class: "tag" + (g.diff ? " diff" : "") }, g.label))),
+      el("div", { class: "hint stat" }, `${f.houses || 0} 栋 · 主路 ${Math.round(t.length_m || 0)} m · 爬升 ${Math.round(t.climb_m || 0)} m`));
+  }));
+  return el("div", { class: "compare" }, head || warn ? el("div", { class: "cmp-head" }, head, warn ? el("span", { class: "warn" }, (head ? " " : "") + warn) : null) : null, grid, opts.foot || null);
 }

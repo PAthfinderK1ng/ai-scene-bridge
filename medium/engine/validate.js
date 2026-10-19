@@ -4,9 +4,11 @@
 import { polygonCentroid, pointInPolygon } from "./terrain.js";
 
 export const ID_RE = /^[a-z][a-z0-9_]*$/;
-export const COLLS = ["volumes", "regions", "paths", "markers", "features"];
+export const COLLS = ["volumes", "regions", "paths", "markers", "spaces", "features"];
 const DEG = Math.PI / 180;
 const FEATURE_KINDS = ["hill", "pit", "ridge", "cliff", "plateau"];
+const SPACE_KINDS = { underground: ["cave", "tunnel", "cellar", "crypt"], sky: ["platform", "walkway", "island", "bridge"] };
+const VIAS = ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"];
 
 /**
  * 取某个集合的数组（features 在 sid.terrain 下）。
@@ -85,7 +87,7 @@ export function obbOverlap(a, b) {
 export function objCenter(coll, obj) {
   if (coll === "volumes" || coll === "markers") return [obj.position[0], obj.position[2]];
   if (coll === "features") return obj.polygon && obj.polygon.length >= 3 ? polygonCentroid(obj.polygon) : [obj.center[0], obj.center[2]];
-  if (coll === "regions") return polygonCentroid(obj.polygon);
+  if (coll === "regions" || coll === "spaces") return polygonCentroid(obj.polygon);
   if (coll === "paths") return polygonCentroid(obj.points.length >= 3 ? obj.points : [...obj.points, obj.points[0]]);
   return [0, 0];
 }
@@ -149,6 +151,24 @@ export function validate(sid, T) {
     if (!Array.isArray(r.polygon) || r.polygon.length < 3) { push("error", r.id, `${r.id} 的多边形少于 3 个点`); continue; }
     for (const [x, z] of r.polygon) if (!inside(x, z)) { push("warn", r.id, `${r.id} 超出 bounds`); break; }
   }
+  // 多层空间与连接点（docs/04 §4）
+  const spaceById = new Map();
+  for (const s of sid.spaces || []) {
+    spaceById.set(s.id, s);
+    if (!SPACE_KINDS[s.stratum]) push("error", s.id, `${s.id} 的 stratum「${s.stratum}」不是 underground / sky`);
+    else if (!SPACE_KINDS[s.stratum].includes(s.kind)) push("warn", s.id, `${s.id} 的 kind「${s.kind}」不在 ${SPACE_KINDS[s.stratum].join("/")}`);
+    if (!Array.isArray(s.polygon) || s.polygon.length < 3) { push("error", s.id, `${s.id} 的多边形少于 3 个点`); continue; }
+    if (!Number.isFinite(s.floor_y)) push("error", s.id, `${s.id} 的 floor_y 不是数字`);
+    if (!(s.height > 0)) push("error", s.id, `${s.id} 的 height 必须大于 0`);
+    for (const [x, z] of s.polygon) if (!inside(x, z)) { push("warn", s.id, `${s.id} 超出 bounds`); break; }
+  }
+  for (const m of sid.markers || []) {
+    if (m.kind !== "connector") continue;
+    if (!VIAS.includes(m.via)) push("warn", m.id, `${m.id} 的 via「${m.via}」不在 ${VIAS.join("/")}`);
+    for (const e of [m.from, m.to]) if (e !== "ground" && !spaceById.has(e)) push("error", m.id, `连接点 ${m.id} 引用了不存在的空间 ${e}`);
+    if (m.from === m.to) push("error", m.id, `连接点 ${m.id} 两端相同`);
+    if (Number.isFinite(m.top_y) && Number.isFinite(m.bottom_y) && m.top_y < m.bottom_y) push("error", m.id, `连接点 ${m.id} 的 top_y 低于 bottom_y`);
+  }
   for (const p of sid.paths || []) {
     if (!Array.isArray(p.points) || p.points.length < 2) push("error", p.id, `${p.id} 的路径少于 2 个点`);
     if (!(p.width > 0)) push("error", p.id, `${p.id} 的宽度必须大于 0`);
@@ -171,8 +191,15 @@ export function validate(sid, T) {
   // 标记在体块里
   for (const m of sid.markers || []) {
     if (!isVec3(m.position)) continue;
+    // 连接点看它在地面的那一端（地下的是上端，空中的是下端）；两端都是空间的不查
+    let y = m.position[1];
+    if (m.kind === "connector") {
+      if (m.from !== "ground" && m.to !== "ground") continue;
+      const sp = spaceById.get(m.from === "ground" ? m.to : m.from);
+      y = sp && sp.stratum === "underground" && Number.isFinite(m.top_y) ? m.top_y : y;
+    }
     for (const { v, poly } of vols) {
-      if (m.position[1] >= v.position[1] + v.size[1]) continue;
+      if (y >= v.position[1] + v.size[1] || (m.kind === "connector" && y + 0.5 < v.position[1])) continue;
       if (pointInPolygon([m.position[0], m.position[2]], poly)) push("warn", m.id, `${m.id} 在 ${v.id} 内部`);
     }
   }

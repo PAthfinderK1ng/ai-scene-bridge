@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8" /><title>界面流程测试</title></head>
+<body>
+<!-- 需要本地服务（模拟 AI）：.venv\Scripts\python -X utf8 desktop\sid_editor.py --no-window --port 8791，再用无头 Edge 打开
+     http://127.0.0.1:8791/medium/tests/flow.test.html --dump-dom。结果写在 #out：PASS / FAIL 每行一条，最后 DONE。 -->
+<pre id="out"></pre>
+<iframe id="f" src="../?demo=pick" style="width:1440px;height:900px;border:0"></iframe>
+<script type="module">
+const out = document.getElementById("out");
+let passed = 0, failed = 0;
+const ok = (name, cond, why = "") => { if (cond) { passed++; out.textContent += `PASS ${name}\n`; } else { failed++; out.textContent += `FAIL ${name}: ${why}\n`; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { try { const v = fn(); if (v) return v; } catch { /* 还没好 */ } await sleep(40); } return null; };
+const f = document.getElementById("f");
+
+try {
+  await new Promise((r) => f.addEventListener("load", r, { once: true }));
+  const W = f.contentWindow, D = f.contentDocument;
+  // 数一数调 AI 的请求
+  let aiCalls = 0;
+  const realFetch = W.fetch.bind(W);
+  W.fetch = (u, o) => { if (String(u).includes("/api/ai/")) aiCalls++; return realFetch(u, o); };
+  const T = await until(() => W.__scene && W.__scene.S.scene && W.__scene.S.step === 3 && W.__scene);
+  ok("选卡后直接进「改」，不问问题", !!T, "等不到第 3 步");
+  const { S, A } = T;
+  ok("顶栏四步：说 选 改 出", [...D.querySelectorAll("#steps li")].map((l) => l.textContent).join("") === "说选改出");
+  ok("聊天里没有提问", !/第一个|问完了|我理解为/.test(D.querySelector("#log").textContent));
+  ok("提示条里没有字面 null", !/null/.test(D.querySelector("#note").textContent), D.querySelector("#note").textContent);
+  ok("顶栏没有计数器", !D.querySelector("#meter") && !/指点 \d/.test(D.querySelector("#top").textContent));
+  aiCalls = 0;
+  const nMsg = () => D.querySelectorAll("#log .msg").length;
+  const m0 = nMsg();
+
+  // ---------- 本地操作：参数、拖房子、剖面、剖切、空间，都不调 AI、不写聊天
+  const row = (label) => [...D.querySelectorAll("#params .prow")].find((r) => r.querySelector(".pl").textContent === label);
+  const t0 = S.scene.card.params.terraces;
+  [...row("层数").querySelectorAll(".seg button")].find((b) => b.textContent === "5").click();
+  ok("参数按钮本地重算", S.scene.card.params.terraces === 5, `层数 ${S.scene.card.params.terraces}`);
+  ok("动过的参数不再标「默认」", !row("层数").querySelector(".pdef").textContent);
+  ok("提示条说一句并给撤销", !D.querySelector("#note").hidden && /层数/.test(D.querySelector("#note").textContent) && /撤销/.test(D.querySelector("#note").textContent));
+  const h = S.scene.sid.volumes.find((v) => v.kind === "building" && v.importance !== "landmark");
+  A.mapHandlers.onDragEnd({ type: "house", id: h.id }, [h.position[0] + 5, h.position[2] + 3], { delta: [5, 3] });
+  ok("拖房子：改名 u_house_ 并锁住", S.scene.sid.volumes.some((v) => /^u_house_/.test(v.id) && v.locked), "没有 u_house");
+  const feat = S.scene.sid.terrain.features.find((x) => x.kind === "plateau" && x.level === 2);
+  const fh = feat.height;
+  A.profileHandlers.onTerraceHeight(feat.id, fh + 2);
+  ok("剖面拖第 3 层 +2 m", S.scene.sid.terrain.features.find((x) => x.id === feat.id).height === fh + 2);
+  A.profileHandlers.onSectionMode("line"); A.profileHandlers.onSectionRotate(15); A.profileHandlers.onSectionRotate(15);
+  ok("直线剖切并转 30°", S.scene.section().mode === "line");
+  [...D.querySelectorAll("#strata button.add")].find((b) => b.textContent.includes("地下")).click();
+  ok("＋地下空间", (S.scene.sid.spaces || []).some((s) => s.stratum === "underground"));
+  ok("加完选中它并切到地下层", S.sel && S.sel.type === "space" && S.stratum === "underground");
+  ok("选中面板显示可改项", !D.querySelector("#p-sel").hidden && /净高/.test(D.querySelector("#selection").textContent));
+  ok("本地操作不写聊天", nMsg() === m0, `${m0} → ${nMsg()}`);
+  ok("本地操作不调 AI", aiCalls === 0, `调了 ${aiCalls} 次`);
+
+  // ---------- 撤销 / 重做（按钮与快捷键）
+  const nSp = S.scene.sid.spaces.length;
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  ok("Ctrl+Z 撤销加空间", S.scene.sid.spaces.length === nSp - 1);
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true }));
+  ok("Ctrl+Y 重做", S.scene.sid.spaces.length === nSp);
+  for (let i = 0; i < 10; i++) D.querySelector("#btn-undo").click();
+  ok("撤销到底回到选卡时的层数", S.scene.card.params.terraces === t0, `${S.scene.card.params.terraces} vs ${t0}`);
+  ok("撤销后「默认」回来了", /默认/.test(row("层数").querySelector(".pdef").textContent));
+
+  // ---------- 键盘
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "2", bubbles: true }));
+  ok("2 = 剖面", S.view === "profile");
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "r", bubbles: true }));
+  ok("R = 圈区域（切回俯视图）", S.tool === "region" && S.view === "map");
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  ok("Esc 回到移动", S.tool === "move");
+  const h2 = S.scene.sid.volumes.find((v) => v.kind === "building" && v.importance !== "landmark");
+  A.mapHandlers.onDragEnd({ type: "house", id: h2.id }, [h2.position[0] + 4, h2.position[2]], { delta: [4, 0] });
+  const uid = S.sel && S.sel.id;
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Delete", bubbles: true }));
+  ok("Delete 删除选中（挪过的房子）", /^u_house_/.test(uid || "") && !S.scene.sid.volumes.some((v) => v.id === uid) && !S.sel, uid);
+
+  // ---------- 打字：调 AI 一次，聊天里有一行耗时 / 费用；AI 的改动也能撤销
+  const lh = S.scene.card.params.layer_height_m;
+  A.say("再陡一点");
+  await until(() => S.busy === 0 && /模拟 AI/.test(D.querySelector("#log").textContent));
+  ok("打字调 AI 一次", aiCalls === 1, `调了 ${aiCalls} 次`);
+  ok("AI 改了每层高", S.scene.card.params.layer_height_m > lh, `${lh} → ${S.scene.card.params.layer_height_m}`);
+  ok("聊天显示耗时与费用一行", /模拟 AI · [\d.]+ s · 不花钱/.test(D.querySelector("#log").textContent));
+  D.querySelector("#btn-undo").click();
+  ok("AI 的改动可撤销", S.scene.card.params.layer_height_m === lh);
+
+  // ---------- 换一批：锁住的不变；点一张回到「改」
+  row("层数").querySelector("button.lock").click();
+  ok("锁住层数", S.locked.has("terraces"));
+  const tLock = S.scene.card.params.terraces;
+  S.axisCursor = 1; // 下一条轴是「台地层数」，锁住了应跳过
+  D.querySelector("#btn-variants").click();
+  await until(() => S.busy === 0 && S.comparing);
+  ok("换一批调 AI 一次", aiCalls === 2, `调了 ${aiCalls} 次`);
+  ok("跳过锁住的轴", S.axis && S.axis !== "terraces", `axis ${S.axis}`);
+  ok("换一批三张都守住锁", S.cards.every((c) => c.params.terraces === tLock));
+  D.querySelector(".cmp:nth-child(2)").click();
+  ok("点一张回到改", S.step === 3 && !S.comparing);
+  ok("锁住的层数没变", S.scene.card.params.terraces === tLock);
+
+  // ---------- 本轮：坡度显示一致、村口、3D 小窗三种状态、Esc 取消拖动、剖面拖动实时 3D、剖到这里、删程序摆的房子
+  const { slopeChoices } = await import("../views/profile.js");
+  const lay = S.scene.card.params.layer_height_m, sc0 = slopeChoices(lay);
+  ok("每层高：永远亮一档，没有灰标", row("每层高").querySelectorAll(".seg button.on").length === 1 && sc0.items.filter((x) => x.on).length === 1 && !row("每层高").querySelector(".pnow"), `${lay} m`);
+  const mid = (x) => slopeChoices(x).items.find((i) => i.l === "中");
+  ok("4.3 m 时「中」亮着且点得动（回到 4 m），正好 4 m 时点它不动", mid(4.3).on && mid(4.3).act && mid(4).on && !mid(4).act && slopeChoices(4.3).items.filter((i) => i.act).length === 3);
+  const nCalls = aiCalls;
+  [...row("位置").querySelectorAll(".seg button")].find((b) => b.textContent === "村口").click();
+  ok("地标位置有「村口」(entry)", S.scene.card.landmark.placement === "entry", S.scene.card.landmark.placement);
+  D.querySelector("#btn-undo").click();
+  if (!S.insetOn) D.querySelector("#btn-inset").click();
+  A.setView("map");
+  const box = D.querySelector("#inset3d");
+  ok("俯视图：3D 是浮窗", !box.hidden && !box.classList.contains("docked") && box.parentNode.id === "views");
+  box.querySelector(".inset-min").click();
+  ok("「—」收成 3D 小按钮", box.classList.contains("min"));
+  box.querySelector(".inset-bar").dispatchEvent(new W.PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 5, clientY: 5 }));
+  W.dispatchEvent(new W.PointerEvent("pointerup", { bubbles: true, clientX: 5, clientY: 5 }));
+  ok("点一下展开", !box.classList.contains("min"));
+  A.setView("profile");
+  ok("剖面里不出俯视图专用的工具", [...D.querySelectorAll("#toolbar [data-tool]")].every((b) => W.getComputedStyle(b).display === "none"));
+  ok("剖面：3D 嵌在剖面下方", !box.hidden && box.classList.contains("docked") && !!box.closest("#view-profile"));
+  A.setView("eye");
+  ok("第一眼：小窗隐藏、按钮置灰不高亮", box.hidden && D.querySelector("#btn-inset").disabled && D.querySelector("#btn-inset").getAttribute("aria-pressed") === "false");
+  A.setView("map");
+  // Esc 取消拖动：DOM 回原位、不提交、不入撤销栈
+  const svg = S.mapSvg, hn = svg.querySelector("[data-house]"), hid = hn.dataset.house, tr0 = hn.getAttribute("transform");
+  const vol0 = JSON.stringify(S.scene.sid.volumes.find((v) => v.id === hid).position);
+  const toC = (p) => { const pt = svg.createSVGPoint(); pt.x = p[0]; pt.y = p[1]; const q = pt.matrixTransform(svg.getScreenCTM()); return [q.x, q.y]; };
+  const pe = (c) => ({ bubbles: true, cancelable: true, clientX: c[0], clientY: c[1], pointerId: 1, button: 0, isPrimary: true, pointerType: "mouse" });
+  const hp = hn.getAttribute("data-pos").split(" ").map(Number), a0 = toC(hp), a1 = toC([hp[0] + 10, hp[1] + 6]);
+  hn.dispatchEvent(new W.PointerEvent("pointerdown", pe(a0)));
+  svg.dispatchEvent(new W.PointerEvent("pointermove", pe([(a0[0] + a1[0]) / 2, (a0[1] + a1[1]) / 2])));
+  svg.dispatchEvent(new W.PointerEvent("pointermove", pe(a1)));
+  ok("拖动中 3D 浮窗淡出", D.body.classList.contains("gesturing") && W.getComputedStyle(box).pointerEvents === "none");
+  const sel0 = S.sel, tool0 = S.tool;
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  svg.dispatchEvent(new W.PointerEvent("pointerup", pe(a1)));
+  ok("Esc 取消拖动：没提交", JSON.stringify((S.scene.sid.volumes.find((v) => v.id === hid) || {}).position) === vol0 && !D.body.classList.contains("gesturing"));
+  ok("Esc 取消拖动：DOM 回原位", (S.mapSvg.querySelector(`[data-house="${hid}"]`) || {}).getAttribute?.("transform") === tr0);
+  ok("Esc 只取消拖动，不动选中 / 工具", S.sel === sel0 && S.tool === tool0);
+  // 剖面拖动实时 3D：副本上算，不改场景、不入撤销栈
+  await until(() => S.inset, 15000);
+  A.setView("profile");
+  const ft = S.scene.sid.terrain.features.find((x) => x.kind === "plateau" && x.level === 1);
+  const fth = ft.height;
+  S.liveMs = null;
+  A.profileHandlers.onDragLive({ kind: "terrace", id: ft.id, value: fth + 3 });
+  ok("剖面拖动：3D 预览走副本", S.liveMs != null && S.scene.sid.terrain.features.find((x) => x.id === ft.id).height === fth, `liveMs ${S.liveMs}`);
+  // 剖到这里：在剖面里选中空间，剖切改成直线过它
+  A.edit("测试：加地下溶洞", (sc) => { sc.addSpace({ stratum: "underground", kind: "cave", anchor: "village" }); });
+  const cave = S.scene.sid.spaces.find((x) => x.stratum === "underground");
+  A.select({ type: "space", id: cave.id }, "underground");
+  const sec = S.scene.section(), cx = cave.polygon.reduce((a, p) => a + p[0], 0) / cave.polygon.length, cz = cave.polygon.reduce((a, p) => a + p[1], 0) / cave.polygon.length;
+  const [pa, pb] = sec.line, dl = Math.abs((pb[0] - pa[0]) * (cz - pa[1]) - (pb[1] - pa[1]) * (cx - pa[0])) / Math.hypot(pb[0] - pa[0], pb[1] - pa[1]);
+  ok("剖面里选中空间 = 剖到它", sec.mode === "line" && dl < sec.width_m / 2, `离线 ${dl.toFixed(1)} m，宽 ${sec.width_m}`);
+  ok("选中卡有「剖到这里」", /剖到这里/.test(D.querySelector("#selection").textContent));
+  // 3D 浮窗自己让开：俯视图里选中的东西和剖切把手不被它挡住（人没拖过时）
+  A.setView("map"); A.select({ type: "space", id: cave.id }, "underground");
+  const hit = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  const ib = box.getBoundingClientRect(), selN = S.mapSvg.querySelector(".selection");
+  ok("3D 浮窗不挡选中的东西", !box.hidden && selN && !hit(selN.getBoundingClientRect(), ib), selN ? JSON.stringify([selN.getBoundingClientRect(), ib]) : "没有选中描边");
+  ok("3D 浮窗不挡剖切把手", [...S.mapSvg.querySelectorAll(".sec-handle")].every((n) => !hit(n.getBoundingClientRect(), ib)));
+  // 删程序摆的房子：Delete 键，重算后仍不在
+  A.setView("map"); A.setStratum("ground");
+  const gh = S.scene.sid.volumes.find((v) => v.kind === "building" && v.importance !== "landmark" && v.generated);
+  A.select({ type: "house", id: gh.id });
+  ok("程序摆的房子也有「删除」", /删除/.test(D.querySelector("#selection").textContent));
+  const nH = S.scene.facts.houses;
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Delete", bubbles: true }));
+  ok("Delete 删掉程序摆的房子", !S.scene.sid.volumes.some((v) => v.id === gh.id && v.generated && JSON.stringify(v.position) === JSON.stringify(gh.position)), `${nH} → ${S.scene.facts.houses}`);
+  [...row("时段").querySelectorAll(".seg button")].find((b) => !b.classList.contains("on")).click();
+  ok("重算后那栋仍不在", !S.scene.sid.volumes.some((v) => v.kind === "building" && Math.hypot(v.position[0] - gh.position[0], v.position[2] - gh.position[2]) < 0.5), "重算后补回来了");
+  ok("这些都不调 AI", aiCalls === nCalls, `${nCalls} → ${aiCalls}`);
+  A.setView("map");
+  // 俯视图标签不压房子（躲不开的垫了底色）；换视图收起提示条
+  const shrink = (r, k) => ({ left: r.left + k, right: r.right - k, top: r.top + k, bottom: r.bottom - k });
+  const houses = [...S.mapSvg.querySelectorAll("[data-house] rect:first-child")].map((n) => n.getBoundingClientRect());
+  const bad = [...S.mapSvg.querySelectorAll(".labels text[data-region-label], .labels text[data-lv], .labels text[data-for]")]
+    .filter((t) => !(t.previousElementSibling && t.previousElementSibling.classList.contains("label-bg")) && houses.some((h) => hit(shrink(t.getBoundingClientRect(), 2), h)));
+  ok("俯视图标签不压房子", houses.length > 5 && bad.length === 0, bad.map((t) => t.textContent).join(" / "));
+  A.note("测试提示", { undo: true }); A.setView("eye");
+  ok("换视图收起提示条", D.querySelector("#note").hidden);
+  A.setView("map");
+
+  // ---------- 出：随时可点，不要求确认；BRIEF 里有空间层与剖切
+  A.edit("加空中平台", (sc) => { sc.addSpace({ stratum: "sky", kind: "platform", anchor: "landmark" }); });
+  D.querySelector("#btn-export").click();
+  ok("出：弹窗直接打开", !D.querySelector("#modal").hidden && /导出引擎包/.test(D.querySelector("#modal").textContent));
+  ok("打开弹窗收起提示条", D.querySelector("#note").hidden);
+  ok("弹窗开着时 3D 浮窗不透出来", !S.insetOn || W.getComputedStyle(box).visibility === "hidden");
+  const { buildBrief } = await import("../exporter.js");
+  const brief = buildBrief({ sid: S.scene.sid, card: S.scene.card, facts: S.scene.facts, checks: S.scene.checks, params: [], eye: S.eye, section: S.scene.section() });
+  ok("BRIEF 有多层空间与连接点", /多层空间与连接点/.test(brief) && /连接点 `conn_/.test(brief));
+  ok("BRIEF 有剖切说明", /## 剖切/.test(brief));
+  D.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  ok("Esc 关弹窗回到改", D.querySelector("#modal").hidden && S.step === 3);
+  ok("总共只调了两次 AI", aiCalls === 2, `调了 ${aiCalls} 次`);
+  // ---------- 出卡后一行灰字：按你的话锁定（服务端 constraints）
+  await A.intent("夜里亮灯的山村，有溪，有水车");
+  await until(() => S.busy === 0 && S.comparing);
+  ok("出卡后显示锁定的条件", /按你的话锁定：.*（三张都照办）/.test(D.querySelector("#log").textContent), [...D.querySelectorAll("#log .msg.sys")].map((m) => m.textContent).join(" | "));
+  ok("没有页面脚本错误", !D.getElementById("boot-error"), D.getElementById("boot-error") && D.getElementById("boot-error").textContent);
+} catch (e) { ok("测试本身", false, e && e.stack || e); }
+out.textContent += `DONE passed=${passed} failed=${failed}\n`;
+</script>
+</body>
+</html>

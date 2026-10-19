@@ -1,7 +1,7 @@
 // routing.js — 路由：A* 山径、之字构造、溪流、路径事实、折线简化
 // 约定见 SPEC.md 第 0 节与第 3 节。纯函数、确定性（随机只来自 opts.seed）。
 // 依赖 terrain.js 的几何小工具（不修改它）。
-import { pointInPolygon, distToPolygon, clamp, r2, rng } from "./terrain.js";
+import { pointInPolygon, distToPolygon, distToSegment, clamp, r2, rng } from "./terrain.js";
 
 const SQRT2 = Math.SQRT2;
 /** 8 邻域方向（先直后斜，顺序固定以保证确定性） */
@@ -191,8 +191,9 @@ function astar(L, blocked, start, goal, maxSlope, noise) {
  * @param {object} T buildTerrain 结果
  * @param {number[]} from [x,z]
  * @param {number[]} to [x,z]
- * @param {{maxSlope?:number, res?:number, avoidPolys?:number[][][], seed?:number, maxPoints?:number}} [opts]
- *   seed 只用于给节点代价加 ≤ 2% 步长的确定性抖动（打破平局、让不同 seed 的路略有差别）
+ * @param {{maxSlope?:number, res?:number, avoidPolys?:number[][][], seed?:number, maxPoints?:number, wet?:object[]}} [opts]
+ *   seed 只用于给节点代价加 ≤ 2% 步长的确定性抖动（打破平局、让不同 seed 的路略有差别）；
+ *   wet 溪（paths kind=river）：溪面 + 1 m 内每个格点加 3 步长的代价——要过溪就直着过一次（一座桥），不顺着溪床走
  * @returns {{points:number[][]|null, facts:object, raw?:number[][]}} 不可达时 points 为 null、facts.reason 说明原因；raw 为未简化的格点路径
  */
 export function routeTrail(T, from, to, opts = {}) {
@@ -209,6 +210,14 @@ export function routeTrail(T, from, to, opts = {}) {
   if (avoid.length) for (let idx = 0; idx < N; idx++) { const p = L.world(idx); for (const poly of avoid) if (pointInPolygon(p, poly)) { blocked[idx] = 1; break; } }
   let noise = null;
   if (typeof opts.seed === "number") { const rand = rng(opts.seed); noise = new Float64Array(N); for (let i = 0; i < N; i++) noise[i] = rand() * 0.02 * res; }
+  const wet = (opts.wet || []).filter((p) => p && Array.isArray(p.points) && p.points.length >= 2);
+  if (wet.length) {
+    noise = noise || new Float64Array(N);
+    for (let idx = 0; idx < N; idx++) {
+      const q = L.world(idx);
+      for (const p of wet) { const w = (p.width || 4) / 2 + 1; let hit = false; for (let k = 0; k < p.points.length - 1 && !hit; k++) hit = distToSegment(q, p.points[k], p.points[k + 1]) <= w; if (hit) { noise[idx] += 3 * res; break; } }
+    }
+  }
 
   const start = L.nearest(from), goal = L.nearest(to);
   if (blocked[goal]) return fail("终点最近的格点在禁行区内");
@@ -313,4 +322,29 @@ export function routeStream(T, bounds) {
   pts[0] = [pts[0][0], b.min[2]];
   pts[pts.length - 1] = [pts[pts.length - 1][0], b.max[2]];
   return pts;
+}
+
+// ------------------------------------------------------------ 桥
+/**
+ * 路过溪的地方 = 桥：每条可走的路（非 river）与每条溪的线段交点。确定性：按路在 paths 里的顺序、沿路的先后。
+ * @param {object[]} paths sid.paths
+ * @returns {{path: string, at: number[], dir: number[], width: number}[]} at 交点 [x,z]；dir 路在那里的单位方向；width 溪宽
+ */
+export function pathCrossings(paths) {
+  const ok = (p) => p && Array.isArray(p.points) && p.points.length >= 2;
+  const rivers = (paths || []).filter((p) => ok(p) && p.kind === "river"), out = [];
+  for (const p of (paths || []).filter((q) => ok(q) && q.kind !== "river")) for (let i = 0; i < p.points.length - 1; i++) {
+    const a = p.points[i], b = p.points[i + 1];
+    for (const rv of rivers) for (let j = 0; j < rv.points.length - 1; j++) {
+      const c = rv.points[j], d = rv.points[j + 1];
+      const den = (b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0]);
+      if (Math.abs(den) < 1e-9) continue;
+      const t = ((c[0] - a[0]) * (d[1] - c[1]) - (c[1] - a[1]) * (d[0] - c[0])) / den, u = ((c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])) / den;
+      if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, at = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+      if (out.some((o) => Math.hypot(o.at[0] - at[0], o.at[1] - at[1]) < 6)) continue; // 6 m 内算同一座桥（路沿溪走时会来回擦边）
+      out.push({ path: p.id, at: [r2(at[0]), r2(at[1])], dir: [r2((b[0] - a[0]) / L), r2((b[1] - a[1]) / L)], width: rv.width || 4 });
+    }
+  }
+  return out;
 }

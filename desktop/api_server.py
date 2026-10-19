@@ -3,12 +3,14 @@
 api_server.py — 「场景对话」本地服务：静态文件 + /api/*
 
 路由（全部 JSON，仅监听 127.0.0.1）：
-  GET  /api/health                → {ok, version, mock}
-  GET  /api/config                → 公开配置（不回传密钥明文，只回 has_key / key_hint / model / mock）
-  POST /api/config                → {api_key?, model?, mock?} 写入 %LOCALAPPDATA%/ai-scene-bridge/config.json
-  POST /api/config/test           → 用当前密钥发一条最短请求，验证密钥可用
-  POST /api/ai/draft              → {intent, axis?, targets?, locked?} → {cards:[3 张卡], provider}
-  POST /api/ai/revise             → {card, action, locked?} → {understood, patch, restatement, question?, ask_to_point}
+  GET  /api/health                → {ok, version, mock, provider, provider_label, model, thinking}
+  GET  /api/config                → 公开配置（不回传密钥明文）：provider / mock / 各服务商 has_key / key_hint / model / thinking
+  POST /api/config                → {provider?, mock?, providers?: {anthropic|deepseek: {api_key?, model?, thinking?}}}（也收扁平 api_key / model / thinking，写给当前服务商）
+  POST /api/config/test           → {provider?, api_key?, model?} 按（当前）服务商发一条最短请求，验证密钥可用
+  POST /api/ai/draft              → {intent, axis?, targets?, locked?, force_mock?} → {cards:[3 张卡], provider, _usage, _ms}
+  POST /api/ai/revise             → {card, action, locked?, force_mock?} → {understood, patch, restatement, question?, ask_to_point, provider, _usage, _ms}
+  force_mock=true：这次请求强制走模拟 AI（演示 / 截图 / 测试用，不花钱）。
+  _usage：{input, output, cache_read, ms, model, cost_cny（DeepSeek / 模拟）或 cost_usd（Claude）, ...}
   POST /api/score                 → {intent: sid, readback: json, map?, auto_map?} → score_readback 的结果 JSON
   POST /api/save                  → {name, content} 把导出包 / SID 写到 %LOCALAPPDATA%/ai-scene-bridge/exports/
 
@@ -29,7 +31,8 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-import ai_service  # noqa: E402
+import ai_service
+import intent_rules  # noqa: E402
 
 APP_VERSION = "0.2.0"
 MAX_BODY = 32 * 1024 * 1024  # 读回 JSON 可能有几千个对象
@@ -69,9 +72,9 @@ def _score(root: str, payload: dict) -> dict:
 def _ai_error_types():
     try:
         import anthropic
-        return (anthropic.APIError,)  # APIStatusError（有状态码）与 APIConnectionError / APITimeoutError（没有）的共同基类
+        return (anthropic.APIError, ai_service.DeepSeekAPIError)  # APIError：APIStatusError（有状态码）与 APIConnectionError / APITimeoutError（没有）的共同基类
     except Exception:
-        return (type("_Never", (Exception,), {}),)
+        return (ai_service.DeepSeekAPIError,)
 
 
 # 按 HTTP 状态码给人看得懂的诊断（来源：claude-api 技能 shared/error-codes.md）
@@ -86,18 +89,37 @@ AI_HINTS = {
     500: "Anthropic 服务异常：稍后重试",
     529: "Anthropic 过载：稍后重试",
 }
-RETRYABLE = {408, 409, 429, 500, 529}
+# DeepSeek 的状态码（官方错误码：400 格式错误 / 401 认证失败 / 402 余额不足 / 422 参数错误 / 429 限流 / 500 / 503 繁忙）
+DS_HINTS = {
+    400: "请求格式错误：把 message 原文发给开发者",
+    401: "DeepSeek 密钥无效：到 AI 设置里重新粘贴",
+    402: "DeepSeek 余额不足：到 platform.deepseek.com 充值",
+    422: "参数错误：多半是模型名不对（默认 deepseek-flash）",
+    429: "请求太频繁：等几十秒再试",
+    500: "DeepSeek 服务异常：稍后重试",
+    503: "DeepSeek 繁忙：稍后重试",
+}
+RETRYABLE = {408, 409, 429, 500, 502, 503, 529}
 
 
 def ai_error_payload(e: Exception) -> dict:
     """把 anthropic 的异常整理成前端能诊断的 JSON：状态码、错误类型、request_id、是否可重试、一句中文提示。"""
     status = getattr(e, "status_code", None)
     body = getattr(e, "body", None)
+    provider = getattr(e, "provider", None) or "anthropic"
     etype = (body.get("error") or {}).get("type") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
-    is_timeout = type(e).__name__ == "APITimeoutError"
+    if provider == "deepseek" and not etype:
+        etype = getattr(e, "etype", None)
+    is_timeout = type(e).__name__ == "APITimeoutError" or etype == "APITimeoutError"
     is_conn = status is None
-    hint = AI_HINTS.get(status) or ("等太久没回：模型思考 + 三张卡输出可能超过 180 s，再试一次或降低 effort" if is_timeout else "连不上 api.anthropic.com：检查网络 / 代理" if is_conn else "")
-    return {"error": "ai", "message": getattr(e, "message", None) or str(e), "status": status, "type": etype or type(e).__name__,
+    msg = getattr(e, "message", None) or str(e)
+    if provider == "deepseek":
+        bad_model = status in (400, 404, 422) and "model" in msg.lower()
+        hint = ("模型名不对：检查 AI 设置里的模型名（默认 deepseek-flash）" if bad_model else DS_HINTS.get(status)) \
+            or ("等太久没回：再试一次" if is_timeout else "连不上 api.deepseek.com：检查网络 / 代理" if is_conn else "")
+    else:
+        hint = AI_HINTS.get(status) or ("等太久没回：模型思考 + 三张卡输出可能超过 180 s，再试一次或降低 effort" if is_timeout else "连不上 api.anthropic.com：检查网络 / 代理" if is_conn else "")
+    return {"error": "ai", "provider": provider, "message": msg, "status": status, "type": etype or type(e).__name__,
             "request_id": getattr(e, "request_id", None), "retryable": is_conn or status in RETRYABLE, "hint": hint}
 
 
@@ -176,7 +198,7 @@ class AppHandler(SimpleHTTPRequestHandler):
 # ---------- 路由实现 ----------
 def r_health(root, _):
     cfg = ai_service.public_config()
-    return {"ok": True, "version": APP_VERSION, "mock": cfg["mock"], "model": cfg["model"], "root": root}
+    return {"ok": True, "version": APP_VERSION, "mock": cfg["mock"], "provider": cfg["provider"], "provider_label": cfg["provider_label"], "model": cfg["model"], "thinking": cfg["thinking"], "root": root}
 
 
 def r_config_get(root, _):
@@ -188,15 +210,9 @@ def r_config_set(root, payload):
     return ai_service.public_config()
 
 
-def r_config_test(root, payload):
-    cfg = ai_service.load_config()
-    if payload.get("api_key"):
-        cfg["api_key"] = payload["api_key"]
-    if not cfg.get("api_key"):
-        return {"ok": False, "message": "没有密钥"}
+def _test_anthropic(key: str, model: str) -> dict:
     import anthropic
-    client = anthropic.Anthropic(api_key=cfg["api_key"], timeout=30.0, max_retries=0)
-    model = (payload.get("model") or cfg.get("model") or ai_service.DEFAULT_MODEL).strip()
+    client = anthropic.Anthropic(api_key=key, timeout=30.0, max_retries=0)
     t0 = time.time()
     try:
         # 最短的一条：不传 thinking / 采样参数（Opus 5.5 会 400），effort=low 让它少想；max_tokens 要装得下思考 + 回复
@@ -212,17 +228,61 @@ def r_config_test(root, payload):
             "usage": {"input": u.input_tokens, "output": u.output_tokens}}
 
 
+def r_config_test(root, payload):
+    """按服务商发一条最短请求。payload 可带 provider / api_key / model（测还没保存的密钥）；不带就测已保存的。"""
+    cfg = ai_service.load_config()
+    prov = payload.get("provider") if payload.get("provider") in ai_service.PROVIDERS else cfg["provider"]
+    pc = cfg["providers"][prov]
+    key = (payload.get("api_key") or pc.get("api_key") or "").strip()
+    model = (payload.get("model") or pc.get("model") or "").strip()
+    if not key:
+        return {"ok": False, "provider": prov, "message": "没有密钥"}
+    if prov == "deepseek":
+        ai = ai_service.DeepSeekAI(key, model or ai_service.ai_deepseek.DEFAULT_MODEL, pc.get("base_url") or ai_service.ai_deepseek.DEFAULT_BASE_URL)
+        try:
+            return {"provider": prov, **ai.ping()}
+        except ai_service.DeepSeekAPIError as e:
+            p = ai_error_payload(e)
+            return {**p, "ok": False, "message": (p["hint"] + "（" + p["message"] + "）") if p["hint"] else p["message"]}
+    return {"provider": prov, **_test_anthropic(key, model or ai_service.DEFAULT_MODEL)}
+
+
+def _finish(res: dict, ai, t0: float) -> dict:
+    """所有 AI 响应都带 provider、_usage（cost_cny 或 cost_usd）、_ms"""
+    ms = int((time.time() - t0) * 1000)
+    res.setdefault("provider", getattr(ai, "name", "mock"))
+    if not res.get("_usage"):
+        res["_usage"] = {"model": getattr(ai, "model", "mock"), "input": 0, "output": 0, "cache_read": 0, "ms": ms, "cost_cny": 0.0}
+    res["_ms"] = ms
+    return res
+
+
 def r_ai_draft(root, payload):
     intent = (payload.get("intent") or "").strip()
     if not intent:
         raise ValueError("intent 不能为空")
-    return ai_service.get_ai().draft(intent, payload.get("axis"), payload.get("targets"), payload.get("locked"))
+    t0, ai = time.time(), ai_service.get_ai(force_mock=bool(payload.get("force_mock")))
+    # 用户说死的条件（时段 / 溪 / 地标 / 层数 / 坡度 / 入口 / 原型 / 多层空间）：提示给模型，回来后再本地锁定一遍（不花钱）
+    cons = intent_rules.extract(intent)
+    hint = intent_rules.hint(cons)
+    res = ai.draft(intent + ((chr(10) + hint) if hint and getattr(ai, "name", "") != "mock" else ""), payload.get("axis"), payload.get("targets"), payload.get("locked"))
+    fixed = []
+    if isinstance(res, dict) and isinstance(res.get("cards"), list):
+        for i, card in enumerate(res["cards"]):
+            if isinstance(card, dict):
+                res["cards"][i], ch = intent_rules.enforce(card, cons, payload.get("axis"))
+                if ch:
+                    fixed.append({"card": i, "fields": ch})
+    res["constraints"] = intent_rules.summary(cons)
+    res["constraints_fixed"] = fixed
+    return _finish(res, ai, t0)
 
 
 def r_ai_revise(root, payload):
     if not payload.get("card") or not payload.get("action"):
         raise ValueError("需要 card 与 action")
-    return ai_service.get_ai().revise(payload["card"], payload["action"], payload.get("locked"))
+    t0, ai = time.time(), ai_service.get_ai(force_mock=bool(payload.get("force_mock")))
+    return _finish(ai.revise(payload["card"], payload["action"], payload.get("locked")), ai, t0)
 
 
 def r_score(root, payload):

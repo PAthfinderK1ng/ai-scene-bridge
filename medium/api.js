@@ -27,14 +27,14 @@ async function call(method, path, body, { timeoutMs = 30000, signal } = {}) {
   return data;
 }
 
-/** 状态码 → kind。本地服务把上游 Anthropic 的状态码放在 data.status 里（本身回 502） */
+/** 状态码 → kind。本地服务把上游（Anthropic / DeepSeek）的状态码放在 data.status 里（本身回 502） */
 function classify(status, data) {
   const st = (data && data.status) || status;
   const msg = String((data && (data.message || data.type)) || "");
-  if (st === 401 || st === 403 || st === 402) return "auth";
-  if (st === 404 && /model/i.test(msg + (data && data.hint || ""))) return "model";
-  if (st === 429) return "rate";
-  if (st === 529 || /overloaded/i.test(msg)) return "busy";
+  if (st === 401 || st === 403) return "auth";
+  if ((st === 404 || st === 400 || st === 422) && /model/i.test(msg + (data && data.hint || ""))) return "model";
+  if (st === 429 || st === 402) return "rate"; // 402：余额 / 计费问题
+  if (st === 529 || st === 503 || /overloaded/i.test(msg)) return "busy";
   if (/APIConnectionError|APITimeoutError/.test(msg)) return "net";
   return "server";
 }
@@ -44,11 +44,17 @@ export const api = {
   async health() { try { return await call("GET", "/api/health", null, { timeoutMs: 5000 }); } catch { return null; } },
   config() { return call("GET", "/api/config", null, { timeoutMs: 10000 }); },
   setConfig(patch) { return call("POST", "/api/config", patch, { timeoutMs: 30000 }); },
-  testKey(api_key) { return call("POST", "/api/config/test", api_key ? { api_key } : {}, { timeoutMs: 45000 }); },
-  /** 一句话 → 3 张卡。axis / targets / locked 用于「换一批」；真实 Claude 出三张卡可能要一两分钟 */
-  draft(intent, { axis = null, targets = null, locked = null } = {}, { signal } = {}) { return call("POST", "/api/ai/draft", { intent, axis, targets, locked }, { timeoutMs: 120000, signal }); },
-  /** 人的一次动作（结构化事实）→ 对当前卡的 patch + 复述 */
-  revise(card, action, locked = null, { signal } = {}) { return call("POST", "/api/ai/revise", { card, action, locked }, { timeoutMs: 60000, signal }); },
+  /** 测密钥：opts 可带 provider / model（测还没保存的设置）；不带 api_key 就测已保存的 */
+  testKey(api_key, opts = {}) { return call("POST", "/api/config/test", { ...(api_key ? { api_key } : {}), ...opts }, { timeoutMs: 45000 }); },
+  /** 一句话 → 3 张卡。axis / targets / locked 用于「换一批」；mock:true → force_mock（这次走模拟 AI，不花钱）。
+   *  返回 { cards, provider, _usage: { input, output, cache_read, ms, cost_cny | cost_usd }, _ms } */
+  draft(intent, { axis = null, targets = null, locked = null, mock = false } = {}, { signal, mock: mock2 = false } = {}) {
+    return call("POST", "/api/ai/draft", { intent, axis, targets, locked, ...(mock || mock2 ? { force_mock: true } : {}) }, { timeoutMs: 120000, signal });
+  },
+  /** 人的一句话 / 动作（结构化事实）→ 对当前卡的 patch + 复述（+ provider / _usage / _ms）；{ mock:true } → force_mock */
+  revise(card, action, locked = null, { signal, mock = false } = {}) {
+    return call("POST", "/api/ai/revise", { card, action, locked, ...(mock ? { force_mock: true } : {}) }, { timeoutMs: 60000, signal });
+  },
   /** 意图 SID vs 引擎读回 → score_readback 的结果 */
   score(intent, readback, opts = {}) { return call("POST", "/api/score", { intent, readback, auto_map: true, ...opts }, { timeoutMs: 30000 }); },
   save(name, content) { return call("POST", "/api/save", { name, content }, { timeoutMs: 30000 }); },

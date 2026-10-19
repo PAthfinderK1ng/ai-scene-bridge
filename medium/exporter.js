@@ -3,6 +3,14 @@
 import { ARCH_LABEL, TOD_LABEL } from "./cards.js";
 import { LANDMARK_LABEL, PLACEMENT_LABEL, SPAWN_LABEL } from "./views/map.js";
 import { slopeLabel } from "./views/profile.js";
+import { SPACE_LABEL, VIA_LABEL, STRATUM_LABEL } from "./engine/strata.js";
+
+const r1 = (v) => Math.round(Number(v) * 10) / 10;
+/** 剖切的一句话（BRIEF 与 views 说明共用） */
+export function sectionText(sec) {
+  if (!sec) return "沿主路";
+  return sec.mode === "line" && Array.isArray(sec.line) ? `直线 (${sec.line[0].map(r1).join(", ")}) → (${sec.line[1].map(r1).join(", ")})，宽 ${sec.width_m} m` : `沿主路，宽 ${sec.width_m} m`;
+}
 
 export function download(name, blob) {
   const a = document.createElement("a");
@@ -59,7 +67,7 @@ export function cleanSid(sid) {
 }
 
 /** 给引擎侧（人或 AI）的交代：结构、关系、事实、色板，全部来自卡与引擎 */
-export function buildBrief({ sid, card, facts = {}, checks = [], understanding = [], eye = {}, corrections = [] }) {
+export function buildBrief({ sid, card, facts = {}, checks = [], params = [], eye = {}, section = null, corrections = [] }) {
   const p = card.params || {};
   const lm = card.landmark, t = facts.trail || {};
   const lines = [];
@@ -72,14 +80,34 @@ export function buildBrief({ sid, card, facts = {}, checks = [], understanding =
   lines.push(`- 玩家出生点：${SPAWN_LABEL[card.spawn.placement] || card.spawn.placement}（markers 里 player_spawn，rotation_y 朝向地标）。${eye.landmark_visible ? `第一眼能看见地标，在画面${eye.landmark_screen}，仰角约 ${eye.landmark_elev_deg}°。` : eye.landmark_visible === false ? "第一眼看不见地标（设计者已知悉）。" : ""}`);
   if (t.length_m != null) lines.push(`- 主路 main_trail：${t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m，约 ${Math.round(t.steps_estimate || 0)} 级台阶；最陡 ${slopeLabel(t.max_slope || 0)}。请做成石阶 + 歇脚平台，不要做成斜坡。`);
   if (p.stream) lines.push("- 溪 stream（paths kind=river）走谷底，宽 4 m，水面低于两岸 0.5 m。");
+  const br = facts.bridges || [];
+  if (br.length) lines.push(`- 桥 ${br.length} 座（路过溪处，石板桥，桥面与路同宽）：${br.map((b) => `${b.path === "main_trail" ? "主路" : b.path} (${r1(b.at[0])}, ${r1(b.at[1])})`).join("、")}。`);
   if (facts.perTerrace) lines.push(`- 民居 ${facts.houses || 0} 栋：${Object.entries(facts.perTerrace).map(([l, n]) => `${+l + 1} 层 ${n} 栋`).join("，")}。每栋 volumes 里有确切 position / size / rotation_y；长边平行等高线，门（−z 面）朝下坡或朝路。`);
   if (card.regions && card.regions.some((r) => r.kind !== "other")) lines.push(`- 特殊区域：${card.regions.filter((r) => r.kind !== "other").map((r) => `${r.terrace + 1} 层 ${r.label || r.kind}（${r.kind}）`).join("、")}。`);
   lines.push("", "## 外观（P3：按 hex 用，不要自己猜色）");
   for (const c of card.palette || []) lines.push(`- ${c.role}: \`${c.hex}\` ${c.note || ""}`);
   lines.push(`- 时段：${TOD_LABEL[(card.lighting || {}).time_of_day] || "黄昏"}；气氛：${(card.mood || []).join("、")}`);
   lines.push("- 材质意图：屋顶 roof、墙 wall、台阶与挡土墙 stone、树 foliage、远景雾 mist。volumes 的 color_role 指向这些角色。");
-  lines.push("", "## 设计者已确认的理解（逐条成立才算对）");
-  for (const u of understanding) lines.push(`- [${u.confirmed ? "x" : " "}] ${u.text}${u.detail ? `（${u.detail}）` : ""}`);
+  const tuned = ((sid.terrain || {}).features || []).filter((f) => f.user_height);
+  if (tuned.length) lines.push(`- 单独调过高度的台地：${tuned.map((f) => `第 ${f.level + 1} 层 +${r1(f.height)} m`).join("、")}（terrain.features 里 user_height: true，按 height 搭，不要按层数推算）。`);
+  const moved = (sid.volumes || []).filter((v) => v.user_moved);
+  if (moved.length) lines.push(`- 设计者亲手挪过的房子 ${moved.length} 栋（id 以 u_house_ 开头、locked: true），位置按 SID 放。`);
+  const spaces = (sid.spaces || []).filter((x) => x && x.polygon);
+  const conns = (sid.markers || []).filter((m) => m && m.kind === "connector");
+  if (spaces.length) {
+    lines.push("", "## 多层空间与连接点（spaces / markers 里 kind=connector）");
+    lines.push("地下空间是挖进山体的可走空间（floor_y 是地面绝对高度，height 是净高，顶板到地面至少留 2 m 岩层）；空中空间是悬空的板（floor_y 是板面，板厚 1 m 在板面之下，height 是上方可用高度）。");
+    for (const x of spaces) {
+      const xs = x.polygon.map((p) => p[0]), zs = x.polygon.map((p) => p[1]);
+      lines.push(`- ${x.label || SPACE_LABEL[x.kind]}（${STRATUM_LABEL[x.stratum]} · ${SPACE_LABEL[x.kind] || x.kind}，id \`${x.id}\`）：底面 ${r1(x.floor_y)} m，${x.stratum === "underground" ? "净高" : "上方"} ${r1(x.height)} m，约 ${Math.round(Math.max(...xs) - Math.min(...xs))}×${Math.round(Math.max(...zs) - Math.min(...zs))} m（${x.polygon.length} 边形，见 polygon）${x.user_set ? "；设计者亲手加的" : ""}。`);
+    }
+    for (const m of conns) lines.push(`- 连接点 \`${m.id}\`：${VIA_LABEL[m.via] || m.via}，${m.from === "ground" ? "地面" : m.from} ↔ ${m.to === "ground" ? "地面" : (spaces.find((x) => x.id === m.to) || {}).label || m.to}，位置 (${r1(m.position[0])}, ${r1(m.position[2])})，下端 ${r1(m.bottom_y ?? m.position[1])} m、上端 ${r1(m.top_y ?? m.position[1])} m。`);
+  }
+  lines.push("", "## 剖切", `views/profile.png 是剖面：${sectionText(section)}（meta.section）。宽度带内的房子、地标、空间、连接点都投影到剖面上；纵向有夸张，标注是真实米数。`);
+  if (params.length) {
+    lines.push("", "## 参数（谁定的）");
+    for (const p of params) lines.push(`- ${p.label}：${p.value}（${p.by}${p.locked ? "，已锁" : ""}）`);
+  }
   lines.push("", "## 关系检查（引擎里搭完请再核一遍）");
   for (const c of checks) lines.push(`- ${c.ok ? "✓" : "✗"} ${c.text}${c.detail ? ` — ${c.detail}` : ""}`);
   if (corrections.length) { lines.push("", "## 上一轮读回后的修正要求"); for (const c of corrections) lines.push(`- ${c}`); }
@@ -91,18 +119,19 @@ export function buildBrief({ sid, card, facts = {}, checks = [], understanding =
  * 组包。views = { map: svg, profile: svg, eye: svg, three?: dataURL }
  * @returns {Promise<Blob>}
  */
-export async function buildPackage({ sid, card, facts, checks, understanding, eye, views, corrections = [] }) {
+export async function buildPackage({ sid, card, facts, checks, params = [], eye, section = null, views, corrections = [] }) {
   if (!window.JSZip) throw new Error("JSZip 没有加载（需要联网访问 cdn.jsdelivr.net）");
   const doc = cleanSid(sid);
+  if (section) doc.meta.section = JSON.parse(JSON.stringify(section));
   const zip = new window.JSZip();
   const imgs = [];
   if (views.map) { const r = await svgToPng(views.map, 2048); zip.file("views/top.png", r.blob); imgs.push({ kind: "top_down", image: "views/top.png", scale_m_per_px: Math.round(r.m_per_px * 1e5) / 1e5, north_up: true, labels_drawn: true }); }
-  if (views.profile) { const r = await svgToPng(views.profile, 1600); zip.file("views/profile.png", r.blob); imgs.push({ kind: "section", image: "views/profile.png", labels_drawn: true, note: "沿主路的侧剖面，纵向有夸张" }); }
+  if (views.profile) { const r = await svgToPng(views.profile, 1600); zip.file("views/profile.png", r.blob); imgs.push({ kind: "section", image: "views/profile.png", labels_drawn: true, note: `剖面：${sectionText(section)}，纵向有夸张` }); }
   if (views.eye) { const r = await svgToPng(views.eye, 1600); zip.file("views/first-sight.png", r.blob); imgs.push({ kind: "perspective", image: "views/first-sight.png", labels_drawn: true, note: "从出生点 1.7 m 眼高朝地标的示意，不是渲染" }); }
   if (views.three) { zip.file("views/preview-3d.png", dataURLToBlob(views.three)); imgs.push({ kind: "perspective", image: "views/preview-3d.png", labels_drawn: false, note: "3D 预览截图" }); }
   doc.views = (doc.views || []).filter((v) => !String(v.image || "").startsWith("views/")).concat(imgs);
   zip.file("scene.sid.json", JSON.stringify(doc, null, 2));
-  zip.file("BRIEF.md", buildBrief({ sid: doc, card, facts, checks, understanding, eye, corrections }));
+  zip.file("BRIEF.md", buildBrief({ sid: doc, card, facts, checks, params, eye, section, corrections }));
   try { const r = await fetch("../spec/PROTOCOL.md"); if (r.ok) zip.file("PROTOCOL.md", await r.text()); } catch { /* 离线 / 打包缺文件时跳过 */ }
   try { const r = await fetch("../spec/sid.schema.json"); if (r.ok) zip.file("sid.schema.json", await r.text()); } catch { /* 同上 */ }
   return zip.generateAsync({ type: "blob" });

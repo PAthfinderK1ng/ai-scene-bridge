@@ -1,0 +1,241 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { buildTerrain, pointInPolygon, polygonCentroid, polygonArea } from "../terrain.js";
+import { newDoc, applyCard, applyPatch, resolve, snapshot, setTerraceHeight } from "../sid.js";
+import { validate } from "../validate.js";
+import { boxCorners } from "../layout.js";
+import { STRATA_KINDS, SPACE_LABEL, CONNECTOR_VIA, VIA_LABEL, ANCHORS, SIZES, normalizeLevels, generateSpaces, makeSpace, spaceChecks, connectorFor, groundRange, spaceClearance, anchorPoint } from "../strata.js";
+
+const baseCard = (levels, extra = {}) => Object.assign({
+  name: "测试村", archetype: "slope_zigzag",
+  params: { entry_side: "S", terraces: 4, layer_height_m: 3, plateau_width: "medium", stream: false },
+  landmark: { kind: "temple", placement: "top" }, spawn: { placement: "valley_bottom" }, levels,
+}, extra);
+const build = (levels, extra, seed = 1) => resolve(applyCard(newDoc(), baseCard(levels, extra)), { seed });
+const conns = (sid) => sid.markers.filter((m) => m.kind === "connector");
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const inBounds = (sid, p) => p[0] >= sid.bounds.min[0] && p[0] <= sid.bounds.max[0] && p[1] >= sid.bounds.min[2] && p[1] <= sid.bounds.max[2];
+const checkOf = (checks, id) => checks.find((c) => c.id === id);
+const assertClear = (sp, T, tag = "") => {
+  const g = groundRange(sp.polygon, T);
+  if (sp.stratum === "underground") assert(g.min - (sp.floor_y + sp.height) >= 2 - 1e-6, `${tag}${sp.id} 岩层 ${g.min - sp.floor_y - sp.height}`);
+  else assert(sp.floor_y - 1 - g.max >= 3 - 1e-6, `${tag}${sp.id} 板底净空 ${sp.floor_y - 1 - g.max}`);
+};
+
+test("normalizeLevels：最多 3 项、非法 stratum / kind 丢弃、其余字段回退默认", () => {
+  const L = normalizeLevels([
+    { stratum: "underground", kind: "cave" },
+    { stratum: "underground", kind: "platform" },           // kind 与层不符 → 丢
+    { stratum: "water", kind: "cave" },                     // stratum 非法 → 丢
+    { stratum: "sky", kind: "walkway", anchor: "nowhere", size: "huge", connect: "teleport", height_layers: 99 },
+    { stratum: "sky", kind: "island", label: "云上岛" },
+    { stratum: "underground", kind: "crypt" },              // 第 4 个合法项 → 截掉
+  ]);
+  assert(L.length === 3, "3 项 " + L.length);
+  assert(L[0].anchor === "landmark" && L[0].size === "medium" && L[0].connect === "stairs" && L[0].depth_layers === 2 && L[0].label === "地下溶洞", "默认值 " + JSON.stringify(L[0]));
+  assert(L[1].anchor === "landmark" && L[1].size === "medium" && L[1].connect === "ladder" && L[1].height_layers === 6 && L[1].label === "天上栈道", "夹取 " + JSON.stringify(L[1]));
+  assert(L[2].label === "云上岛" && L[2].height_layers === 3, "自带 label");
+  assert(normalizeLevels(null).length === 0 && normalizeLevels("x").length === 0, "非数组");
+});
+
+test("每种 stratum × kind 都能生成：多边形在 bounds 内、高度合格、有连接点（天桥两端）、两项检查通过、validate 无 error", () => {
+  for (const stratum of ["underground", "sky"]) for (const kind of STRATA_KINDS[stratum]) {
+    const { sid, T, checks, facts } = build([{ stratum, kind, anchor: "landmark", size: "medium" }]);
+    assert(sid.spaces.length === 1, kind + " 1 个空间");
+    const sp = sid.spaces[0];
+    assert(sp.id === `space_${kind}_1` && sp.generated === true && sp.stratum === stratum && sp.kind === kind, kind + " 字段 " + JSON.stringify(sp).slice(0, 120));
+    assert(sp.polygon.length >= 4 && sp.polygon.every((p) => inBounds(sid, p)), kind + " 多边形在 bounds 内");
+    assert(sp.label === (stratum === "underground" ? "地下" : "天上") + SPACE_LABEL[kind], kind + " label");
+    assertClear(sp, T, kind + " ");
+    const cs = conns(sid);
+    assert(cs.length === (kind === "bridge" ? 2 : 1), kind + " 连接点数 " + cs.length);
+    for (const c of cs) {
+      assert(c.from === "ground" && c.to === sp.id && CONNECTOR_VIA.includes(c.via) && c.generated, kind + " 连接点字段");
+      assert(c.top_y > c.bottom_y && c.position[1] === c.bottom_y, kind + " 两端高度");
+      const ground = T.heightAt(c.position[0], c.position[2]);
+      if (stratum === "underground") { close(c.top_y, ground, 0.05, kind + " 上端在地面"); close(c.bottom_y, sp.floor_y, 1e-6, kind + " 下端在空间底面"); }
+      else { close(c.bottom_y, ground, 0.05, kind + " 下端在地面"); close(c.top_y, sp.floor_y, 1e-6, kind + " 上端在板面"); }
+    }
+    assert(checkOf(checks, "spaces_connected").ok && checkOf(checks, "spaces_clear_of_terrain").ok, kind + " 检查通过");
+    assert(facts.spaces.total === 1 && facts.spaces[stratum] === 1 && facts.spaces.connectors === cs.length, kind + " facts.spaces");
+    assert(facts.errors === 0, kind + " validate error: " + JSON.stringify(facts.validation.filter((m) => m.level === "error")));
+  }
+});
+
+test("七种 anchor：地下溶洞落在锚点附近（地标正下方、入口旁…），至少 5 个不同位置", () => {
+  const centers = [];
+  for (const anchor of ANCHORS) {
+    const { sid, T } = build([{ stratum: "underground", kind: "cave", anchor, size: "small" }]);
+    const sp = sid.spaces[0], c = polygonCentroid(sp.polygon), a = anchorPoint(anchor, sid, T);
+    assert(dist(c, a) <= SIZES.small, `${anchor} 质心距锚点 ${dist(c, a)}`);
+    centers.push(c.map((v) => Math.round(v)).join(","));
+    if (anchor === "landmark") { const lm = sid.volumes.find((v) => v.importance === "landmark"); assert(pointInPolygon([lm.position[0], lm.position[2]], sp.polygon), "地标正下方"); }
+    if (anchor === "entry") { const s = sid.markers.find((m) => m.kind === "player_spawn"); assert(dist(c, [s.position[0], s.position[2]]) <= SIZES.small, "入口附近"); }
+  }
+  assert(new Set(centers).size >= 5, "不同位置 " + centers.join(" | "));
+});
+
+test("size：small < medium < large（圆形看面积，长条看长度）", () => {
+  const area = (size) => polygonArea(build([{ stratum: "underground", kind: "crypt", size }]).sid.spaces[0].polygon);
+  const a = area("small"), b = area("medium"), c = area("large");
+  assert(a < b && b < c, `面积 ${a} ${b} ${c}`);
+  between(b, Math.PI * 9 * 9 * 0.65, Math.PI * 9 * 9 * 1.15, "medium 直径约 18 m");
+  const len = (size) => { const p = build([{ stratum: "sky", kind: "walkway", anchor: "ridge_end", size }]).sid.spaces[0].polygon; return Math.max(dist(p[0], p[1]), dist(p[1], p[2])); };
+  const l1 = len("small"), l3 = len("large");
+  assert(l1 < l3 && l1 >= 12, `栈道长度 ${l1} ${l3}`);
+});
+
+test("确定性：同卡同 seed 两次逐字节相同；card.seed 不同则多边形不同", () => {
+  const lv = [{ stratum: "underground", kind: "cave" }, { stratum: "sky", kind: "bridge", anchor: "top" }, { stratum: "sky", kind: "platform", anchor: "village" }];
+  const a = snapshot(build(lv).sid), b = snapshot(build(lv).sid);
+  assert(a === b, "两次相同");
+  const c = build(lv, { seed: 5 }).sid;
+  assert(JSON.stringify(c.spaces[0].polygon) !== JSON.stringify(JSON.parse(a).spaces[0].polygon), "seed 不同多边形不同");
+  assert(c.spaces.map((s) => s.id).join() === "space_cave_1,space_bridge_1,space_platform_1", "id 稳定");
+});
+
+test("高度规则：地下默认 floor = 地面 − 2 层 − 净高（且岩层 ≥ 2 m）；空中 floor ≥ 地面 + 3 层；栈道沿等高线（两端高差小）", () => {
+  const { sid, T } = build([{ stratum: "underground", kind: "cave", anchor: "top", depth_layers: 2 }, { stratum: "sky", kind: "walkway", anchor: "ridge_end", height_layers: 3 }]);
+  const [cave, walk] = sid.spaces;
+  const c = polygonCentroid(cave.polygon), ref = T.heightAt(c[0], c[1]);
+  assert(cave.floor_y <= ref - 2 * 3 - cave.height + 1e-6, `溶洞 floor ${cave.floor_y} ref ${ref}`);
+  assertClear(cave, T);
+  const cw = polygonCentroid(walk.polygon);
+  assert(walk.floor_y >= T.heightAt(cw[0], cw[1]) + 9 - 1e-6, "栈道 ≥ 地面 + 3 层");
+  const p = walk.polygon, e0 = [(p[0][0] + p[3][0]) / 2, (p[0][1] + p[3][1]) / 2], e1 = [(p[1][0] + p[2][0]) / 2, (p[1][1] + p[2][1]) / 2];
+  assert(Math.abs(T.heightAt(...e0) - T.heightAt(...e1)) <= 3.01, "栈道两端高差 ≤ 1 层");
+  const conn = conns(sid).find((m) => m.to === cave.id);
+  assert(conn.label === "下行" + VIA_LABEL.stairs && conns(sid).find((m) => m.to === walk.id).label === "上行" + VIA_LABEL.ladder, "连接点文案");
+});
+
+test("天桥：跨谷或跨台地，两端各一个连接点，桥面高于两端地面且板底净空 ≥ 3 m", () => {
+  for (const arch of ["valley_two_banks", "slope_zigzag"]) {
+    const { sid, T, checks } = build([{ stratum: "sky", kind: "bridge", anchor: "top", size: "medium" }], { archetype: arch, params: { entry_side: "S", terraces: 4, layer_height_m: 3, plateau_width: "medium" } });
+    const br = sid.spaces[0], cs = conns(sid);
+    assert(cs.length === 2 && cs[0].id === "conn_space_bridge_1" && cs[1].id === "conn_space_bridge_1_2", arch + " 两端 id");
+    assert(dist([cs[0].position[0], cs[0].position[2]], [cs[1].position[0], cs[1].position[2]]) > 8, arch + " 两端分开");
+    for (const c of cs) assert(br.floor_y > T.heightAt(c.position[0], c.position[2]) + 3, arch + " 桥面高于端点地面");
+    assertClear(br, T, arch + " ");
+    assert(checkOf(checks, "spaces_clear_of_terrain").ok, arch + " 检查");
+  }
+});
+
+test("spaces_connected：删掉连接点 → 不通过；fix「补一个连接点」→ 通过；「不重要」→ ignored", () => {
+  const r = build([{ stratum: "underground", kind: "cellar", anchor: "village" }]);
+  const sid = r.sid;
+  sid.markers = sid.markers.filter((m) => m.kind !== "connector");
+  let ch = checkOf(spaceChecks(sid, r.T), "spaces_connected");
+  assert(!ch.ok && ch.detail.includes("没有连接点") && ch.fixes.map((f) => f.label).join() === "补一个连接点,不重要", "不通过 " + JSON.stringify(ch.fixes.map((f) => f.label)));
+  ch.fixes[0].patch(sid);
+  assert(conns(sid).length === 1, "补了 1 个");
+  assert(checkOf(spaceChecks(sid, r.T), "spaces_connected").ok, "补完通过");
+  // 两层之间的连接：地窖 → 溶洞，溶洞只经地窖通到地面也算连通
+  const ok2 = build([{ stratum: "underground", kind: "cellar" }, { stratum: "underground", kind: "cave", anchor: "village" }]);
+  const s2 = ok2.sid, cave = s2.spaces[1];
+  s2.markers = s2.markers.filter((m) => m.to !== cave.id);
+  s2.markers.push({ id: "conn_link", kind: "connector", via: "shaft", from: s2.spaces[0].id, to: cave.id, position: [0, 0, 0], top_y: 0, bottom_y: 0, label: "竖井" });
+  assert(checkOf(spaceChecks(s2, ok2.T), "spaces_connected").ok, "经别的空间连通也算");
+  s2.markers = s2.markers.filter((m) => m.id !== "conn_link");
+  const c3 = checkOf(spaceChecks(s2, ok2.T), "spaces_connected");
+  c3.fixes[1].patch(s2);
+  assert(checkOf(spaceChecks(s2, ok2.T), "spaces_connected").ignored === true, "不重要");
+});
+
+test("makeSpace：人圈的多边形补高度（地下 2 层 / 空中 3 层，岩层 ≥ 2 m / 净空 ≥ 3 m）与连接点；太浅 / 太低时检查报错，fix 下移 / 上移到合格", () => {
+  const r = build([]);
+  const { sid, T } = r;
+  const top = T.topTerrace(), c = top.centroid;
+  const poly = [[c[0] - 6, c[1] - 4], [c[0] + 6, c[1] - 4], [c[0] + 6, c[1] + 4], [c[0] - 6, c[1] + 4]];
+  const u = makeSpace({ stratum: "underground", kind: "crypt", polygon: poly }, sid, T);
+  assert(u.space.id === "u_space_1" && u.space.user_set === true && !u.space.generated && u.space.height === 5, "id / user_set / 默认净高");
+  assert(u.space.floor_y <= top.height - 6 - 5 + 1e-6, "地面下 2 层 " + u.space.floor_y);
+  assertClear(u.space, T);
+  assert(u.connector.to === "u_space_1" && pointInPolygon([u.connector.position[0], u.connector.position[2]], poly), "连接点在多边形内");
+  const s = makeSpace({ stratum: "sky", polygon: poly.map(([x, z]) => [x + 2, z]) }, Object.assign({}, sid, { spaces: [u.space] }), T);
+  assert(s.space.id === "u_space_2" && s.space.kind === "platform" && s.space.floor_y >= top.height + 9 - 1e-6, "空中默认上 3 层 " + s.space.floor_y);
+  assertClear(s.space, T);
+  // 人把高度拖坏了
+  sid.spaces.push(u.space, s.space); sid.markers.push(u.connector, s.connector);
+  u.space.floor_y = top.height - 3; s.space.floor_y = top.height + 2;
+  let ch = checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain");
+  assert(!ch.ok && ch.severity === "error" && ch.fixes[0].label === "移到合格高度", "两个都坏 " + ch.detail);
+  s.space.floor_y = top.height + 20;
+  ch = checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain");
+  assert(!ch.ok && ch.fixes[0].label === "下移到合格高度", "只有地下坏");
+  ch.fixes[0].patch(sid);
+  assert(checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain").ok, "下移后合格");
+  s.space.floor_y = top.height + 1;
+  ch = checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain");
+  assert(ch.fixes[0].label === "上移到合格高度", "只有空中坏");
+  ch.fixes[0].patch(sid);
+  assert(checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain").ok, "上移后合格");
+  assert(makeSpace({ stratum: "water", polygon: poly }, sid, T) === null && makeSpace({ stratum: "sky", polygon: [[0, 0]] }, sid, T) === null, "非法输入 null");
+});
+
+test("user_set 空间与它的连接点在 applyPatch / resolve 后保留；generated 空间随 levels 重生，levels 清空就删掉", () => {
+  const r = build([{ stratum: "underground", kind: "cave" }]);
+  const { sid, T } = r;
+  const c = T.terraces[1].centroid;
+  const u = makeSpace({ stratum: "underground", kind: "tunnel", polygon: [[c[0] - 8, c[1] - 2], [c[0] + 8, c[1] - 2], [c[0] + 8, c[1] + 2], [c[0] - 8, c[1] + 2]] }, sid, T);
+  sid.spaces.push(u.space); sid.markers.push(u.connector);
+  const floor = u.space.floor_y;
+  applyPatch(sid, { levels: [{ stratum: "sky", kind: "island", anchor: "top" }], density_scale: 0.8 });
+  let out = resolve(sid, { seed: 1 });
+  const ids = out.sid.spaces.map((s) => s.id).sort().join();
+  assert(ids === "space_island_1,u_space_1", "保留 user_set、换掉 generated：" + ids);
+  assert(out.sid.spaces.find((s) => s.id === "u_space_1").floor_y === floor, "user_set 高度不动");
+  assert(conns(out.sid).some((m) => m.to === "u_space_1") && !conns(out.sid).some((m) => m.to === "space_cave_1"), "连接点跟着保留 / 删除");
+  applyPatch(sid, { levels: [] });
+  out = resolve(sid, { seed: 1 });
+  assert(out.sid.spaces.length === 1 && conns(out.sid).length === 1, "levels 清空只剩人圈的");
+  assert(out.facts.errors === 0, "validate 无 error");
+});
+
+test("地形调高后：地下空间仍在地面下（generated 自动下移），连接点上端跟到新地面；人设空间高度不动但检查会报", () => {
+  const r = build([{ stratum: "underground", kind: "crypt", anchor: "top", depth_layers: 1 }]);
+  const { sid } = r;
+  const crypt = sid.spaces[0], topId = r.T.topTerrace().id, oldTop = r.T.topTerrace().height;
+  setTerraceHeight(sid, topId, oldTop + 12);
+  const r2 = resolve(sid, { seed: 1 });
+  const T2 = r2.T;
+  assert(T2.topTerrace().height === oldTop + 12, "台地已调高");
+  assertClear(crypt, T2, "调高后 ");
+  const conn = conns(sid)[0];
+  close(conn.top_y, T2.heightAt(conn.position[0], conn.position[2]), 0.05, "连接点上端在新地面");
+  assert(checkOf(r2.checks, "spaces_clear_of_terrain").ok, "检查通过");
+  // 人设的天上平台：地形抬高后被顶穿 → 检查报错
+  const c = T2.topTerrace().centroid;
+  const sky = makeSpace({ stratum: "sky", polygon: [[c[0] - 4, c[1] - 4], [c[0] + 4, c[1] - 4], [c[0] + 4, c[1] + 4], [c[0] - 4, c[1] + 4]] }, sid, T2);
+  sid.spaces.push(sky.space); sid.markers.push(sky.connector);
+  setTerraceHeight(sid, topId, oldTop + 20);
+  const r3 = resolve(sid, { seed: 1 });
+  assert(!checkOf(r3.checks, "spaces_clear_of_terrain").ok, "人设平台被地形顶穿要报");
+  assertClear(sid.spaces[0], r3.T, "generated 地宫仍合格 ");
+});
+
+test("房子避开连接点；没有空间时不追加检查（仍是 6 项）", () => {
+  const { sid } = build([{ stratum: "underground", kind: "cellar", anchor: "village" }, { stratum: "sky", kind: "platform", anchor: "plaza" }]);
+  const houses = sid.volumes.filter((v) => v.kind === "building" && v.generated);
+  assert(houses.length >= 6, "还有房子 " + houses.length);
+  for (const c of conns(sid)) for (const h of houses) assert(!pointInPolygon([c.position[0], c.position[2]], boxCorners(h.position, [h.size[0] + 2, h.size[1], h.size[2] + 2], h.rotation_y)), `${h.id} 压住 ${c.id}`);
+  const none = build([]);
+  assert(none.checks.length === 7 && none.sid.spaces.length === 0 && none.facts.spaces.total === 0, "无空间 7 项检查");
+  assert(spaceChecks(none.sid, none.T).length === 0, "spaceChecks 空");
+});
+
+test("connectorFor：地下连接点优先靠近主路；validate 认识 connector（引用不存在的空间报 error、id 全局唯一）", () => {
+  const { sid, T } = build([{ stratum: "underground", kind: "cave", anchor: "landmark", size: "large" }]);
+  const cave = sid.spaces[0], c = connectorFor(cave, sid, T), trail = sid.paths.find((p) => p.id === "main_trail");
+  const dTrail = (p) => Math.min(...trail.points.map((q) => dist(p, q)));
+  assert(dTrail([c.position[0], c.position[2]]) <= dTrail(polygonCentroid(cave.polygon)) + 1e-6, "比质心更靠主路");
+  const bad = JSON.parse(snapshot(sid));
+  bad.markers.push(Object.assign({}, c, { id: "conn_x", to: "space_none" }));
+  bad.markers.push(Object.assign({}, c, { id: cave.id }));
+  const v = validate(bad, buildTerrain(bad));
+  assert(v.some((m) => m.level === "error" && m.msg.includes("space_none")), "不存在的空间");
+  assert(v.some((m) => m.level === "error" && m.msg.includes("重复")), "id 重复");
+});
+
+run();
+</script>

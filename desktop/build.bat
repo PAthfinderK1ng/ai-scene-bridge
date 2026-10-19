@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\pyinstaller.exe" (
 )
 ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --name SceneDialog ^
   --add-data "medium;medium" --add-data "app;app" --add-data "spec;spec" --add-data "tools;tools" ^
-  --paths desktop --hidden-import api_server --hidden-import ai_service --hidden-import score_readback ^
+  --paths desktop --hidden-import api_server --hidden-import ai_service --hidden-import ai_common --hidden-import ai_mock --hidden-import ai_deepseek --hidden-import intent_rules --hidden-import schema_lite --hidden-import score_readback ^
   --collect-all webview --collect-all clr_loader --collect-all pythonnet --collect-all anthropic ^
   desktop\sid_editor.py
 if errorlevel 1 exit /b 1

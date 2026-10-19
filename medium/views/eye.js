@@ -106,18 +106,21 @@ export function renderEye(ctx) {
     }
   }
 
-  // 体块：按距离远→近
-  const vols = (sid.volumes || []).filter((v) => v.position && v.size).map((v) => ({ v, dist: Math.hypot(v.position[0] - ex, v.position[2] - ez) })).filter((o) => o.dist > 1 && o.dist < MAXR).sort((a, b) => b.dist - a.dist);
-  let landmarkVisible = null, landmarkScreen = null;
-  for (const { v, dist } of vols) {
+  // 体块：按距离远→近。空中空间（平台 / 栈道 / 浮岛 / 天桥）当一块板画（板面 floor_y，板厚 1 m）；地下空间看不见，不画
+  const vols = (sid.volumes || []).filter((v) => v.position && v.size).map((v) => {
     const hw = v.size[0] / 2, hd = v.size[2] / 2, th = ((v.rotation_y || 0) * Math.PI) / 180;
     const cs = Math.cos(th), sn = Math.sin(th);
     const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([lx, lz]) => [v.position[0] + lx * cs + lz * sn, v.position[2] - lx * sn + lz * cs]);
+    return { v, corners, y0: v.position[1], y1: v.position[1] + v.size[1], dist: Math.hypot(v.position[0] - ex, v.position[2] - ez) };
+  });
+  for (const sk of skySpaces(sid)) vols.push(Object.assign(sk, { dist: centroidDist(sk.corners, ex, ez) }));
+  vols.sort((a, b) => b.dist - a.dist);
+  let landmarkVisible = null, landmarkScreen = null, skyDrawn = 0;
+  for (const { v, corners, y0, y1, dist } of vols.filter((o) => o.dist > 1 && o.dist < MAXR)) {
     const azs = corners.map(([x, z]) => norm(Math.atan2(z - ez, x - ex) - a0));
     const azMin = Math.min(...azs), azMax = Math.max(...azs);
     if (azMax - azMin > Math.PI) continue; // 跨越正后方
     if (deg(azMax) < -FOV / 2 || deg(azMin) > FOV / 2) continue;
-    const y0 = v.position[1], y1 = v.position[1] + v.size[1];
     const eb = deg(Math.atan2(y0 - eyeH, dist)), et = deg(Math.atan2(y1 - eyeH, dist));
     // 地形遮挡：中心列上，比它近的地形仰角是否盖过它的顶
     const cc = Math.round(((deg(norm((azMin + azMax) / 2)) + FOV / 2) / FOV) * (COLS - 1));
@@ -133,6 +136,7 @@ export function renderEye(ctx) {
     const yt = sy(Math.min(et, VFOV_UP)), yb = Math.min(Hv, sy(Math.max(eb, -VFOV_DOWN)));
     if (x1 - x0 < 0.6 || yb - yt < 0.6) continue;
     const far = Math.min(1, dist / MAXR);
+    if (v.kind === "sky_space") { skyDrawn++; s.append(svgel("rect", { class: "sky-space", "data-id": v.id, x: x0, y: yt, width: x1 - x0, height: Math.max(1, yb - yt), fill: mix("#8a7f6e", pal.mist, far * 0.6), stroke: "rgba(0,0,0,.4)", "stroke-width": 0.3, opacity: blocked ? 0.35 : 0.95 })); continue; }
     if (v.kind === "prop") { s.append(svgel("ellipse", { cx: (x0 + x1) / 2, cy: (yt + yb) / 2, rx: (x1 - x0) / 2, ry: (yb - yt) / 2, fill: mix(pal.foliage, pal.mist, far * 0.7), opacity: 0.9 })); continue; }
     const wall = isLm ? pal.roof : pal.wall, roofH = Math.min((yb - yt) * 0.35, 6);
     s.append(svgel("rect", { x: x0, y: yt + roofH, width: x1 - x0, height: Math.max(0.5, yb - yt - roofH), fill: mix(wall, pal.mist, far * 0.6), stroke: isLm ? "#4a1a10" : "rgba(0,0,0,.35)", "stroke-width": isLm ? 1 : 0.3, opacity: blocked ? 0.35 : 1, "stroke-dasharray": blocked ? "2 2" : null }));
@@ -151,7 +155,7 @@ export function renderEye(ctx) {
   for (const x of [Wv / 3, (Wv * 2) / 3]) s.append(svgel("line", { x1: x, x2: x, y1: 0, y2: Hv, stroke: "#fff", "stroke-width": 0.4, opacity: 0.5, "stroke-dasharray": "2 3" }));
 
   const where = landmarkScreen ? (landmarkScreen.x < Wv / 3 ? "左" : landmarkScreen.x > (Wv * 2) / 3 ? "右" : "正中") : null;
-  const facts = { landmark_visible: landmarkVisible, landmark_screen: where, landmark_dist_m: landmarkScreen ? Math.round(landmarkScreen.dist) : null, landmark_elev_deg: landmarkScreen ? fmt1(landmarkScreen.elev) : null, time_of_day: tod };
+  const facts = { landmark_visible: landmarkVisible, landmark_screen: where, landmark_dist_m: landmarkScreen ? Math.round(landmarkScreen.dist) : null, landmark_elev_deg: landmarkScreen ? fmt1(landmarkScreen.elev) : null, time_of_day: tod, sky_spaces: skyDrawn };
   const cap = document.createElement("div");
   cap.className = "caption";
   if (lm && landmarkScreen) cap.append(span(`第一眼：${lm.label || "地标"} 在画面${where}${landmarkScreen.top < 0 ? "（出框，太近或太高）" : ""}`), span(`距离约 ${facts.landmark_dist_m} m`), span(`仰角 ${facts.landmark_elev_deg}°`), span(landmarkVisible ? "可见 ✓" : "被地形 / 房子挡住 ✗"));
@@ -161,6 +165,15 @@ export function renderEye(ctx) {
   return { node: wrap, facts };
 }
 
+/** 空中空间 → 当体块画的板：多边形顶点作角点，y 从 floor_y − 1 到 floor_y */
+export function skySpaces(sid) {
+  return (sid.spaces || []).filter((x) => x && x.stratum === "sky" && Array.isArray(x.polygon) && x.polygon.length >= 3 && Number.isFinite(x.floor_y))
+    .map((x) => ({ v: { id: x.id, kind: "sky_space", label: x.label || "" }, corners: x.polygon.map((p) => [p[0], p[1]]), y0: x.floor_y - 1, y1: x.floor_y }));
+}
+function centroidDist(corners, ex, ez) {
+  const cx = corners.reduce((a, p) => a + p[0], 0) / corners.length, cz = corners.reduce((a, p) => a + p[1], 0) / corners.length;
+  return Math.hypot(cx - ex, cz - ez);
+}
 function norm(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
 function span(t) { const e = document.createElement("span"); e.textContent = t; return e; }
 function hex2(hex) { const h = hex.replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); }

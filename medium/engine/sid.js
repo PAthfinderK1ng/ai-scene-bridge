@@ -5,10 +5,11 @@
 
 import { buildTerrain, generateArchetype, ARCHETYPES, DEFAULT_BOUNDS, DEFAULT_LAYER_M, pointInPolygon, distToPolygon, clamp, r2 } from "./terrain.js";
 import { layoutHouses, HOUSE_SIZES, boxCorners, facingToRotation } from "./layout.js";
-import { routeTrail, zigzagTrail, pathFacts } from "./routing.js";
-import { analyze, unreachedTerraces } from "./relations.js";
+import { routeTrail, zigzagTrail, pathFacts, pathCrossings } from "./routing.js";
+import { analyze, unreachedTerraces, polyToPolylineDist } from "./relations.js";
 import { validate } from "./validate.js";
 import { paletteShift, ROLES, SHIFT_MODES } from "./color.js";
+import { normalizeLevels, generateSpaces, refreshSpaces, spaceChecks, spaceFacts } from "./strata.js";
 
 // ------------------------------------------------------------ 主题
 /**
@@ -50,9 +51,9 @@ const CARD_DEFAULTS = Object.freeze({
   landmark: { kind: "temple", placement: "top" },
   spawn: { placement: "valley_bottom" },
   regions: [], palette: null, palette_shift: "neutral", density_scale: 1,
-  lighting: {}, mood: [], summary: "",
+  lighting: {}, mood: [], summary: "", levels: [],
 });
-const LANDMARK_PLACEMENTS = ["top", "ridge_end", "cliff_edge", "plaza"];
+const LANDMARK_PLACEMENTS = ["top", "ridge_end", "cliff_edge", "plaza", "entry"]; // entry = 村口（原型的 spots.entry）
 const SPAWN_PLACEMENTS = ["valley_bottom", "side_slope", "summit", "S", "E", "W"];
 const MAIN_TRAIL_ID = "main_trail", STREAM_ID = "stream", LANDMARK_ID = "landmark", SPAWN_ID = "spawn", POI_ID = "landmark_poi";
 
@@ -103,7 +104,7 @@ export function newDoc(theme = THEME.mountain_village) {
     style: { palette: clone(t.palette), references: [], lighting: clone(t.lighting), material_intents: {} },
     bounds: clone(t.bounds),
     terrain: { base: "flat", base_height: 0, features: [] },
-    volumes: [], regions: [], paths: [], markers: [], relations: [], constraints: [], views: [], asset_hints: {},
+    volumes: [], regions: [], paths: [], markers: [], spaces: [], relations: [], constraints: [], views: [], asset_hints: {},
   };
 }
 
@@ -112,6 +113,7 @@ export function normalizeCard(card = {}) {
   const c = deepMerge(CARD_DEFAULTS, card || {});
   c.regions = mergeByKey([], card && card.regions, "terrace").filter((r) => Number.isFinite(Number(r.terrace)));
   c.palette = card && Array.isArray(card.palette) ? mergeByKey([], card.palette, "role") : null;
+  c.levels = normalizeLevels(card && card.levels);
   if (!ARCHETYPES.includes(c.archetype)) c.archetype = CARD_DEFAULTS.archetype;
   if (!LANDMARK_PLACEMENTS.includes(c.landmark.placement)) c.landmark.placement = "top";
   if (!SPAWN_PLACEMENTS.includes(c.spawn.placement)) c.spawn.placement = "valley_bottom";
@@ -193,12 +195,14 @@ export function applyCard(sid, card) {
   sid.bounds = sid.bounds || clone(theme.bounds);
   sid.meta = sid.meta || {};
   sid.terrain = sid.terrain || { base: "flat", base_height: 0, features: [] };
-  for (const k of ["volumes", "regions", "paths", "markers", "relations", "constraints"]) sid[k] = Array.isArray(sid[k]) ? sid[k] : [];
+  for (const k of ["volumes", "regions", "paths", "markers", "spaces", "relations", "constraints"]) sid[k] = Array.isArray(sid[k]) ? sid[k] : [];
 
-  // 1. 原型 → 地形
+  // 1. 原型 → 地形（同原型、同 id 的台地沿用人单独调过的高度 user_height）
   const g = generateArchetype(c.archetype, c.params, sid.bounds, c.seed);
+  const userHeights = new Map(sid.meta.archetype === g.archetype ? (sid.terrain.features || []).filter((f) => f && f.user_height && Number.isFinite(f.height)).map((f) => [f.id, f.height]) : []);
   sid.meta.layer_height_m = g.layer_height_m;
   sid.terrain.features = clone(g.features);
+  for (const f of sid.terrain.features) if (userHeights.has(f.id)) Object.assign(f, { height: userHeights.get(f.id), skirt: clamp(Math.abs(userHeights.get(f.id)) * 0.8, 2, 10), user_height: true });
   const T = buildTerrain(sid, { res: 2 });
 
   // 2. 清掉上次生成的东西（保留用户的）
@@ -236,6 +240,15 @@ export function applyCard(sid, card) {
     const density = clamp(Number(ov.density ?? old.density ?? 1), 0, 1.6);
     return { id, kind, polygon: clone(f.polygon), density, label: ov.label || old.label || f.label || "", terrace_level: f.level };
   }).concat(userRegions);
+
+  // 5b. 多层空间：清掉上次生成的空间与它们的连接点（人圈的 user_set 空间与连向它们的连接点保留），按卡片 levels 重新生成
+  sid.meta.seed = c.seed;
+  sid.spaces = sid.spaces.filter((s) => s && (s.user_set || !s.generated));
+  const keptSpaces = new Set(sid.spaces.map((s) => s.id));
+  sid.markers = sid.markers.filter((m) => !m || m.kind !== "connector" || [m.from, m.to].every((e) => e === "ground" || keptSpaces.has(e)));
+  const S = generateSpaces(c.levels, sid, T, g);
+  sid.spaces.push(...S.spaces);
+  sid.markers.push(...S.connectors);
 
   // 6. 风格与意图
   sid.style = sid.style || {};
@@ -293,7 +306,7 @@ function addAutoSpurs(sid, T, theme, seed, avoid) {
       const id = "spur_" + f.t.id;
       if (sid.paths.some((p) => p.id === id)) continue;
       const from = f.nearPt ? [r2(f.nearPt[0]), r2(f.nearPt[1])] : origin, to = [r2(f.target[0]), r2(f.target[1])];
-      const r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2, avoidPolys: avoid, seed, maxPoints: 12 });
+      const r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2, avoidPolys: avoid, seed, maxPoints: 12, wet: riversOf(sid) });
       const points = (r.points || [from, to]).map(([x, z]) => [r2(x), r2(z)]);
       points[0] = from; points[points.length - 1] = to;
       sid.paths.push({ id, kind: "trail", width: theme.trail.width, points, surface: theme.trail.surface, label: "支路", generated: true, auto_spur: true });
@@ -303,6 +316,21 @@ function addAutoSpurs(sid, T, theme, seed, avoid) {
   }
   return added;
 }
+/**
+ * 主路是不是为躲开人放的房子绕了路：只看贴着主路（底面 6 m 内）的那几栋；把它们从禁行区拿掉再算一次 A*，
+ * 新路穿过（外扩 1 m 的）底面的就是「为它绕行」。没有贴路的房子时不多算。
+ * @returns {string[]} 房子 id（按 id 排序）
+ */
+function detourAround(T, from, to, points, houses, avoidVols, seed, wet) {
+  const near = houses.filter((v) => polyToPolylineDist(expandedFootprint(v, 0), points) < 6);
+  if (!near.length) return [];
+  const keep = avoidVols.filter((v) => !near.includes(v)).map((v) => expandedFootprint(v, v.kind === "building" ? 2.5 : 1));
+  const r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2, avoidPolys: keep, seed, wet });
+  if (!r.points) return [];
+  return near.filter((v) => polyToPolylineDist(expandedFootprint(v, 1), r.points) === 0).map((v) => v.id).sort();
+}
+/** 溪（给 A* 加代价：过溪直着过，不顺着溪床走） */
+function riversOf(sid) { return (sid.paths || []).filter((p) => p && p.kind === "river"); }
 /** 体块底面四角外扩 margin 米（给 A* 当禁行区） */
 function expandedFootprint(v, margin) { return boxCorners(v.position, [v.size[0] + 2 * margin, v.size[1], v.size[2] + 2 * margin], v.rotation_y || 0); }
 
@@ -314,19 +342,21 @@ function expandedFootprint(v, margin) { return boxCorners(v.position, [v.size[0]
  * 确定性：同 (sid, seed) 两次调用的 sid / checks / facts 逐字节相同；耗时在返回值顶层 ms，不进 facts。
  * @param {object} sid 文档（原地修改并返回）
  * @param {{seed?: number, autoSpur?: boolean}} [opts] seed 默认 sid.meta.seed，再默认 1；autoSpur 默认 true
- * @returns {{sid: object, T: object, checks: object[], facts: object, ms: number}} facts 含 houses / trees / perTerrace / rejected / trail / spurs / validation
+ * @returns {{sid: object, T: object, checks: object[], facts: object, ms: number}} facts 含 houses / trees / perTerrace / rejected / trail / spurs / bridges / validation
  */
 export function resolve(sid, opts = {}) {
   const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
   const seed = (Number(opts.seed ?? (sid.meta && sid.meta.seed) ?? 1) >>> 0) || 1;
   const theme = themeOf(sid);
-  for (const k of ["volumes", "regions", "paths", "markers", "relations", "constraints"]) sid[k] = Array.isArray(sid[k]) ? sid[k] : [];
+  for (const k of ["volumes", "regions", "paths", "markers", "spaces", "relations", "constraints"]) sid[k] = Array.isArray(sid[k]) ? sid[k] : [];
   const T = buildTerrain(sid, { res: 2 });
 
   // 清掉上次 resolve 生成的对象（主路与自动支路；用户 fix 补的支路保留）
   sid.volumes = sid.volumes.filter((v) => v && !v.generated);
   sid.paths = sid.paths.filter((p) => p && !(p.generated && (p.id === MAIN_TRAIL_ID || p.auto_spur)));
   sid.relations = sid.relations.filter((r) => r && !r.generated);
+  // 人拖过的房子（user_moved）贴到当前地面（台地单独调高后跟着走）
+  for (const v of sid.volumes) if (v.user_moved && Array.isArray(v.position)) v.position[1] = r2(T.heightAt(v.position[0], v.position[2]));
 
   // 地标与出生点重新贴地、互相朝向，poi 跟到地标顶（fix「挪到顶层」「入口挪到路口」挪过位置后这些都要跟着变）
   const landmark = sid.volumes.find((v) => v.importance === "landmark") || sid.volumes.find((v) => v.id === LANDMARK_ID) || null;
@@ -338,20 +368,26 @@ export function resolve(sid, opts = {}) {
 
   // 主路：A* 从出生点到地标门前，避开用户放的体块；不可达时退回之字构造
   let trailFacts = null, spurs = [];
-  const avoid = landmark && spawn ? sid.volumes.filter((v) => v !== landmark && v.position && v.size && !v.generated && !pointInPolygon(xz(spawn.position), boxCorners(v.position, v.size, v.rotation_y || 0))).map((v) => expandedFootprint(v, 1)) : [];
+  // 人放的房子外扩 2.5 m（路中心离房边 ≥ 2.5，「房子不压路」才成立），其它人放的体块外扩 1 m
+  const avoidVols = landmark && spawn ? sid.volumes.filter((v) => v !== landmark && v.position && v.size && !v.generated && !pointInPolygon(xz(spawn.position), boxCorners(v.position, v.size, v.rotation_y || 0))) : [];
+  const userHouse = (v) => v.kind === "building" && v.importance !== "landmark";
+  const avoid = avoidVols.map((v) => expandedFootprint(v, userHouse(v) ? 2.5 : 1));
   if (landmark && spawn) {
     const from = xz(spawn.position), to = landmarkDoor(landmark, from, T);
-    let r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2, avoidPolys: avoid, seed });
+    let r = routeTrail(T, from, to, { maxSlope: 0.7, res: 2, avoidPolys: avoid, seed, wet: riversOf(sid) });
     let fallback = null;
     if (!r.points) { fallback = r.facts.reason || "不可达"; r = zigzagTrail(T, from, to, { folds: 3, maxSlope: 0.7 }); }
     const points = r.points.map(([x, z]) => [r2(x), r2(z)]);
     points[0] = [from[0], from[1]]; points[points.length - 1] = [to[0], to[1]];
-    sid.paths.push({ id: MAIN_TRAIL_ID, kind: "trail", width: theme.trail.width, points, surface: theme.trail.surface, label: theme.trail.label, generated: true });
-    trailFacts = Object.assign(pathFacts(points, T), { fallback, end_to_landmark_m: r2(dist2(to, xz(landmark.position))) });
+    const detour = fallback ? [] : detourAround(T, from, to, points, avoidVols.filter(userHouse), avoidVols, seed, riversOf(sid));
+    sid.paths.push(Object.assign({ id: MAIN_TRAIL_ID, kind: "trail", width: theme.trail.width, points, surface: theme.trail.surface, label: theme.trail.label, generated: true }, detour.length ? { detour_around: detour } : {}));
+    trailFacts = Object.assign(pathFacts(points, T), { fallback, end_to_landmark_m: r2(dist2(to, xz(landmark.position))) }, detour.length ? { detour_around: detour } : {});
     delete trailFacts.segments;
   }
   // 自动支路：主路够不到的台地（在布房之前补，房子才会避开它）
   if (opts.autoSpur !== false) spurs = addAutoSpurs(sid, T, theme, seed, avoid);
+  // 多层空间：generated 空间按当前地形重算高度，连接点按主路重新选位置 / 重算两端高度（在布房之前，房子会避开连接点）
+  refreshSpaces(sid, T);
 
   // 房子与树（避开主路、溪、支路、地标与用户体块）
   const density = Number(sid.meta && sid.meta.density_scale) || 1;
@@ -361,16 +397,19 @@ export function resolve(sid, opts = {}) {
   // 关系与检查
   const A = analyze(sid, T);
   for (const rel of A.relations) if (facesConsistent(sid, rel)) sid.relations.push(rel);
+  const checks = A.checks.concat(spaceChecks(sid, T));
   const validation = validate(sid, T);
   const now = typeof performance !== "undefined" ? performance.now() : Date.now();
   const facts = {
     seed, archetype: (sid.meta && sid.meta.archetype) || null, terraces: T.terraces.length,
     houses: L.volumes.filter((v) => v.kind === "building").length, trees: L.volumes.filter((v) => v.kind === "prop").length,
-    perTerrace: L.perTerrace, rejected: L.rejected, trail: trailFacts, spurs, has_stream: sid.paths.some((p) => p.kind === "river"),
-    checks_ok: A.checks.filter((c) => c.ok).length, checks_total: A.checks.length,
+    perTerrace: L.perTerrace, rejected: L.rejected, filled: L.filled, trail: trailFacts, spurs, has_stream: sid.paths.some((p) => p.kind === "river"),
+    bridges: pathCrossings(sid.paths), // 路过溪处 = 桥（BRIEF 与俯视图都按它画）
+    spaces: spaceFacts(sid),
+    checks_ok: checks.filter((c) => c.ok).length, checks_total: checks.length,
     validation, errors: validation.filter((m) => m.level === "error").length,
   };
-  return { sid, T, checks: A.checks, facts, ms: r2(now - t0) };
+  return { sid, T, checks, facts, ms: r2(now - t0) };
 }
 
 /**
@@ -408,13 +447,43 @@ function nearestOnSeg(p, a, b) {
  */
 export function applyPatch(sid, patch = {}) {
   const base = (sid.meta && sid.meta.card) || {};
-  const allowed = ["name", "one_liner", "archetype", "seed", "params", "landmark", "spawn", "palette_shift", "density_scale", "lighting", "mood", "summary"];
+  const allowed = ["name", "one_liner", "archetype", "seed", "params", "landmark", "spawn", "palette_shift", "density_scale", "lighting", "mood", "summary", "levels"];
   const p = {};
   for (const k of allowed) if (patch && patch[k] !== undefined) p[k] = patch[k];
   const card = deepMerge(base, p);
   if (patch && Array.isArray(patch.regions)) card.regions = mergeByKey(base.regions, patch.regions, "terrace");
   if (patch && Array.isArray(patch.palette)) card.palette = mergeByKey(base.palette, patch.palette, "role");
   return applyCard(sid, card);
+}
+
+// ------------------------------------------------------------ 台地单独调高（剖面拖平台段）
+/**
+ * 只改一层台地的高度：height 吸附 0.5 m，写 user_height: true，边缘坡面 skirt 跟着重算。
+ * 之后 applyCard / applyPatch（同原型）沿用它，resolve 让房子贴新高度、主路重算。改完调用方再 resolve。
+ * @param {object} sid 文档（原地修改并返回）
+ * @param {string} id terrain.features 的 id
+ * @param {number} height 米
+ * @returns {object} sid
+ */
+export function setTerraceHeight(sid, id, height) {
+  const f = ((sid.terrain && sid.terrain.features) || []).find((x) => x && x.id === id);
+  const h = Math.round(Number(height) * 2) / 2;
+  if (!f || !Number.isFinite(h)) return sid;
+  Object.assign(f, { height: h, skirt: clamp(Math.abs(h) * 0.8, 2, 10), user_height: true });
+  return sid;
+}
+/**
+ * 恢复一层台地的规则高度：height = level × 层高，去掉 user_height。
+ * @returns {object} sid
+ */
+export function resetTerraceHeight(sid, id) {
+  const f = ((sid.terrain && sid.terrain.features) || []).find((x) => x && x.id === id);
+  if (!f || !f.user_height) return sid;
+  const layer = Number(sid.meta && sid.meta.layer_height_m) || DEFAULT_LAYER_M;
+  const h = r2((Number(f.level) || 0) * layer);
+  Object.assign(f, { height: h, skirt: clamp(h * 0.8, 2, 10) });
+  delete f.user_height;
+  return sid;
 }
 
 // ------------------------------------------------------------ snapshot / restore
@@ -432,7 +501,7 @@ export function snapshot(sid) { return JSON.stringify(sid, (k, v) => (typeof k =
  */
 export function restore(json) {
   const sid = typeof json === "string" ? JSON.parse(json) : clone(json);
-  for (const k of ["volumes", "regions", "paths", "markers", "relations", "constraints", "views"]) if (!Array.isArray(sid[k])) sid[k] = [];
+  for (const k of ["volumes", "regions", "paths", "markers", "spaces", "relations", "constraints", "views"]) if (!Array.isArray(sid[k])) sid[k] = [];
   sid.terrain = sid.terrain || { base: "flat", base_height: 0, features: [] };
   if (!Array.isArray(sid.terrain.features)) sid.terrain.features = [];
   sid.meta = sid.meta || {};

@@ -1,7 +1,7 @@
 <!doctype html><meta charset="utf-8"><pre id="out">running</pre>
 <script type="module">
 import { test, run, assert, close, between } from "./harness.js";
-import { buildTerrain, generateArchetype, ARCHETYPES, pointInPolygon, polygonArea, DEFAULT_BOUNDS } from "../terrain.js";
+import { buildTerrain, generateArchetype, ARCHETYPES, pointInPolygon, polygonArea, DEFAULT_BOUNDS, MIN_BAND, MIN_BAND_HARD } from "../terrain.js";
 import { villageSid, valleySid } from "./fixtures.js";
 
 test("之字坡原型：4 层台地，高度递增，均在 bounds 内", () => {
@@ -96,6 +96,29 @@ test("ARCHETYPES 常量与未知原型回退", () => {
   assert(ARCHETYPES.length === 3);
   const g = generateArchetype("unknown", {}, DEFAULT_BOUNDS, 1);
   assert(g.archetype === "unknown" && g.features.length === 4, "未知名字按之字坡处理");
+});
+
+test("窄台地带宽：溪谷两岸与环台每条带平均宽 ≥ 8 m（7 层溪谷放不下时 ≥ 7 m），全部在 bounds 内", () => {
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  for (const w of ["narrow", "medium", "wide"]) for (const n of [3, 4, 5, 6, 7]) {
+    // 溪谷：band 的点前一半是内缘、后一半倒序是外缘，同一 z 一一对应
+    const gv = generateArchetype("valley_two_banks", { terraces: n, plateau_width: w }, DEFAULT_BOUNDS, 1);
+    for (const f of gv.features) {
+      const P = f.polygon, m = P.length / 2;
+      const ws = []; for (let i = 0; i < m; i++) ws.push(Math.abs(P[2 * m - 1 - i][0] - P[i][0]));
+      const need = n <= 6 ? MIN_BAND : MIN_BAND_HARD;
+      assert(mean(ws) >= need - 0.3, `溪谷 ${w}/${n} ${f.id} 平均宽 ${mean(ws).toFixed(2)} < ${need}`);
+      for (const [x, z] of P) { between(x, -60, 60, "溪谷 x"); between(z, -60, 60, "溪谷 z"); }
+    }
+    // 环台：arc 前 8 点外弧、后 8 点倒序内弧，圆心 (0, 2)
+    const gr = generateArchetype("ring_terrace", { terraces: n, plateau_width: w }, DEFAULT_BOUNDS, 1);
+    for (const f of gr.features.filter((x) => x.polygon.length === 16)) {
+      const P = f.polygon, rad = ([x, z]) => Math.hypot(x, z - 2);
+      const ws = []; for (let i = 0; i < 8; i++) ws.push(rad(P[i]) - rad(P[15 - i]));
+      assert(mean(ws) >= MIN_BAND - 0.3, `环台 ${w}/${n} ${f.id} 平均宽 ${mean(ws).toFixed(2)}`);
+      for (const [x, z] of P) { between(x, -60, 60, "环台 x"); between(z, -60, 60, "环台 z"); }
+    }
+  }
 });
 
 run();
