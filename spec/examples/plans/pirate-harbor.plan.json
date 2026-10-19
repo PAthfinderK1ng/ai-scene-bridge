@@ -1,0 +1,52 @@
+{
+  "name": "黑帆港",
+  "concept": "北岸陆地、南面是海：海湾里伸出一排码头，停着两艘船，岸边一排酒馆，东北崖上是炮台，海里散着礁石",
+  "key_structures": ["海湾", "码头", "海盗船", "酒馆街", "崖上炮台", "礁石"],
+  "site": { "size_m": [200, 180], "ground": "coast", "relief_m": 6, "layer_m": 3 },
+  "terrain": [
+    { "id": "bay", "op": "lake", "label": "海湾", "at": "site.C", "offset_m": [-30, 26], "shape": "ellipse", "size_m": [64, 34], "depth_m": 4 },
+    { "id": "fort_hill", "op": "cliff", "label": "炮台崖", "at": "site.NE", "shape": "rect", "size_m": [54, 44], "height_m": 14, "edge": "cliff" }
+  ],
+  "nodes": [
+    { "id": "fort", "type": "group", "label": "炮台", "role": "landmark", "at": "fort_hill.top", "children": [
+      { "id": "fort_walls", "type": "courtyard", "label": "炮台", "size_m": [32, 26], "wall_h_m": 5, "gate": "W", "thickness_m": 1.5 },
+      { "id": "keep", "type": "tower", "label": "瞭望塔", "shape": "box", "size_m": [9, 16, 9], "roof": "flat", "offset_m": [4, -4] },
+      { "id": "cannons", "type": "repeat", "label": "炮", "pattern": "linear", "count": 4, "spacing_m": 6, "offset_m": [-2, 8],
+        "child": { "id": "cannon", "type": "cylinder", "label": "炮", "size_m": [1.4, 1.4, 4], "color": "iron" } }
+    ]},
+    { "id": "docks", "type": "repeat", "label": "码头", "at": "site.C", "offset_m": [26, 30], "pattern": "linear", "count": 4, "spacing_m": 15,
+      "child": { "id": "pier", "type": "platform", "label": "栈桥码头", "size_m": [5, 1, 26], "color": "wood" } },
+    { "id": "ships", "type": "repeat", "label": "海盗船", "at": "site.C", "offset_m": [26, 52], "pattern": "linear", "count": 2, "spacing_m": 30,
+      "child": { "id": "hull", "type": "wedge", "label": "船身", "size_m": [8, 3.5, 22], "color": "wood", "children": [
+        { "id": "mast_a", "type": "column", "label": "主桅", "size_m": [0.7, 15], "offset_m": [0, -5] },
+        { "id": "mast_b", "type": "column", "label": "后桅", "size_m": [0.6, 11], "offset_m": [0, 5] },
+        { "id": "sail", "type": "box", "label": "黑帆", "size_m": [7, 7, 0.3], "offset_m": [0, -4.5], "elev_m": 5, "color": "sail" }
+      ] } },
+    { "id": "tavern_row", "type": "repeat", "label": "酒馆街", "at": "site.C", "offset_m": [-10, -6], "pattern": "linear", "count": 5, "spacing_m": 13,
+      "child": { "id": "tavern", "type": "building", "label": "酒馆", "size_m": [10, 7, 9], "roof": "gable", "rotate_deg": 180 } },
+    { "id": "lighthouse", "type": "tower", "label": "灯塔", "at": "site.W", "offset_m": [0, 12], "size_m": [6, 20], "roof": "dome", "color": "wall" },
+    { "id": "street", "type": "link", "style": "road", "label": "码头街", "from": "spawn", "to": "docks[1].N", "via": ["tavern_row.S"], "width_m": 5 },
+    { "id": "fort_stairs", "type": "link", "style": "stairs", "label": "上炮台的台阶", "from": "tavern_row.E", "to": "fort", "width_m": 3 },
+    { "id": "boardwalk", "type": "link", "style": "bridge", "label": "栈道", "from": "bay.N", "to": "docks[0].N", "width_m": 3 },
+    { "id": "reefs", "type": "repeat", "label": "礁石", "pattern": "scatter", "count": 9, "area": "sea", "seed_hint": "clustered",
+      "child": { "id": "reef", "type": "rock", "label": "礁石", "size_m": [5, 7, 5], "ground": "carve" } }
+  ],
+  "spawn": { "at": "site.NW", "look_at": "fort" },
+  "relations": [
+    { "type": "visible_from", "a": "fort", "b": "spawn" },
+    { "type": "reachable", "a": "fort", "b": "spawn" },
+    { "type": "adjacent", "a": "ships", "b": "docks" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#5A3B2A", "note": "旧木顶" },
+    { "role": "wall", "hex": "#C9B48F", "note": "灰泥墙" },
+    { "role": "stone", "hex": "#8A877F", "note": "礁岩" },
+    { "role": "foliage", "hex": "#5E7A45", "note": "灌木" },
+    { "role": "mist", "hex": "#D8E4E8", "note": "海雾" },
+    { "role": "wood", "hex": "#7A5434", "note": "船木" },
+    { "role": "sail", "hex": "#1E1E22", "note": "黑帆" },
+    { "role": "iron", "hex": "#3C3C40", "note": "铁炮" }
+  ],
+  "lighting": { "time_of_day": "dusk" },
+  "mood": ["粗野", "咸湿"]
+}

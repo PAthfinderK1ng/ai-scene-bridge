@@ -1,0 +1,42 @@
+{
+  "name": "星穹学院",
+  "concept": "湖心岩柱上的学院：六座法师塔环绕穹顶主殿，浮空书库用光桥连到塔上，殿下是禁书迷宫",
+  "key_structures": ["湖心岩柱", "穹顶主殿", "环形法师塔", "浮空书库与光桥", "湖上长桥", "禁书地窖"],
+  "site": { "size_m": [220, 220], "ground": "lake", "relief_m": 6, "layer_m": 4 },
+  "terrain": [
+    { "id": "rock", "op": "raise", "label": "湖心岩柱", "at": "site.C", "shape": "circle", "size_m": [92, 92], "height_m": 22, "edge": "cliff" }
+  ],
+  "nodes": [
+    { "id": "academy", "type": "group", "label": "学院", "at": "rock.top", "children": [
+      { "id": "hall", "type": "building", "label": "主殿", "role": "landmark", "size_m": [36, 24, 26], "roof": "dome", "floors": 3 },
+      { "id": "spire", "type": "cone", "label": "尖顶", "at": "hall.top", "size_m": [7, 14], "color": "glow" },
+      { "id": "towers", "type": "repeat", "label": "法师塔", "pattern": "radial", "count": 6, "radius_m": 33, "start_deg": 30, "face": "center",
+        "child": { "id": "mage_tower", "type": "tower", "label": "法师塔", "size_m": [7, 28], "roof": "spire", "floors": 6 } },
+      { "id": "court", "type": "courtyard", "label": "内庭", "at": "hall.S", "size_m": [20, 12], "wall_h_m": 4, "gate": "S" },
+      { "id": "fountain", "type": "water", "label": "星泉", "at": "court", "size_m": [6, 6], "shape": "cylinder" }
+    ]},
+    { "id": "library", "type": "island", "label": "浮空书库", "at": "academy", "offset_m": [-62, -26], "elev_m": 30, "size_m": [26, 8, 22],
+      "children": [ { "id": "stacks", "type": "building", "label": "书库", "size_m": [14, 10, 12], "roof": "spire", "floors": 3 } ] },
+    { "id": "light_bridge", "type": "link", "style": "bridge", "label": "光桥", "from": "towers[5]", "to": "library", "width_m": 3 },
+    { "id": "causeway", "type": "link", "style": "bridge", "label": "湖上长桥", "from": "spawn", "to": "rock.S", "width_m": 5 },
+    { "id": "approach", "type": "link", "style": "stairs", "label": "崖顶石阶", "from": "rock.S", "to": "court", "width_m": 4 },
+    { "id": "isles", "type": "repeat", "label": "湖中礁石", "pattern": "scatter", "count": 7, "area": "lake", "seed_hint": "loose",
+      "child": { "id": "reef", "type": "rock", "label": "礁石", "size_m": [6, 9, 6], "ground": "carve" } },
+    { "id": "vault", "type": "space", "label": "禁书地窖", "stratum": "underground", "under": "hall", "depth_m": 12, "layout": "maze", "size_m": 36, "branching": "high", "sublevels": 2, "connect": { "via": "stairs", "from": "hall" } }
+  ],
+  "spawn": { "at": "site.S", "look_at": "hall" },
+  "relations": [
+    { "type": "visible_from", "a": "hall", "b": "spawn" },
+    { "type": "reachable", "a": "library", "b": "spawn" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#2E3A6B", "note": "靛蓝瓦" },
+    { "role": "wall", "hex": "#D8D2C4", "note": "白石墙" },
+    { "role": "stone", "hex": "#7D7A85", "note": "岩" },
+    { "role": "foliage", "hex": "#3F5E4A", "note": "苔" },
+    { "role": "mist", "hex": "#C9D6F2", "note": "湖雾" },
+    { "role": "glow", "hex": "#9FD8FF", "note": "星光" }
+  ],
+  "lighting": { "time_of_day": "night" },
+  "mood": ["神秘", "宏大"]
+}

@@ -70,8 +70,8 @@ def main(argv=None) -> int:
     failed_pages = 0
     try:
         for page in args.pages:
-            rel = Path(page).as_posix().lstrip("./")
-            if not (ROOT / rel).exists():
+            rel = Path(page.split("?")[0]).as_posix().lstrip("./") + ("?" + page.split("?", 1)[1] if "?" in page else "")  # 可带 ?query
+            if not (ROOT / rel.split("?")[0]).exists():
                 print(f"[{rel}] 文件不存在")
                 failed_pages += 1
                 continue

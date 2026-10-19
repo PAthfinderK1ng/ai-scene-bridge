@@ -41,7 +41,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import ai  # noqa: E402
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 APP_TITLE = "场景对话 · ai-scene-bridge"
 MAX_BODY = 32 * 1024 * 1024  # 读回 JSON 可能有几千个对象
 

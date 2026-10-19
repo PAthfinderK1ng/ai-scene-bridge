@@ -1,7 +1,7 @@
 // section.js — 自选剖切（D19）：沿主路或一条直线、带宽度，把带内的体块 / 空间 / 连接点 / 路投到剖面上。
 // 规格见 docs/04 §5、SPEC.md §11。纯函数、确定性；不调 AI。
 import { clamp, r2, pointInPolygon, distToPolygon, polygonCentroid, DEFAULT_BOUNDS } from "./terrain.js";
-import { boxCorners } from "./layout.js";
+import { boxCorners, ringOf } from "./layout.js";
 
 export const SECTION_WIDTH = Object.freeze({ min: 2, max: 60, default: 12 });
 const dist2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -122,7 +122,7 @@ export function interiorBand(s, path, halfW) {
  * @param {{mode, line, width_m}} [section] 省略时用 sid.meta.section，再省略用 defaultSection
  * @returns {{path, length_m, width_m, ground, terraces, volumes, spaces, connectors, paths}}
  *   ground: [{ d, h, x, z, terrace_id, level }] 每 1 m；terraces: 剖切线穿过的台地平台段 [{ id, level, height, d0, d1, user_height }]；
- *   volumes: 带内体块 [{ id, kind, importance, d0, d1, y0, y1, label }]；spaces: [{ id, stratum, kind, layout, sublevels, d0, d1, floor_y, height, label, passages, rooms, links }]（内部见 interiorBand）；
+ *   volumes: 带内体块 [{ id, kind, importance, d0, d1, y0, y1, label, segs? }]（segs = 环带在剖切线上的几段 [[d0, d1], …]，中间是孔）；spaces: [{ id, stratum, kind, layout, sublevels, d0, d1, floor_y, height, label, passages, rooms, links }]（内部见 interiorBand）；
  *   connectors: [{ id, via, d, top_y, bottom_y }]；paths: 与剖切线相交的路 / 溪 [{ id, kind, d }]
  */
 export function sampleSection(sid, T, section) {
@@ -149,12 +149,21 @@ export function sampleSection(sid, T, section) {
   const volumes = [];
   for (const v of sid.volumes || []) {
     if (!v || !Array.isArray(v.position) || !Array.isArray(v.size)) continue;
-    const c = [v.position[0], v.position[2]], corners = boxCorners(v.position, v.size, v.rotation_y || 0);
+    const size = [v.size[0], v.size[1], v.size[2] > 0 ? v.size[2] : v.size[0]]; // 圆形体 size = [直径, 高]（v5）
+    const c = [v.position[0], v.position[2]], corners = boxCorners(v.position, size, v.rotation_y || 0);
     const offs = [c, ...corners].map((p) => projectToPath(path, p).off);
     if (Math.min(...offs) > halfW) continue;
-    const [d0, d1] = dRange(path, corners, c, Math.hypot(v.size[0], v.size[2]));
+    const [d0, d1] = dRange(path, corners, c, Math.hypot(size[0], size[2]));
     const y0 = Math.max(Number(v.position[1]) || 0, T.heightAt(c[0], c[1]));
-    volumes.push({ id: v.id, kind: v.kind, importance: v.importance || null, d0, d1, y0: r2(y0), y1: r2(y0 + v.size[1]), label: v.label || "" });
+    const sv = { id: v.id, kind: v.kind, importance: v.importance || null, d0, d1, y0: r2(y0), y1: r2(y0 + v.size[1]), label: v.label || "" };
+    const R = ringOf(v);
+    if (R && !R.torus && R.ix > 0.05) { // 空心圆柱 / 环带：剖切线在带子上的几段（穿过内孔 = 两段壁，中间是空的）；沿主路的折线绕着走也对
+      const Ro = Math.max(R.rx, R.rz), Ri = Math.min(R.ix, R.iz), segs = [];
+      let cur = null;
+      for (const q of raw) { const dc = Math.hypot(q.x - c[0], q.z - c[1]); if (dc <= Ro && dc >= Ri) { if (cur && q.d - cur[1] <= 1.01) cur[1] = q.d; else segs.push((cur = [q.d, q.d])); } else cur = null; }
+      if (segs.length) { sv.segs = segs.map(([a, b]) => [r2(Math.max(0, a - 0.5)), r2(Math.min(length_m, b + 0.5))]); sv.d0 = sv.segs[0][0]; sv.d1 = sv.segs[sv.segs.length - 1][1]; }
+    }
+    volumes.push(sv);
   }
 
   const spaces = [];
@@ -180,7 +189,7 @@ export function sampleSection(sid, T, section) {
   const paths = [];
   const self = sec.mode === "line" ? null : mainTrail(sid);
   for (const p of sid.paths || []) {
-    if (!p || p === self || !Array.isArray(p.points) || p.points.length < 2) continue;
+    if (!p || p === self || p.unrouted || !Array.isArray(p.points) || p.points.length < 2) continue;
     let acc = 0;
     for (let i = 0; i < path.length - 1; i++) {
       const a = path[i], b = path[i + 1], L = dist2(a, b);

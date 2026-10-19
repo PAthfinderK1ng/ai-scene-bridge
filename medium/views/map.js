@@ -1,12 +1,15 @@
 // views/map.js — 俯视图：渲染 + 图层 + 标签避让 + 手势（v4，docs/05 §6；吸收原 maplayers / maplabels / mapgestures）。
+// v5（docs/06 §5）：每种形体画真实轮廓（矩形 / 椭圆 / n 边形 / 环 / 拱的两腿），屋顶纹样，悬空虚线 + 「↑18 m」，路按 style 画；
+// 形体约定（shapeOf / volDims / roofOf / volumeBase / footprintPolygon …）在这里导出，剖面 / 第一眼 / 3D 共用。
 // 纯函数：数据进（ctx）、SVG 出、回调出；不 import app.js / ui.js，不调 AI。
 // 坐标：viewBox 直接用米（x 向右 = 东，y 向下 = +z 南），北在上；字号按图宽缩放（u = 图宽 / 120）。
 // 图上每个可点的东西带 data-type / data-plan-id / data-sid-id（空间内部另带 data-part / data-sublevel），
 // 拖动预览按 data-for 平移一组节点。三层：地面 / 地下 / 空中，当前层画实、其它层淡显；地下 / 空中层画空间内部平面
 // （通道按真实宽度、房间填色、入口 / 终点、层间连接），当前内部层实画、其它内部层淡画。
-import { pointInPolygon, polygonCentroid, polygonArea, clamp } from "../engine/terrain.js";
+import { pointInPolygon, polygonCentroid, polygonArea, clamp, distToPolygon } from "../engine/terrain.js";
 import { sectionPath, widthClamp } from "../engine/section.js";
-import { boxCorners } from "../engine/layout.js";
+import { ringOf, footRects } from "../engine/layout.js";
+export { ringOf };
 import { levelsOf, entryLevel, goalLevel, VIA_LABEL, ROLE_LABEL, LAYOUT_LABEL, SKY_LAYOUT_LABEL } from "../engine/interior.js";
 
 // ============================================================ 共用小工具（profile / eye / view3d 也用）
@@ -55,9 +58,104 @@ export function paletteOf(sid) {
   for (const p of (sid.style && sid.style.palette) || []) if (p && p.role) m[p.role] = p.hex;
   return Object.assign({ roof: "#4A4A4A", wall: "#D9C9A3", stone: "#9A9890", foliage: "#4F6B3A", mist: "#DDE6F0" }, m);
 }
+// ------------------------------------------------------------ 形体（v5 SID 体块约定，docs/06 §4.8；四个视图共用）
+/** 体块形体 */
+export const SHAPES = Object.freeze(["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"]);
+/** 路的样式 */
+export const PATH_STYLES = Object.freeze(["path", "road", "stairs", "ramp", "bridge", "rope_bridge", "tunnel", "canal", "portal"]);
+/** 屋顶（building / tower 才有） */
+export const ROOFS = Object.freeze(["gable", "hip", "flat", "dome", "spire", "none"]);
+const SHAPE_ALIAS = { cube: "box", block: "box", hemisphere: "dome", ring: "torus", ball: "sphere", ramp: "wedge", hex: "prism", polygon: "prism", cyl: "cylinder" };
+const ROOF_ALIAS = { cone: "spire", pointed: "spire", conical: "spire", pyramid: "hip", hipped: "hip", gabled: "gable", onion: "dome", dome: "dome", flat: "flat", none: "none", gable: "gable", hip: "hip", spire: "spire" };
+/** 俯视是圆的形体（占地按椭圆） */
+export const ROUND_SHAPES = new Set(["cylinder", "cone", "dome", "sphere", "torus", "prism"]);
+/** 规范化形体名（缺省 box） */
+export function shapeOf(v) { const s = String((v && v.shape) || "box").toLowerCase(); return SHAPES.includes(s) ? s : SHAPE_ALIAS[s] || "box"; }
+/** SID 原始尺寸 [宽, 总高（含屋顶）, 深] */
+function rawDims(v) {
+  const s = (v && Array.isArray(v.size)) ? v.size : [];
+  const w = Math.max(0.1, Number(s[0]) || 1), h = Math.max(0.05, Number(s[1]) || 1), d = Number(s[2]) > 0 ? Number(s[2]) : w;
+  return [w, h, d];
+}
+/**
+ * 体块三维尺寸 [宽 x, 墙身高 y, 深 z]：圆形体 size = [直径, 高, (直径 z)]、prism = [直径, 高]，深缺省 = 宽。
+ * SID v0.5：size[1] 是总高（含屋顶 roof_h），这里返回的 y 是去掉屋顶的墙身高——视图「墙身 + 屋顶」叠起来正好 = size[1]。
+ */
+export function volDims(v) {
+  const [w, h, d] = rawDims(v), r = roofOf(v);
+  return [w, r ? Math.max(0.05, h - r.h) : h, d];
+}
+/** prism 的边数（3–12，缺省 6） */
+export const prismSides = (v) => clamp(Math.round(Number(v && v.sides) || 6), 3, 12);
+/** 拱的腿厚（缺省宽的 18%，至少 0.6 m，最多宽的 45%） */
+export function archThickness(v) { const [w] = volDims(v); return clamp(Number(v.thickness) > 0 ? Number(v.thickness) : Math.max(0.6, w * 0.18), 0.2, w * 0.45); }
+/** 环的管径（平放 = 高；立起来 orient upright = 厚 size[2]；夹在直径的 6%–35%） */
+export function torusTube(v) { const [w, h, d] = volDims(v); return clamp(v && v.orient === "upright" ? d : h, w * 0.06, w * 0.35); }
+/** 立起来的环（torus + orient upright）：环面竖着，按 rotation_y 朝向 */
+export const isUpright = (v) => !!v && v.orient === "upright" && shapeOf(v) === "torus";
+/**
+ * 屋顶：只有 kind building / tower 有。缺省 building = gable、tower = spire；别名 cone → spire、pyramid → hip。
+ * SID v0.5：屋顶在 size[1]（总高）之内、顶部那一段，高 h = v.roof_h（引擎给）；没给时按引擎同一规则估：
+ * spire min(长边, 0.45 总高)、dome min(短边 / 2, 0.45 总高)、gable / hip min(0.35 短边, 0.4 总高)、flat min(0.5, 0.1 总高)（压顶板）、none 0。
+ * @returns {{type: string, h: number} | null}
+ */
+export function roofOf(v) {
+  if (!v || (v.kind !== "building" && v.kind !== "tower")) return null;
+  const raw = v.roof == null ? (v.kind === "tower" ? "spire" : "gable") : String(v.roof).toLowerCase(), type = ROOF_ALIAS[raw] || "gable";
+  const [w, h, d] = rawDims(v), mn = Math.min(w, d), mx = Math.max(w, d);
+  let rh = { gable: Math.min(mn * 0.35, h * 0.4), hip: Math.min(mn * 0.35, h * 0.4), dome: Math.min(mn / 2, h * 0.45), spire: Math.min(mx, h * 0.45), flat: Math.min(0.5, h * 0.1), none: 0 }[type];
+  if (Number(v.roof_h) >= 0 && v.roof_h != null) rh = Number(v.roof_h);
+  return { type, h: clamp(rh, 0, h * 0.9) };
+}
+/** 离地高度（米）：v.elev（底面离地，> 0 = 悬空） */
+export const elevOf = (v) => Math.max(0, Number(v && v.elev) || 0);
+/**
+ * 体块底面的世界高度：position[1] 是底面绝对高度；悬空（elev > 0）时至少是中心地面 + elev（引擎只给 elev 没抬 position[1] 时也对）。
+ * @param {object} v SID volume
+ * @param {object} [T] buildTerrain 结果
+ */
+export function volumeBase(v, T) {
+  const y = Number(v.position[1]), e = elevOf(v);
+  if (!T) return Number.isFinite(y) ? y : e;
+  const g = T.heightAt(v.position[0], v.position[2]);
+  if (!Number.isFinite(y)) return g + e;
+  return e > 0 ? Math.max(y, g + e) : y;
+}
+/** 体块最高点（墙身 + 屋顶） */
+export function volumeTop(v, T) { const r = roofOf(v); return volumeBase(v, T) + volDims(v)[1] + (r ? r.h : 0); }
+/** 局部 (lx, lz) → 世界 [x, z]（rotation_y 度，俯视逆时针为正；与 layout.boxCorners 同一约定） */
+export function volToWorld(v, lx, lz) {
+  const t = ((v.rotation_y || 0) * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+  return [v.position[0] + lx * c + lz * s, v.position[2] - lx * s + lz * c];
+}
+/** 体块俯视占地多边形（世界坐标）：圆形体 = 椭圆 20 点、prism = n 边形、其它 = 旋转矩形；pad 向外扩 */
+export function footprintPolygon(v, pad = 0) {
+  const sh = shapeOf(v), [w, , d] = volDims(v), rx = w / 2 + pad, rz = d / 2 + pad;
+  if (sh === "prism") { const n = prismSides(v); return Array.from({ length: n }, (_, k) => { const a = (2 * Math.PI * k) / n - Math.PI / 2; return volToWorld(v, rx * Math.cos(a), rx * Math.sin(a)); }); }
+  if (ROUND_SHAPES.has(sh)) return Array.from({ length: 20 }, (_, k) => { const a = (2 * Math.PI * k) / 20; return volToWorld(v, rx * Math.cos(a), rz * Math.sin(a)); });
+  return [[-rx, -rz], [rx, -rz], [rx, rz], [-rx, rz]].map(([x, z]) => volToWorld(v, x, z));
+}
+/** 图上的点选类型：地标 → landmark；撒出来的房子（有 zone_id / generated / 没有 plan_id 的 building）→ house；其余形体 → shape */
+export function volumeType(v) {
+  if (v.importance === "landmark") return "landmark";
+  if (v.kind === "building" && (v.zone_id || v.generated || !v.plan_id)) return "house";
+  return "shape";
+}
+/** 体块的颜色（地标红；有 color_role 且色板里有就用它；否则按 kind） */
+const KIND_FILL = { wall: "#7a6a55", stairs: "#a8a090", platform: "#c9bfa8", column: "#a3a097", gate: "#8a5a3a", statue: "#8d8a80", rock: "#8d867a", crystal: "#7fc8e0", island: "#9b8b6c", water: "#6f9bc2", prop: "#a08a6a", bridge: "#a0784a" };
+export function volumeColor(v, pal, view = "top") {
+  if (v.importance === "landmark") return view === "top" ? "#b8452b" : pal.roof;
+  const role = v.color_role && v.color_role !== "mist" && pal[v.color_role] ? v.color_role : null;
+  if (v.kind === "building" || v.kind === "tower") return view === "top" ? (role && role !== "wall" ? pal[role] : pal.roof) : role && role !== "roof" ? pal[role] : pal.wall;
+  if (role) return pal[role];
+  if (v.kind === "tree") return pal.foliage;
+  return KIND_FILL[v.kind] || pal.stone;
+}
 export function landmarksOf(sid) { return (sid.volumes || []).filter((v) => v && v.importance === "landmark" && Array.isArray(v.position) && Array.isArray(v.size)); }
 /** 主地标：meta.focus（入口看向的那个），否则第一个地标 */
 export function landmarkOf(sid) { const all = landmarksOf(sid), f = sid.meta && sid.meta.focus; return all.find((v) => v.id === f || v.plan_id === f) || all[0] || null; }
+/** 出生点脚下的高度：引擎给的 position[1]（站在浮岛 / 平台 / 桥上时高于地面）；没给或不高于地面就取地面 */
+export function spawnY(sp, T) { const g = T ? T.heightAt(sp.position[0], sp.position[2]) : 0, y = Number(sp.position[1]); return Number.isFinite(y) && y > g + 0.3 ? y : g; }
 export function spawnOf(sid) { return (sid.markers || []).find((m) => m && m.kind === "player_spawn" && Array.isArray(m.position)) || null; }
 export function mainTrailOf(sid) { return (sid.paths || []).find((p) => p.id === "main_trail") || (sid.paths || []).find((p) => p.kind === "trail") || null; }
 export function streamOf(sid) { return (sid.paths || []).find((p) => p.kind === "river") || null; }
@@ -104,6 +202,7 @@ export function planCenter(sid, T, planId) {
   for (const r of sid.regions || []) if (r.plan_id === planId && validPoly(r.polygon)) ps.push(...r.polygon);
   for (const s of sid.spaces || []) if ((s.plan_id || s.id) === planId && validPoly(s.polygon)) ps.push(...s.polygon);
   for (const v of sid.volumes || []) if (v.plan_id === planId && v.importance === "landmark") ps.push([v.position[0], v.position[2]]);
+  if (!ps.length) for (const v of sid.volumes || []) if (v.plan_id === planId && Array.isArray(v.position)) ps.push(...footprintPolygon(v)); // 形体组（v5）：整组占地
   if (!ps.length) return null;
   const xs = ps.map((p) => p[0]), zs = ps.map((p) => p[1]);
   return [r2((Math.min(...xs) + Math.max(...xs)) / 2), r2((Math.min(...zs) + Math.max(...zs)) / 2)];
@@ -111,8 +210,12 @@ export function planCenter(sid, T, planId) {
 /** plan 里某个 id 的名字（构成清单里的 label）；没有 plan 时 null */
 function planLabel(plan, id) {
   if (!plan || !id) return null;
-  for (const k of ["terrain", "zones", "landmarks", "paths", "water", "spaces", "buildings"]) { const e = (plan[k] || []).find((x) => x && x.id === id); if (e) return e.label || null; }
-  return null;
+  const t = Array.isArray(plan.terrain) && plan.terrain.find((x) => x && x.id === id);
+  if (t) return t.label || null;
+  // 场景树：nodes 递归（children / child）；v4 的构成图由 plan.js 的 migrateV4 先转成场景树
+  const walk = (ns) => { for (const n of ns || []) { if (!n || typeof n !== "object") continue; if (n.id === id) return n; const r = walk(n.children) || (n.child ? walk([n.child]) : null); if (r) return r; } return null; };
+  const n = walk(plan.nodes);
+  return n ? n.label || null : null;
 }
 /** 一个 plan_id 对应的全部 SID id（有 index 用 index，否则扫 SID） */
 export function sidIdsOf(sid, index, planId) {
@@ -154,6 +257,7 @@ export function renderMap(ctx, opts = {}) {
   if (!small && ctx.section) drawSectionBand(R, ctx.section);
   drawVolumes(R);
   drawSpawn(R);
+  drawPortals(R);
   drawSpaces(R);
   drawConnectors(R);
   if (!small && onGround) drawTrailHandles(R);
@@ -163,7 +267,31 @@ export function renderMap(ctx, opts = {}) {
   if (!onGround) for (const t of groundLabels.querySelectorAll("text")) if (!["landmark", "spawn"].includes(t.getAttribute("data-type"))) t.remove();
   if (!small) { drawChrome(R, footer, PAD, W, H); placeLabels(R); }
   svg.append(labels);
+  if (small) { const fb = contentBox(sid, b, u); if (fb) svg.setAttribute("viewBox", fb.map(fmt1).join(" ")); } // 缩略图：取景框贴着内容（形体 + 路 + 出生点），不画整块场地
   return svg;
+}
+/** 内容的取景框 [x, z, w, h]：形体底面 + 路 + 空间 + 出生点的包围盒，四周留 8% / 至少 6 m，不出场地边；内容太少（< 1/6 场地）时放大到 1/6，免得只剩一个点 */
+function contentBox(sid, b, u) {
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  const put = (x, z) => { if (!Number.isFinite(x) || !Number.isFinite(z)) return; x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); };
+  for (const v of sid.volumes || []) {
+    if (!v.position || !v.size) continue;
+    const r = Math.hypot(v.size[0], v.size[2]) / 2;
+    put(v.position[0] - r, v.position[2] - r); put(v.position[0] + r, v.position[2] + r);
+  }
+  for (const p of sid.paths || []) for (const q of p.points || []) put(q[0], q[q.length - 1]);
+  for (const s of sid.spaces || []) for (const q of s.polygon || s.outline || []) put(q[0], q[1]);
+  for (const m of sid.markers || []) if (m.position) put(m.position[0], m.position[2]);
+  if (!Number.isFinite(x0)) return null;
+  const BW = b.max[0] - b.min[0], BH = b.max[2] - b.min[2];
+  let w = x1 - x0, h = z1 - z0;
+  const pad = Math.max(6, 0.08 * Math.max(w, h)), minS = Math.max(BW, BH) / 6;
+  let cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  w = Math.max(minS, w + 2 * pad); h = Math.max(minS, h + 2 * pad);
+  const PAD = 4 * u;
+  w = Math.min(w, BW + 2 * PAD); h = Math.min(h, BH + 2 * PAD);
+  cx = clamp(cx, b.min[0] - PAD + w / 2, b.max[0] + PAD - w / 2); cz = clamp(cz, b.min[2] - PAD + h / 2, b.max[2] + PAD - h / 2);
+  return [cx - w / 2, cz - h / 2, w, h];
 }
 
 /** 通用属性：可点、可拖的东西都带这些 */
@@ -203,6 +331,7 @@ function drawTerrain(R) {
   const seen = new Set();
   for (const f of feats) {
     if (seen.has(f.plan_id)) continue; seen.add(f.plan_id);
+    if (f.plan_id === "site" || !f.plan_id) continue; // 场地基础形态（plan_id = site）不标名字：它是底，不是 AI 写的地形块
     const c = planCenter(sid, T, f.plan_id); if (!c) continue;
     groundLabels.append(label(Object.assign(tag("feature", f.plan_id, f.id, `feature:${f.plan_id}`), { x: fmt1(c[0]), y: fmt1(c[1] - 3 * u), "font-size": fmt1(2.4 * u), "text-anchor": "middle", fill: "#5f6e43", style: "cursor:pointer" }), planLabel(R.plan, f.plan_id) || String(f.label || "").replace(/\s*第.*$/, ""), { rank: 6, optional: true }));
   }
@@ -210,7 +339,7 @@ function drawTerrain(R) {
   for (const t of terraces) {
     if (lv.has(t.level)) continue; lv.add(t.level);
     const x = Math.min(...t.polygon.map((p) => p[0])) + 2.5 * u;
-    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": t.level }, `${t.level} 层 +${fmt1(t.level * layer)} m`, { rank: 8, optional: true }));
+    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": t.level }, `${t.level} 层 ${t.level < 0 ? "−" : "+"}${fmt1(Math.abs(t.level * layer))} m`, { rank: 8, optional: true }));
   }
 }
 
@@ -220,7 +349,7 @@ function drawZones(R) {
   const best = new Map();
   for (const r of sid.regions || []) {
     if (!validPoly(r.polygon)) continue;
-    const kd = REGION_KINDS[r.kind] || REGION_KINDS.other, pid = r.plan_id || r.id, c = polygonCentroid(r.polygon);
+    const kd = REGION_KINDS[r.kind] || REGION_KINDS.other, pid = r.plan_id || r.id, c = labelPoint(r.polygon, validPoly(r.hole) ? r.hole : null, r.kind === "water" && Number.isFinite(r.surface_y) && R.T ? (q) => R.T.heightAt(q[0], q[1]) < r.surface_y - 0.2 : null);
     const style = kd.color ? { fill: kd.color, "fill-opacity": r.kind === "forest" ? 0.18 : r.kind === "water" ? 0.55 : 0.3, stroke: kd.color, "stroke-width": 0.5, "stroke-dasharray": r.kind === "water" ? null : "1.5 1" }
       : { fill: "#fff", "fill-opacity": 0, stroke: "#8b6b3a", "stroke-width": 0.35, "stroke-dasharray": "1.5 1", "stroke-opacity": r.user_set ? 0.9 : 0.45 };
     g.append(svgel("polygon", Object.assign(tag("zone", pid, r.id, `zone:${pid}`), { points: pts(r.polygon), "stroke-linejoin": "round" }, style), svgel("title", {}, r.label || kd.label)));
@@ -246,9 +375,20 @@ function drawWaterAndPaths(R) {
   for (const p of sid.paths || []) {
     if (p.kind === "river" || !Array.isArray(p.points) || p.points.length < 2) continue;
     const main = p.id === "main_trail", pid = p.plan_id || null, w = main ? 2.2 : pid ? Math.max(1.4, (p.width || 2) * 0.7) : 1;
-    const tunnel = p.style === "tunnel" || p.tunnel, bridge = p.style === "bridge";
-    const style = { fill: "none", stroke: tunnel ? "#5a4a3a" : bridge ? "#a0784a" : "#8b7d5b", "stroke-width": fmt1(bridge ? w + 1 : w), "stroke-linejoin": "round", "stroke-linecap": "round", "stroke-dasharray": tunnel ? "1.4 1" : pid ? null : "2 1", opacity: pid ? 0.95 : 0.8 };
-    g.append(svgel("polyline", Object.assign(tag("path", pid, p.id, `path:${p.id}`), { points: pts(p.points) }, style)));
+    if (p.unrouted) { // 按样式走不通：只画两端标记 + 一条细虚线（不画路面）
+      const a = p.points[0], b = p.points[p.points.length - 1], gg = svgel("g", tag("path", pid, p.id, `path:${p.id}`, { "data-style": "unrouted" }));
+      gg.append(svgel("line", { x1: fmt1(a[0]), y1: fmt1(a[1]), x2: fmt1(b[0]), y2: fmt1(b[1]), stroke: "#b5523b", "stroke-width": 0.9, "stroke-dasharray": "3 2.5", opacity: 0.85 }));
+      for (const q of [a, b]) gg.append(svgel("circle", { cx: fmt1(q[0]), cy: fmt1(q[1]), r: 1.8, fill: "#fff", stroke: "#b5523b", "stroke-width": 0.8 }));
+      gg.append(svgel("title", {}, `${p.label || "连接"}：走不通（${p.fallback || "坡太陡"}）`));
+      g.append(gg);
+      continue;
+    }
+    const st = pathStyleOf(p);
+    if (st !== "path") drawStyledPath(R, p, st, w);
+    else {
+      const style = { fill: "none", stroke: "#8b7d5b", "stroke-width": fmt1(w), "stroke-linejoin": "round", "stroke-linecap": "round", "stroke-dasharray": pid ? null : "2 1", opacity: pid ? 0.95 : 0.8 };
+      g.append(svgel("polyline", Object.assign(tag("path", pid, p.id, `path:${p.id}`, { "data-style": st }), { points: pts(p.points) }, style)));
+    }
     if (main && T && !small) {
       let d = "";
       const prof = T.sampleProfile(p.points, 1);
@@ -273,7 +413,90 @@ function drawWaterAndPaths(R) {
   }
 }
 
-// ------------------------------------------------------------ 房子 / 树 / 地标
+/** 路的样式：style（v5，PATH_STYLES 之一）；兼容 v4 的 tunnel 标记；不认识的当 path */
+export function pathStyleOf(p) { const s = String((p && p.style) || (p && p.tunnel ? "tunnel" : "path")); return PATH_STYLES.includes(s) ? s : "path"; }
+/** 沿折线每 step 米取点 [x, z, dx, dz]（dx / dz 单位切向；从 step / 2 起） */
+function alongLine(points, step) {
+  const out = [];
+  let carry = step / 2;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1e-6) continue;
+    const dx = (b[0] - a[0]) / L, dz = (b[1] - a[1]) / L;
+    let t = carry;
+    for (; t <= L; t += step) out.push([a[0] + dx * t, a[1] + dz * t, dx, dz]);
+    carry = t - L;
+  }
+  return out;
+}
+/** 折线向左（俯视）平移 o 米：每个顶点按相邻两段法线的平均挪 */
+function offsetLine(P, o) {
+  return P.map((q, i) => {
+    const a = P[Math.max(0, i - 1)], b = P[Math.min(P.length - 1, i + 1)], L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    return [q[0] - ((b[1] - a[1]) / L) * o, q[1] + ((b[0] - a[0]) / L) * o];
+  });
+}
+/** 桥墩：[[x, z]] 或 [[x, y, z]] */
+export const pierPoints = (p) => (Array.isArray(p.piers) ? p.piers : []).filter((q) => Array.isArray(q) && q.length >= 2).map((q) => (q.length >= 3 ? [q[0], q[2]] : [q[0], q[1]])).filter(isPt);
+/** 传送门圆环（俯视） */
+function portalRing(attrs, at, u) {
+  return svgel("g", Object.assign({ class: "portal-ring", transform: `translate(${fmt1(at[0])} ${fmt1(at[1])})`, style: "cursor:pointer" }, attrs),
+    svgel("circle", { r: fmt1(Math.max(2, 1.6 * u)), fill: "#b9a3e6", "fill-opacity": 0.35, stroke: SECTION_COLOR, "stroke-width": fmt1(0.35 * u) }),
+    svgel("circle", { r: fmt1(Math.max(1, 0.8 * u)), fill: "none", stroke: SECTION_COLOR, "stroke-width": fmt1(0.2 * u) }));
+}
+/**
+ * 有样式的路：road 宽灰 + 中线；stairs 台阶纹；ramp 坡向箭头；bridge 双线 + 桥墩点；rope_bridge 两条虚线 + 端桩；
+ * tunnel 点线 + 洞口；canal 蓝双线；portal 两端圆环 + 淡虚线。可点的那条带 data-style。
+ */
+function drawStyledPath(R, p, st, w) {
+  const { T, u, ground: g } = R, pid = p.plan_id || null, P = p.points, key = `path:${p.id}`, base = tag("path", pid, p.id, key, { "data-style": st });
+  const W = Math.max(1, Number(p.width) || (st === "road" ? 4 : 2));
+  const line = (attrs, pp = P) => svgel("polyline", Object.assign({ points: pts(pp), fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" }, attrs));
+  const quiet = { "pointer-events": "none", "data-for": key };
+  const deco = svgel("g", Object.assign({ class: "path-deco" }, quiet));
+  const ticks = (step, half, attrs) => { let d = ""; for (const [x, z, dx, dz] of alongLine(P, step)) d += `M${fmt1(x + dz * half)} ${fmt1(z - dx * half)}L${fmt1(x - dz * half)} ${fmt1(z + dx * half)}`; if (d) deco.append(svgel("path", Object.assign({ d, fill: "none" }, attrs))); };
+  if (st === "road") {
+    g.append(line(Object.assign({ stroke: "#6f675a", "stroke-width": fmt1(W * 0.85 + 0.6) }, quiet)), line(Object.assign({}, base, { stroke: "#b5ab98", "stroke-width": fmt1(W * 0.85) })));
+    deco.append(line({ stroke: "#fff", "stroke-width": 0.25, "stroke-dasharray": "1.5 1.5", "stroke-linecap": "butt" }));
+  } else if (st === "stairs") {
+    g.append(line(Object.assign({}, base, { stroke: "#a8a090", "stroke-width": fmt1(Math.max(1.4, W * 0.8)) })));
+    ticks(1.2, Math.max(0.7, W * 0.42), { stroke: "#5a4a2a", "stroke-width": 0.3, class: "path-steps" });
+  } else if (st === "ramp") {
+    g.append(line(Object.assign({}, base, { stroke: "#b8a77a", "stroke-width": fmt1(Math.max(1.4, W * 0.8)) })));
+    const up = !T || T.heightAt(P[P.length - 1][0], P[P.length - 1][1]) >= T.heightAt(P[0][0], P[0][1]), all = alongLine(P, 1);
+    const m = all[Math.floor(all.length / 2)];
+    if (m) { const s = up ? 1 : -1, [x, z, dx, dz] = m, a = 1.2 * s, b = Math.max(0.7, W * 0.35); deco.append(svgel("path", { d: `M${fmt1(x - dx * a + dz * b)} ${fmt1(z - dz * a - dx * b)}L${fmt1(x + dx * a)} ${fmt1(z + dz * a)}L${fmt1(x - dx * a - dz * b)} ${fmt1(z - dz * a + dx * b)}`, fill: "none", stroke: "#5a4a2a", "stroke-width": 0.4, class: "ramp-arrow" })); }
+  } else if (st === "bridge") {
+    g.append(line(Object.assign({ stroke: "#5a4a2a", "stroke-width": fmt1(W + 0.9), "stroke-linecap": "butt" }, quiet)), line(Object.assign({}, base, { stroke: "#d9c3a0", "stroke-width": fmt1(W), "stroke-linecap": "butt" })));
+    for (const q of pierPoints(p)) deco.append(svgel("circle", { cx: fmt1(q[0]), cy: fmt1(q[1]), r: fmt1(clamp(W * 0.22, 0.45, 1.2)), fill: "#5a4a2a", class: "pier" }));
+  } else if (st === "rope_bridge") {
+    g.append(line(Object.assign({}, base, { stroke: "#000", "stroke-opacity": 0, "stroke-width": fmt1(W) })));
+    for (const o of [-W / 2, W / 2]) deco.append(line({ stroke: "#8a6a44", "stroke-width": 0.35, "stroke-dasharray": "1.2 0.8", "stroke-linecap": "butt" }, offsetLine(P, o)));
+    ticks(1.6, W / 2, { stroke: "#8a6a44", "stroke-width": 0.25, opacity: 0.7 });
+    for (const q of [P[0], P[P.length - 1]]) for (const o of [-W / 2, W / 2]) { const [x, z] = offsetLine([q, q === P[0] ? P[1] : P[P.length - 2]], q === P[0] ? o : -o)[0]; deco.append(svgel("rect", { x: fmt1(x - 0.4), y: fmt1(z - 0.4), width: 0.8, height: 0.8, fill: "#5a4a2a", class: "rope-post" })); }
+  } else if (st === "tunnel") {
+    g.append(line(Object.assign({}, base, { stroke: "#5a4a3a", "stroke-width": fmt1(Math.max(1, W * 0.6)), "stroke-dasharray": `0.01 ${fmt1(Math.max(1.2, W * 0.9))}`, opacity: 0.9 })));
+    for (const q of [P[0], P[P.length - 1]]) deco.append(svgel("circle", { cx: fmt1(q[0]), cy: fmt1(q[1]), r: fmt1(Math.max(0.9, W * 0.5)), fill: "#3b342d", stroke: "#fff", "stroke-width": 0.25, class: "tunnel-mouth" }));
+  } else if (st === "canal") {
+    g.append(line(Object.assign({ stroke: "#4f7aa0", "stroke-width": fmt1(W + 0.8), "stroke-linecap": "butt" }, quiet)), line(Object.assign({}, base, { stroke: "#8fb7d8", "stroke-width": fmt1(W), "stroke-linecap": "butt" })));
+  } else if (st === "portal") {
+    g.append(line(Object.assign({}, base, { stroke: SECTION_COLOR, "stroke-opacity": 0.35, "stroke-width": 0.4, "stroke-dasharray": "1.5 1.2" })));
+    for (const q of [P[0], P[P.length - 1]]) deco.append(portalRing({ "pointer-events": "none" }, q, u));
+  }
+  if (deco.childNodes.length) g.append(deco);
+}
+/** 传送门标记（markers kind portal） */
+function drawPortals(R) {
+  const { sid, u, ground: g } = R;
+  for (const m of sid.markers || []) {
+    if (!m || m.kind !== "portal" || !Array.isArray(m.position)) continue;
+    const at = [m.position[0], m.position[2]];
+    g.append(portalRing(Object.assign(tag("portal", m.plan_id || null, m.id, `portal:${m.id}`, { "data-pos": `${fmt1(at[0])} ${fmt1(at[1])}` }), { class: "portal-ring portal-marker" }), at, u));
+    R.obs.ground.push([at[0] - 2.2, at[1] - 2.2, at[0] + 2.2, at[1] + 2.2, ICON_W]);
+  }
+}
+
+// ------------------------------------------------------------ 房子 / 树 / 地标 / 形体
 /** 地标俯视符号（原点在中心，按 9 m 宽设计） */
 function landmarkGlyph(form) {
   const g = svgel("g", { "pointer-events": "none" }), fill = "#b8452b", stroke = "#4a1a10";
@@ -291,47 +514,129 @@ function landmarkGlyph(form) {
   else g.append(svgel("rect", { x: -3.5, y: -3.5, width: 7, height: 7, fill, stroke, "stroke-width": 0.35 }));
   return g;
 }
+/** 椭圆的 path 段（闭合，原点为心） */
+const ellD = (rx, rz) => `M${fmt1(-rx)} 0A${fmt1(rx)} ${fmt1(rz)} 0 1 0 ${fmt1(rx)} 0A${fmt1(rx)} ${fmt1(rz)} 0 1 0 ${fmt1(-rx)} 0Z`;
+/**
+ * 形体俯视符号（局部坐标：原点在中心，x 向右、y = 局部 z 向下；外层 g 负责平移 + 旋转）。
+ * box / wedge / pyramid 矩形（pyramid 加对角线、wedge 加坡向箭头，箭头指向高的一边 = 局部 −z）；cylinder / cone / dome / sphere 椭圆
+ * （cone 中心点、dome 同心弧、sphere 高光）；torus 环；prism n 边形；arch 两腿 + 拱线；building / tower 按屋顶加纹样；island 加草顶。
+ */
+function shapeGlyph(v, fill, edge, small) {
+  const sh = shapeOf(v), [w, , d] = volDims(v), rx = w / 2, rz = d / 2, out = [], body = Object.assign({ fill, class: "shape-body" }, edge);
+  const mark = (tagName, attrs) => out.push(svgel(tagName, Object.assign({ fill: "none", stroke: "#fff", "stroke-opacity": 0.6, "stroke-width": 0.3, "pointer-events": "none", class: "shape-mark" }, attrs)));
+  const rect = (x, y, ww, hh, extra = {}) => svgel("rect", Object.assign({ x: fmt1(x), y: fmt1(y), width: fmt1(ww), height: fmt1(hh) }, body, extra));
+  const ell = () => svgel("ellipse", Object.assign({ rx: fmt1(rx), ry: fmt1(rz) }, body));
+  const arcs = (cls) => { for (const k of [0.62, 0.32]) mark("path", { d: `M${fmt1(-rx * k)} 0A${fmt1(rx * k)} ${fmt1(rz * k)} 0 0 1 ${fmt1(rx * k)} 0`, class: cls }); };
+  switch (sh) {
+    case "cylinder": {
+      const R = ringOf(v); // 空心圆柱 = 一圈带子：画环（中间是空的，孔里的东西看得见）
+      if (R && !R.torus && R.ix > 0.2) { out.push(svgel("path", Object.assign({ d: ellD(rx, rz) + ellD(R.ix, R.iz), "fill-rule": "evenodd", class: "shape-body ring-band" }, body, { class: "shape-body ring-band" }))); mark("ellipse", { rx: fmt1((rx + R.ix) / 2), ry: fmt1((rz + R.iz) / 2), "stroke-dasharray": "1 1", class: "shape-mark ring-mid" }); }
+      else out.push(ell());
+      break;
+    }
+    case "cone": out.push(ell()); mark("circle", { r: fmt1(clamp(Math.min(rx, rz) * 0.14, 0.3, 1.2)), fill: "#222", "fill-opacity": 0.7, stroke: "none", class: "shape-mark cone-apex" }); break;
+    case "dome": out.push(ell()); arcs("shape-mark dome-arc"); break;
+    case "sphere": out.push(ell()); mark("ellipse", { cx: fmt1(-rx * 0.32), cy: fmt1(-rz * 0.32), rx: fmt1(rx * 0.22), ry: fmt1(rz * 0.22), fill: "#fff", "fill-opacity": 0.45, stroke: "none" }); break;
+    case "torus": {
+      if (isUpright(v)) { const t = Math.max(0.6, d); out.push(rect(-rx, -t / 2, w, t, { rx: fmt1(t / 2), class: "shape-body torus-upright" })); mark("line", { x1: fmt1(-rx + t / 2), x2: fmt1(rx - t / 2), y1: 0, y2: 0, "stroke-dasharray": "0.8 0.6", class: "shape-mark torus-upright-axis" }); break; } // 立起来的环：俯视是一条线段
+      const t = torusTube(v), ix = Math.max(0.2, rx - t), iz = Math.max(0.2, rz - t * (rz / rx)); out.push(svgel("path", Object.assign({ d: ellD(rx, rz) + ellD(ix, iz), "fill-rule": "evenodd" }, body))); break; }
+    case "prism": { const n = prismSides(v); out.push(svgel("polygon", Object.assign({ points: pts(Array.from({ length: n }, (_, k) => { const a = (2 * Math.PI * k) / n - Math.PI / 2; return [rx * Math.cos(a), rx * Math.sin(a)]; })) }, body))); break; }
+    case "pyramid": out.push(rect(-rx, -rz, w, d)); mark("path", { d: `M${fmt1(-rx)} ${fmt1(-rz)}L${fmt1(rx)} ${fmt1(rz)}M${fmt1(rx)} ${fmt1(-rz)}L${fmt1(-rx)} ${fmt1(rz)}`, stroke: "#222", "stroke-opacity": 0.55, class: "shape-mark pyramid-diag" }); break;
+    case "wedge": { out.push(rect(-rx, -rz, w, d)); const a = rz * 0.7, b = Math.min(rx, rz) * 0.35; mark("path", { d: `M0 ${fmt1(a)}L0 ${fmt1(-a)}M${fmt1(-b)} ${fmt1(-a + b)}L0 ${fmt1(-a)}L${fmt1(b)} ${fmt1(-a + b)}`, stroke: "#222", "stroke-opacity": 0.7, "stroke-width": 0.35, class: "shape-mark wedge-arrow" }); break; }
+    case "arch": {
+      const t = archThickness(v);
+      out.push(rect(-rx + t, -rz, w - 2 * t, d, { "fill-opacity": 0.3, class: "shape-body arch-span" }), rect(-rx, -rz, t, d, { class: "shape-body arch-leg" }), rect(rx - t, -rz, t, d, { class: "shape-body arch-leg" }));
+      mark("line", { x1: fmt1(-rx + t), x2: fmt1(rx - t), y1: 0, y2: 0, stroke: "#222", "stroke-opacity": 0.6, "stroke-dasharray": "0.8 0.5", class: "shape-mark arch-line" });
+      break;
+    }
+    default: out.push(rect(-rx, -rz, w, d));
+  }
+  if (v.kind === "island") out.push(svgel(ROUND_SHAPES.has(sh) ? "ellipse" : "rect", Object.assign(ROUND_SHAPES.has(sh) ? { rx: fmt1(rx * 0.78), ry: fmt1(rz * 0.78) } : { x: fmt1(-rx * 0.78), y: fmt1(-rz * 0.78), width: fmt1(w * 0.78), height: fmt1(d * 0.78) }, { fill: "#7d9a5f", "fill-opacity": 0.75, "pointer-events": "none", class: "island-top" })));
+  const r = roofOf(v);
+  if (r && !small) {
+    const round = ROUND_SHAPES.has(sh), mn = Math.min(rx, rz), m = (dd, extra = {}) => mark("path", Object.assign({ d: dd, class: "roof-mark" }, extra));
+    if (r.type === "gable") m(round || rx >= rz ? `M${fmt1(-rx * (round ? 0.8 : 1) + (round ? 0 : 0.6))} 0L${fmt1(rx * (round ? 0.8 : 1) - (round ? 0 : 0.6))} 0` : `M0 ${fmt1(-rz + 0.6)}L0 ${fmt1(rz - 0.6)}`);
+    else if (r.type === "hip") {
+      if (round) m(`M${fmt1(-rx * 0.7)} 0L${fmt1(rx * 0.7)} 0M0 ${fmt1(-rz * 0.7)}L0 ${fmt1(rz * 0.7)}`);
+      else if (rx >= rz) { const e = rx - rz; m(`M${fmt1(-e)} 0L${fmt1(e)} 0M${fmt1(-rx)} ${fmt1(-rz)}L${fmt1(-e)} 0L${fmt1(-rx)} ${fmt1(rz)}M${fmt1(rx)} ${fmt1(-rz)}L${fmt1(e)} 0L${fmt1(rx)} ${fmt1(rz)}`); }
+      else { const e = rz - rx; m(`M0 ${fmt1(-e)}L0 ${fmt1(e)}M${fmt1(-rx)} ${fmt1(-rz)}L0 ${fmt1(-e)}L${fmt1(rx)} ${fmt1(-rz)}M${fmt1(-rx)} ${fmt1(rz)}L0 ${fmt1(e)}L${fmt1(rx)} ${fmt1(rz)}`); }
+    } else if (r.type === "dome") arcs("roof-mark");
+    else if (r.type === "spire") {
+      const star = Array.from({ length: 8 }, (_, k) => { const a = (Math.PI * k) / 4 - Math.PI / 2, rr = k % 2 ? mn * 0.18 : mn * 0.5; return [rr * Math.cos(a), rr * Math.sin(a)]; });
+      mark("polygon", { points: pts(star), fill: "#fff", "fill-opacity": 0.75, stroke: "#222", "stroke-opacity": 0.5, "stroke-width": 0.2, class: "roof-mark" });
+    }
+  }
+  return out;
+}
+/** 带 v4 符号的地标 form（这些仍叠画旧符号） */
+const GLYPH_FORMS = new Set(["hall", "tower", "gate", "pavilion", "stage", "bridge", "wall", "well", "tree", "statue", "round_house"]);
 function drawVolumes(R) {
-  const { sid, u, small, ground: g, label, groundLabels } = R, pal = paletteOf(sid);
-  for (const v of sid.volumes || []) {
-    if (!v || !Array.isArray(v.position) || !Array.isArray(v.size) || v.importance === "landmark") continue;
-    const [x, , z] = v.position;
-    if (v.kind === "prop") { g.append(svgel("circle", { cx: fmt1(x), cy: fmt1(z), r: fmt1(Math.max(1.2, (v.size[0] / 2) * 0.6)), fill: pal.foliage, opacity: 0.85, "pointer-events": "none" })); continue; }
-    if (v.kind !== "building") continue;
-    const w = v.size[0], d = v.size[2], key = `house:${v.id}`;
-    const n = svgel("g", Object.assign(tag("house", v.plan_id || v.zone_id, v.id, key, { "data-zone-id": v.zone_id || null, "data-pos": `${fmt1(x)} ${fmt1(z)}` }), { transform: `translate(${fmt1(x)} ${fmt1(z)}) rotate(${fmt1(-(v.rotation_y || 0))})`, style: "cursor:pointer" }));
-    const edge = { stroke: v.locked ? "#b8452b" : "#222", "stroke-width": v.locked ? 0.5 : 0.25 };
-    if (v.shape === "cylinder") n.append(svgel("circle", Object.assign({ r: fmt1(w / 2), fill: pal.roof }, edge)), small ? null : svgel("circle", { r: fmt1(w / 4), fill: "none", stroke: "#fff", "stroke-opacity": 0.4, "stroke-width": 0.3 }));
-    else {
-      n.append(svgel("rect", Object.assign({ x: fmt1(-w / 2), y: fmt1(-d / 2), width: fmt1(w), height: fmt1(d), fill: pal.roof }, edge)));
-      if (!small) {
-        n.append(svgel("line", { x1: fmt1(-w / 2 + 0.6), x2: fmt1(w / 2 - 0.6), y1: 0, y2: 0, stroke: "#fff", "stroke-opacity": 0.35, "stroke-width": 0.3 }));
-        n.append(svgel("rect", { x: -0.9, y: fmt1(-d / 2 - 0.3), width: 1.8, height: 1, fill: "#fff", stroke: "#222", "stroke-width": 0.2 }));
-        if (v.form === "stilt_house" || v.stilt_m > 0) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) n.append(svgel("circle", { cx: fmt1((sx * w) / 2), cy: fmt1((sz * d) / 2), r: 0.45, fill: "#6b4f2a" }));
-      }
+  const { sid, T, u, small, ground: g, label, groundLabels } = R, pal = paletteOf(sid), focus = landmarkOf(sid);
+  const vols = (sid.volumes || []).filter((v) => v && Array.isArray(v.position) && Array.isArray(v.size));
+  // 俯视的画家算法：低的先画、高的盖上去（悬空的在上面）；同高保持原顺序
+  const tops = new Map(vols.map((v) => [v, volumeTop(v, T)]));
+  const order = vols.map((v, i) => [v, i]).sort((a, b) => tops.get(a[0]) - tops.get(b[0]) || a[1] - b[1]).map((x) => x[0]);
+  const groupLabel = new Map(), elevLabel = new Map();
+  for (const v of order) {
+    const [x, , z] = v.position, type = volumeType(v), sh = shapeOf(v), [w, , d] = volDims(v), e = elevOf(v), lm = type === "landmark";
+    // v4 的树：只画一个绿点，不可点
+    if (v.kind === "prop" && !v.plan_id && !lm) { g.append(svgel("circle", { cx: fmt1(x), cy: fmt1(z), r: fmt1(Math.max(1.2, (w / 2) * 0.6)), fill: pal.foliage, opacity: 0.85, "pointer-events": "none" })); continue; }
+    const key = `${type}:${v.id}`, pid = v.plan_id || v.zone_id || (lm ? v.id : null), r = roofOf(v);
+    const n = svgel("g", Object.assign(tag(type, pid, v.id, key, { "data-zone-id": v.zone_id || null, "data-pos": `${fmt1(x)} ${fmt1(z)}`, "data-shape": sh, "data-kind": v.kind || null, "data-roof": r ? r.type : null, "data-elev": e > 0.5 ? fmt1(e) : null, "data-instance-of": v.instance_of || null }),
+      { class: lm ? "landmark volume" : "volume", transform: `translate(${fmt1(x)} ${fmt1(z)}) rotate(${fmt1(-(v.rotation_y || 0))})`, style: "cursor:pointer" }));
+    const edge = { stroke: v.locked ? "#b8452b" : lm ? "#4a1a10" : "#222", "stroke-width": v.locked ? 0.5 : lm ? 0.35 : 0.25, "stroke-dasharray": e > 0.5 ? "1 0.6" : null, "fill-opacity": e > 0.5 ? 0.6 : null };
+    const oldGlyph = lm && v.form && GLYPH_FORMS.has(v.form) && (sh === "box" || sh === "cylinder");
+    if (oldGlyph) { if (!small) n.append(...shapeGlyph(v, "#b8452b", Object.assign({}, edge, { "fill-opacity": 0.25, "stroke-width": 0.3 }), true)); const gl = landmarkGlyph(v.form); gl.setAttribute("transform", `scale(${fmt1(clamp(Math.max(w, d) / 9, 0.45, 1.2))})`); n.append(gl); }
+    else n.append(...shapeGlyph(v, volumeColor(v, pal, "top"), edge, small));
+    if (type === "house" && sh === "box" && !small) {
+      n.append(svgel("rect", { x: -0.9, y: fmt1(-d / 2 - 0.3), width: 1.8, height: 1, fill: "#fff", stroke: "#222", "stroke-width": 0.2, "pointer-events": "none" }));
+      if (v.form === "stilt_house" || v.stilt_m > 0) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) n.append(svgel("circle", { cx: fmt1((sx * w) / 2), cy: fmt1((sz * d) / 2), r: 0.45, fill: "#6b4f2a", "pointer-events": "none" }));
     }
     g.append(n);
-    R.obs.ground.push(aabb(v));
+    const bb = aabb(v);
+    if (ringOf(v)) for (const q of footRects(v, 8)) { const xs = q.map((p) => p[0]), zs = q.map((p) => p[1]); R.obs.ground.push([Math.min(...xs), Math.min(...zs), Math.max(...xs), Math.max(...zs)]); }
+    else R.obs.ground.push(bb);
+    if (small) continue;
+    if (lm) groundLabels.append(label(Object.assign(tag("landmark", pid, v.id, key), { x: fmt1(x), y: fmt1(bb[1] - 1.5 * u), "font-size": fmt1((v === focus ? 2.9 : 2.6) * u), "font-weight": v === focus ? 700 : null, "text-anchor": "middle", fill: "#4a1a10", style: "cursor:pointer" }), v.label || FORM_LABEL[v.form] || "地标", { rank: 1 }));
+    // 名字与「↑N m」每组一个：同一模板的实例（instance_of / plan_id 去掉 [k]）算一组，不然环形 8 座宿舍就有 8 个名字
+    const gk = String(v.instance_of || pid || "").replace(/\[\d+\]/g, "") || null; // 嵌套重复（signs[2]/stack）也归成一组
+    if (!lm && type === "shape" && v.label && gk && !v.plinth_of && !groupLabel.has(gk)) groupLabel.set(gk, { v, key, bb, pid }); // 基座不出名字（名字给它垫着的那块）
+    const ek = gk || v.id;
+    if (e > 0.5 && (!elevLabel.has(ek) || elevLabel.get(ek).e < e)) elevLabel.set(ek, { v, e, key, bb, pid });
   }
-  const focus = landmarkOf(sid);
-  for (const lm of landmarksOf(sid)) {
-    const [x, , z] = lm.position, sz = lm.size, key = `landmark:${lm.id}`, pid = lm.plan_id || lm.id;
-    const n = svgel("g", Object.assign(tag("landmark", pid, lm.id, key, { "data-pos": `${fmt1(x)} ${fmt1(z)}` }), { class: "landmark", transform: `translate(${fmt1(x)} ${fmt1(z)})`, style: "cursor:pointer" }));
-    if (!small) n.append(lm.shape === "cylinder"
-      ? svgel("circle", { r: fmt1(sz[0] / 2), fill: "#b8452b", "fill-opacity": 0.25, stroke: "#4a1a10", "stroke-width": 0.3 })
-      : svgel("rect", { x: fmt1(-sz[0] / 2), y: fmt1(-sz[2] / 2), width: fmt1(sz[0]), height: fmt1(sz[2]), fill: "#b8452b", "fill-opacity": 0.25, stroke: "#4a1a10", "stroke-width": 0.3, transform: `rotate(${fmt1(-(lm.rotation_y || 0))})` }));
-    const glyph = landmarkGlyph(lm.form || (lm.kind === "prop" ? "tree" : "custom"));
-    glyph.setAttribute("transform", `rotate(${fmt1(-(lm.rotation_y || 0))}) scale(${fmt1(clamp(Math.max(sz[0], sz[2]) / 9, 0.45, 1.2))})`);
-    n.append(glyph);
-    g.append(n);
-    R.obs.ground.push(aabb(lm));
-    if (!small) groundLabels.append(label(Object.assign(tag("landmark", pid, lm.id, key), { x: fmt1(x), y: fmt1(z - Math.max(sz[2] / 2, 3) - 1.5 * u), "font-size": fmt1((lm === focus ? 2.9 : 2.6) * u), "font-weight": lm === focus ? 700 : null, "text-anchor": "middle", fill: "#4a1a10", style: "cursor:pointer" }), lm.label || FORM_LABEL[lm.form] || "地标", { rank: 1 }));
+  if (small) return;
+  // 同心的几圈环（环墙、墙顶环道、外墙立面、环形花槽）只标最外一圈；孔里的东西（院地、水池）标在它自己中间，不标到环带上
+  const rings = vols.map((v) => [v, ringOf(v)]).filter(([, q]) => q && !q.torus && q.ix > 0.2).map(([v, q]) => ({ v, c: [v.position[0], v.position[2]], r: (q.rx + q.rz) / 2, ri: (q.ix + q.iz) / 2 }));
+  const ringOf_ = (v) => rings.find((q) => q.v === v);
+  const outer = (q) => !rings.some((o) => o !== q && Math.hypot(o.c[0] - q.c[0], o.c[1] - q.c[1]) < 3 && (o.r > q.r + 0.3 || (Math.abs(o.r - q.r) <= 0.3 && rings.indexOf(o) < rings.indexOf(q))));
+  for (const { v, key, bb, pid } of groupLabel.values()) {
+    const rq = ringOf_(v);
+    if (rq && !outer(rq)) continue;
+    const inHole = !rq && rings.some((q) => Math.hypot(v.position[0] - q.c[0], v.position[2] - q.c[1]) < q.ri - 1);
+    groundLabels.append(label(Object.assign(tag("shape", pid, v.id, key), { x: fmt1(v.position[0]), y: fmt1(inHole ? v.position[2] + 0.8 * u : bb[1] - 1.2 * u), "font-size": fmt1(2.3 * u), "text-anchor": "middle", fill: "#3d3a33", style: "cursor:pointer", "data-plan-root": (v.plan_path || [])[0] || null }), v.label, { rank: 6, optional: true }));
   }
+  for (const { v, e, key, bb, pid } of elevLabel.values()) groundLabels.append(label({ x: fmt1(bb[2] + 0.6 * u), y: fmt1(bb[1] + 2 * u), "font-size": fmt1(2 * u), fill: "#2a6aa6", "pointer-events": "none", "data-for": key, "data-elev-label": pid || v.id }, `↑${Math.round(e)} m`, { rank: 7 }));
 }
+/** 区域名字放哪：形心在区域里（不在内孔里、水面真的盖着它）就用形心，否则取离边最远的格点（湖的名字在水上，不在湖心岛 / 岩柱上） */
+function labelPoint(poly, hole, wet) {
+  const c = polygonCentroid(poly), ok = (q) => pointInPolygon(q, poly) && !(hole && pointInPolygon(q, hole)) && (!wet || wet(q));
+  if (ok(c)) return c;
+  const xs = poly.map((q) => q[0]), zs = poly.map((q) => q[1]), x0 = Math.min(...xs), x1 = Math.max(...xs), z0 = Math.min(...zs), z1 = Math.max(...zs), st = Math.max(1, Math.max(x1 - x0, z1 - z0) / 28);
+  let best = c, bd = -1;
+  for (let z = z0 + st / 2; z < z1; z += st) for (let x = x0 + st / 2; x < x1; x += st) {
+    const q = [x, z];
+    if (!ok(q)) continue;
+    let dry = Infinity; // 水面：离露出水面的地（湖心岛、岩柱）也要远
+    if (wet) for (const r of [3, 6, 12, 24]) { if ([0, 1, 2, 3, 4, 5, 6, 7].some((k) => { const a = (k * Math.PI) / 4, p = [x + r * Math.cos(a), z + r * Math.sin(a)]; return pointInPolygon(p, poly) && !wet(p); })) { dry = r; break; } }
+    const d = Math.min(distToPolygon(q, poly), hole ? distToPolygon(q, hole) : Infinity, dry) + z * 1e-3; // 一样宽时偏南（靠近出生点那一侧）
+    if (d > bd) { bd = d; best = q; }
+  }
+  return best;
+}
+/** 体块俯视外接框 [x0, z0, x1, z1] */
 const aabb = (v) => {
-  const r = ((v.rotation_y || 0) * Math.PI) / 180, c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
-  const hx = (v.size[0] * c + v.size[2] * s) / 2, hz = (v.size[0] * s + v.size[2] * c) / 2;
-  return [v.position[0] - hx, v.position[2] - hz, v.position[0] + hx, v.position[2] + hz];
+  const P = footprintPolygon(v), xs = P.map((q) => q[0]), zs = P.map((q) => q[1]);
+  return [Math.min(...xs), Math.min(...zs), Math.max(...xs), Math.max(...zs)];
 };
 
 // ------------------------------------------------------------ 出生点与第一眼视锥（看不见主地标时变红）
@@ -346,7 +651,7 @@ function drawSpawn(R) {
   const n = svgel("g", Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key, { "data-pos": `${fmt1(ex)} ${fmt1(ez)}` }), { class: "spawn", transform: `translate(${fmt1(ex)} ${fmt1(ez)}) rotate(${fmt1(-(sp.rotation_y || 0))})`, style: "cursor:pointer" }));
   n.append(svgel("path", { d: "M0 -4.5 L3.2 3 L-3.2 3 Z", fill: "#1f6feb", stroke: "#fff", "stroke-width": 0.5 }));
   g.append(n);
-  R.obs.ground.push([ex - 3.5, ez - 4.5, ex + 3.5, ez + 3.5]);
+  R.obs.ground.push([ex - 3.5, ez - 4.5, ex + 3.5, ez + 3.5, ICON_W]);
   if (!small) { const right = ex < b.min[0] + (b.max[0] - b.min[0]) * 0.6; groundLabels.append(label(Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key), { x: fmt1(right ? ex + 5 * u : ex - 5 * u), y: fmt1(ez + 1 * u), "text-anchor": right ? "start" : "end", "font-size": fmt1(2.7 * u), fill: "#1f6feb" }), `出生点 · 看向${lm ? lm.label || "地标" : "北"}`, { rank: 2 })); }
 }
 
@@ -409,7 +714,7 @@ function drawSpaces(R) {
       const m = svgel("g", Object.assign(tag(kind, pid, sp.id, key, { "data-part": kind }), { transform: `translate(${fmt1(p[0])} ${fmt1(p[1])})`, class: kind, style: "cursor:pointer" }),
         svgel("circle", { r: fmt1(1.7 * u), fill, stroke: "#fff", "stroke-width": fmt1(0.35 * u) }),
         svgel("text", { y: fmt1(0.75 * u), "font-size": fmt1(2 * u), "text-anchor": "middle", fill: "#fff", "font-weight": 700, "pointer-events": "none" }, txt), svgel("title", {}, title));
-      gs.append(m); R.obs.strata.push([p[0] - 1.8 * u, p[1] - 1.8 * u, p[0] + 1.8 * u, p[1] + 1.8 * u]);
+      gs.append(m); R.obs.strata.push([p[0] - 1.8 * u, p[1] - 1.8 * u, p[0] + 1.8 * u, p[1] + 1.8 * u, ICON_W]);
     };
     const conn = (sid.markers || []).find((m) => m && m.kind === "connector" && (m.to === sp.id || m.from === sp.id));
     if (isPt(sp.entrance) && entryLevel(sp) === cur) mark(sp.entrance, "入", "#2f8f4e", `${sp.label || pid} 入口${conn ? `（${conn.label || VIA_LABEL[conn.via] || "连接点"}）` : ""}`, "entrance");
@@ -421,7 +726,7 @@ function drawSpaces(R) {
         svgel("rect", { x: fmt1(-1.5 * u), y: fmt1(-1.5 * u), width: fmt1(3 * u), height: fmt1(3 * u), rx: fmt1(0.4 * u), fill: "#fff", stroke: "#6b4f2a", "stroke-width": fmt1(0.3 * u) }),
         svgel("text", { y: fmt1(0.75 * u), "font-size": fmt1(2.1 * u), "text-anchor": "middle", fill: "#6b4f2a", "font-weight": 700, "pointer-events": "none" }, `${deeper === (sp.stratum !== "sky") ? "↓" : "↑"}${k + 1}`),
         svgel("title", {}, `${VIA_LABEL[l.via] || "连接"}：通内部第 ${k + 1} 层`));
-      gs.append(m); R.obs.strata.push([l.at[0] - 1.6 * u, l.at[1] - 1.6 * u, l.at[0] + 1.6 * u, l.at[1] + 1.6 * u]);
+      gs.append(m); R.obs.strata.push([l.at[0] - 1.6 * u, l.at[1] - 1.6 * u, l.at[0] + 1.6 * u, l.at[1] + 1.6 * u, ICON_W]);
     }
     g.append(gs);
     if (!small) labels.append(label(Object.assign({}, base, { x: fmt1(top[0]), y: fmt1(top[1] - 1.2 * u), "font-size": fmt1(2.5 * u), "font-weight": 700, "text-anchor": "middle", fill: st.text, style: "cursor:pointer" }),
@@ -457,7 +762,7 @@ function drawConnectors(R) {
     if (up) d += " M1.9 -0.8 L2.6 -1.6 L3.3 -0.8";
     box.append(svgel("path", { d, fill: "none", stroke: down && !up ? SPACE_STYLE.underground.arrow : SPACE_STYLE.sky.arrow, "stroke-width": 0.42, "stroke-linecap": "round", "stroke-linejoin": "round" }));
     n.append(box); g.append(n);
-    const box4 = [x - 1.6 * u, z - 1.6 * u, x + 3.2 * u, z + 1.6 * u];
+    const box4 = [x - 1.6 * u, z - 1.6 * u, x + 3.2 * u, z + 1.6 * u, ICON_W];
     R.obs.ground.push(box4); if (active) R.obs.strata.push(box4);
     if (!small) labels.append(label({ x: fmt1(x + 3.6 * k), y: fmt1(z + 0.8 * u), "font-size": fmt1(2.1 * u), fill: "#333", opacity: active ? 1 : 0.5, "pointer-events": "none", "data-for": key }, m.label || "连接点", { rank: active && stratum !== "ground" ? 0.5 : 3.5, optional: true }));
   }
@@ -532,11 +837,11 @@ function drawSelection(R, sel) {
     const rg = (sid.regions || []).find((x) => x.id === id);
     if (rg && validPoly(rg.polygon)) { g.append(svgel("polygon", Object.assign(st(`zone:${rg.plan_id || rg.id}`, 0.8), { points: pts(rg.polygon) }))); continue; }
     const v = (sid.volumes || []).find((x) => x.id === id);
-    if (v && v.position && v.size) { g.append(svgel("polygon", Object.assign(st(`${v.importance === "landmark" ? "landmark" : "house"}:${v.id}`, v.importance === "landmark" ? 0.6 : 0.45), { points: pts(boxCorners(v.position, [v.size[0] + 1.6, v.size[1], v.size[2] + 1.6], v.rotation_y || 0)) }))); continue; }
+    if (v && v.position && v.size) { g.append(svgel("polygon", Object.assign(st(`${volumeType(v)}:${v.id}`, v.importance === "landmark" ? 0.6 : 0.45), { points: pts(footprintPolygon(v, 0.8)) }))); continue; }
     const pa = (sid.paths || []).find((x) => x.id === id);
     if (pa && pa.points) { g.append(svgel("polyline", Object.assign(st(`path:${pa.id}`, 1.2), { points: pts(pa.points), "stroke-opacity": 0.6 }))); continue; }
     const m = (sid.markers || []).find((x) => x.id === id);
-    if (m && m.position) g.append(svgel("circle", Object.assign(st(`${m.kind === "player_spawn" ? "spawn" : "connector"}:${m.id}`), { cx: fmt1(m.position[0]), cy: fmt1(m.position[2]), r: fmt1(3.4 * u) })));
+    if (m && m.position) g.append(svgel("circle", Object.assign(st(`${m.kind === "player_spawn" ? "spawn" : m.kind === "portal" ? "portal" : "connector"}:${m.id}`), { cx: fmt1(m.position[0]), cy: fmt1(m.position[2]), r: fmt1(3.4 * u) })));
   }
   svg.append(g);
   const q = sel.sid_id ? `[data-sid-id="${esc(sel.sid_id)}"]` : `[data-plan-id="${esc(sel.plan_id)}"], [data-zone-id="${esc(sel.plan_id)}"]`;
@@ -584,7 +889,21 @@ function boxOf(t, x, y) {
   return [x0 - 0.15 * fs, y - 0.9 * fs, x0 + w + 0.15 * fs, y + 0.25 * fs];
 }
 const area = (a, b) => Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
-const CANDIDATES = (() => { const out = []; for (const dy of [0, -1, 1, -2, 2, -3, 3]) for (const dx of [0, 0.4, -0.4]) out.push([dx, dy, Math.abs(dy) + Math.abs(dx) * 2.5]); return out.sort((a, b) => a[2] - b[2]); })();
+const CANDIDATES = (() => { const out = []; for (const dy of [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]) for (const dx of [0, 0.4, -0.4, 0.75, -0.75]) out.push([dx, dy, Math.abs(dy) + Math.abs(dx) * 2.5]); return out.sort((a, b) => a[2] - b[2]); })();
+/** 图标类障碍（出生点、连接点、入口 / 终点、传送门）的权重：标签宁可压一点大块的形体，也别压住小图标 */
+const ICON_W = 6;
+/** 同名同组只标一次：文字一样、属于同一个 plan 元素（实例 / 子件归到根 id），或文字一样且离得近（< 24 m） */
+function dedupeLabels(list) {
+  const seen = [], out = [];
+  const root = (t) => String(t.getAttribute("data-plan-id") || t.getAttribute("data-elev-label") || "").replace(/\[\d+\]/g, "").split(/[/.]/)[0];
+  for (const t of list) {
+    const text = (t.textContent || "").trim(), r = root(t), g = t.getAttribute("data-plan-root") || r, x = +t.getAttribute("x"), y = +t.getAttribute("y");
+    const kin = (o) => (r && o.r === r) || (g && o.g === g); // 同一元素、或同一个根组（柱厅里的柱）
+    if (text && seen.some((o) => (o.text === text && ((r && o.r === r) || Math.hypot(o.x - x, o.y - y) < 24)) || (kin(o) && ((o.text.length >= 2 && text.startsWith(o.text)) || o.text.startsWith(text))))) { t.remove(); continue; } // 「内庭」标过了，「内庭墙」不再标；「柱厅」标过了，「柱」不再标
+    seen.push({ text, r, g, x, y }); out.push(t);
+  }
+  return out;
+}
 function placeLabels(R) {
   const { labels, sid, u, onGround } = R;
   const all = [...labels.querySelectorAll("text")].filter((t) => !t.closest("[data-type=interior_level]"));
@@ -595,14 +914,14 @@ function placeLabels(R) {
   const inactive = (t) => !!t.closest("[data-inactive]");
   const rank = (t) => Number(t.getAttribute("data-rank")) + (inactive(t) ? 10 : 0);
   movable.sort((a, b) => rank(a) - rank(b));
-  for (const t of movable) {
+  for (const t of dedupeLabels(movable)) {
     const x = +t.getAttribute("x"), y = +t.getAttribute("y"), fs = Number(t.getAttribute("font-size")) || 2.5, b0 = boxOf(t, x, y), w = b0[2] - b0[0], lh = 1.2 * fs;
     let best = null;
     for (const [dx, dy, cost] of CANDIDATES) {
       const nx = x + dx * w, ny = y + dy * lh, b = boxOf(t, nx, ny);
       if (b[0] < x0 - 2 * u || b[2] > x1 + 2 * u || b[1] < z0 - 2 * u || b[3] > z1 + 2 * u) continue;
       let hit = 0;
-      for (const o of obs) hit += area(b, o);
+      for (const o of obs) hit += area(b, o) * (o[4] || 1);
       if (!onGround && inactive(t)) for (const o of R.obs.interior) hit += area(b, o); // 淡画的地面标签躲开当前内部层
       for (const o of placed) hit += 3 * area(b, o);
       const score = hit + cost * 0.02 * w * lh;
@@ -613,7 +932,7 @@ function placeLabels(R) {
     if ((t.hasAttribute("data-optional") || (!onGround && inactive(t))) && best.hit > 0.15 * w * lh) { t.remove(); continue; } // 淡画的地面标签只是参照：躲不开就不画
     t.setAttribute("x", fmt1(best.nx)); t.setAttribute("y", fmt1(best.ny));
     if (best.hit > 0.15 * w * lh) { const [a, c, d, e] = best.b; t.before(svgel("rect", { x: fmt1(a), y: fmt1(c), width: fmt1(d - a), height: fmt1(e - c), rx: fmt1(0.4 * u), fill: "#fbfaf6", "fill-opacity": 0.82, "pointer-events": "none", "data-for": t.getAttribute("data-for"), class: "label-bg" })); }
-    placed.push(best.b);
+    placed.push([best.b[0] - 0.4 * lh, best.b[1] - 0.25 * lh, best.b[2] + 0.4 * lh, best.b[3] + 0.25 * lh]); // 留一点缝：两个名字别贴在一起读成一个
   }
 }
 
@@ -632,8 +951,8 @@ export function snapAngle(from, to, step = 15) {
   const t = (a * Math.PI) / 180;
   return { angle_deg: Math.round(a * 10) / 10, length_m: Math.round(L * 10) / 10, to: step > 0 ? [from[0] + Math.cos(t) * L, from[1] - Math.sin(t) * L] : [to[0], to[1]] };
 }
-const DRAG_TYPES = new Set(["landmark", "spawn", "house", "trail_vertex", "section_a", "section_b", "section_mid", "space", "connector", "feature"]);
-const POINT_TYPES = new Set(["landmark", "spawn", "connector", "trail_vertex", "section_a", "section_b", "section_mid", "entrance", "goal", "link"]);
+const DRAG_TYPES = new Set(["landmark", "spawn", "house", "shape", "portal", "trail_vertex", "section_a", "section_b", "section_mid", "space", "connector", "feature"]);
+const POINT_TYPES = new Set(["landmark", "spawn", "shape", "portal", "connector", "trail_vertex", "section_a", "section_b", "section_mid", "entrance", "goal", "link"]);
 const parsePos = (s) => { const a = String(s || "").split(" ").map(Number); return a.length === 2 && a.every(Number.isFinite) ? a : null; };
 /** DOM 节点 → 手势目标 {type, plan_id?, sid_id?, part?, sublevel?, index?, zone_id?}；淡显层里的不算 */
 export function targetOf(n) {

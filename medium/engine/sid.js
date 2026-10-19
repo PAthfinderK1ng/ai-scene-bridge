@@ -7,7 +7,7 @@
 // - 旧模式（测试夹具直接摆的 SID）：resolve 还会按「出生点 → 地标」算主路 main_trail。
 
 import { buildTerrain, DEFAULT_BOUNDS, DEFAULT_LAYER_M, pointInPolygon, clamp, r2 } from "./terrain.js";
-import { layoutHouses, HOUSE_SIZES, boxCorners, facingToRotation } from "./layout.js";
+import { layoutHouses, HOUSE_SIZES, boxCorners, facingToRotation, ringSamples } from "./layout.js";
 import { routeTrail, zigzagTrail, pathFacts, pathCrossings } from "./routing.js";
 import { analyze, unreachedTerraces, polyToPolylineDist } from "./relations.js";
 import { validate } from "./validate.js";
@@ -66,6 +66,73 @@ export function newDoc(theme = THEME.mountain_village) {
     terrain: { base: "flat", base_height: 0, features: [] },
     volumes: [], regions: [], paths: [], markers: [], spaces: [], relations: [], constraints: [], views: [], asset_hints: {},
   };
+}
+
+// ------------------------------------------------------------ 落地（plan v2 的体块带 land：{ mode, elev, on, abs }）
+/** 水面区域（kind water 且有 surface_y）：给「贴地」用（码头、船贴水面） */
+export function waterRegions(sid) {
+  return (sid.regions || []).filter((r) => r && r.kind === "water" && Number.isFinite(r.surface_y) && Array.isArray(r.polygon) && r.polygon.length >= 3).map((r) => ({ polygon: r.polygon, hole: r.hole || null, surface_y: r.surface_y }));
+}
+/** 地面高度 = 地形与水面取高者 */
+export function groundAt(T, waters, x, z) {
+  let h = T.heightAt(x, z);
+  for (const w of waters || []) if (w.surface_y > h && pointInPolygon([x, z], w.polygon) && !(w.hole && pointInPolygon([x, z], w.hole))) h = w.surface_y;
+  return h;
+}
+/** 体块底面采样点（四角、边中点、中心；大体块加密，最多 25 个）；环带（空心圆柱 / 平放的环）只采带子上的点 */
+export function footSamples(v) {
+  const ring = ringSamples(v);
+  if (ring) return ring;
+  const [w, , d] = v.size, t = ((v.rotation_y || 0) * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t), cx = v.position[0], cz = v.position[2];
+  const n = clamp(Math.ceil(Math.max(w, d) / 6), 2, 4), out = [];
+  for (let i = 0; i <= n; i++) for (let j = 0; j <= n; j++) { const lx = (-0.5 + i / n) * w * 0.96, lz = (-0.5 + j / n) * d * 0.96; out.push([cx + lx * c + lz * s, cz - lx * s + lz * c]); }
+  return out;
+}
+/**
+ * 按 v.land 算一个体块的底面高度（原地改 position[1]，并写 elev = 离地高度）：
+ * snap 贴地（大体块取覆盖范围的最高点；小于 4 m 的取中心）/ float 悬空（中心地面 + elev）/ carve 嵌入（覆盖范围最低点 + elev）/
+ * rest 立在 land.on 那个体块顶上（+ elev；from:"base" 时从它的底面量，挂在立面上）/ abs 绝对高度（浮空组里的子节点、叠层）/ plinth 基座（从 plinth_of 的覆盖范围最低点垫到它的底面）。
+ * @param {object} v 体块
+ * @param {object} T
+ * @param {Map<string, object>} byId 体块 id → 体块（rest / plinth 要找另一个体块）
+ * @param {object[]} [waters] waterRegions(sid)
+ */
+export function landVolume(v, T, byId, waters) {
+  const L = v.land;
+  if (!L || !Array.isArray(v.position) || !Array.isArray(v.size)) return v;
+  const cx = v.position[0], cz = v.position[2], g = (x, z) => groundAt(T, waters, x, z);
+  let y;
+  switch (L.mode) {
+    case "rest": { const b = byId.get(L.on); y = b ? b.position[1] + (L.from === "base" ? 0 : b.size[1]) + (L.elev || 0) : g(cx, cz) + (L.elev || 0); break; } // from: "base" = 挂在父体立面上（离父体底面 elev）
+    case "abs": y = Number(L.abs) || 0; break;
+    case "float": { const ring = ringSamples(v); y = (ring ? Math.max(...ring.map(([x, z]) => g(x, z))) : g(cx, cz)) + (L.elev || 0); break; }
+    case "carve": { let lo = Infinity; for (const [x, z] of footSamples(v)) lo = Math.min(lo, T.heightAt(x, z)); y = lo + (L.elev || 0); break; }
+    case "plinth": {
+      const b = byId.get(v.plinth_of);
+      if (!b) { y = T.heightAt(cx, cz); break; }
+      let lo = Infinity; for (const [x, z] of footSamples(b)) { const h = T.heightAt(x, z); if (g(x, z) > h + 0.05) continue; lo = Math.min(lo, h); }
+      if (!Number.isFinite(lo)) lo = b.position[1] - 0.2;
+      y = Math.min(lo, b.position[1] - 0.2); v.size[1] = r2(Math.max(0.2, b.position[1] - y));
+      Object.assign(v.position, [b.position[0], 0, b.position[2]]); v.rotation_y = b.rotation_y;
+      break;
+    }
+    default: {
+      if (Math.max(v.size[0], v.size[2]) < 4) { y = g(cx, cz) + (L.elev || 0); break; }
+      let hi = -Infinity; for (const [x, z] of footSamples(v)) hi = Math.max(hi, g(x, z));
+      y = hi + (L.elev || 0);
+    }
+  }
+  v.position[1] = r2(y);
+  // 离地：环带量带子下面的地（中间的孔可能是坑底），其余量中心
+  const ring = ringSamples(v);
+  v.elev = r2(Math.max(0, y - (ring ? Math.max(...ring.map(([x, z]) => T.heightAt(x, z))) : T.heightAt(cx, cz))));
+  return v;
+}
+/** 所有带 land 的体块按顺序重新落地（父在前；地形改了 / 台地调高后用） */
+export function landVolumes(sid, T) {
+  const byId = new Map((sid.volumes || []).map((v) => [v.id, v])), W = waterRegions(sid);
+  for (const v of sid.volumes || []) if (v && v.land) landVolume(v, T, byId, W);
+  return sid;
 }
 
 // ------------------------------------------------------------ resolve
@@ -161,16 +228,20 @@ export function resolve(sid, opts = {}) {
   sid.volumes = sid.volumes.filter((v) => v && !v.generated);
   sid.paths = sid.paths.filter((p) => p && !(p.generated && (p.auto_spur || (!planMode && p.id === MAIN_TRAIL_ID))));
   sid.relations = sid.relations.filter((r) => r && !r.generated);
+  const v2 = planMode && Number(sid.meta.plan_version) >= 2;
   // 人拖过的房子（user_moved）贴到当前地面（台地单独调高后跟着走）
-  for (const v of sid.volumes) if (v.user_moved && !v.rests_on && Array.isArray(v.position)) v.position[1] = r2(T.heightAt(v.position[0], v.position[2]));
+  for (const v of sid.volumes) if (v.user_moved && !v.rests_on && !v.land && Array.isArray(v.position)) v.position[1] = r2(T.heightAt(v.position[0], v.position[2]));
 
   const landmarks = sid.volumes.filter((v) => v.importance === "landmark");
   const landmark = (sid.meta && sid.meta.focus && landmarks.find((v) => v.id === sid.meta.focus)) || landmarks[0] || sid.volumes.find((v) => v.id === LANDMARK_ID) || null;
   const spawn = sid.markers.find((m) => m.kind === "player_spawn") || null;
-  // 地标与出生点重新贴地（桥 / 吊脚楼的高度由编译决定，不动）
-  for (const o of [...(planMode ? landmarks : [landmark]), spawn]) if (o && o.position && o.form !== "bridge" && o.form !== "stilt_house" && !o.rests_on) o.position[1] = r2(T.heightAt(o.position[0], o.position[2]));
+  // 地标与出生点重新贴地（桥 / 吊脚楼的高度由编译决定，不动）；plan v2 的体块按各自的 land 规则重新落地，出生点站在体块上时跟着它
+  if (v2) {
+    landVolumes(sid, T);
+    if (spawn && spawn.position) { const on = spawn.rests_on && sid.volumes.find((v) => v.id === spawn.rests_on); spawn.position[1] = r2(on ? on.position[1] + on.size[1] : groundAt(T, waterRegions(sid), spawn.position[0], spawn.position[2])); }
+  } else for (const o of [...(planMode ? landmarks : [landmark]), spawn]) if (o && o.position && o.form !== "bridge" && o.form !== "stilt_house" && !o.rests_on) o.position[1] = r2(T.heightAt(o.position[0], o.position[2]));
   // 立在别的地标身上的（桥心楼阁）：跟着它的桥面 / 顶面走
-  for (const o of sid.volumes) if (o && o.rests_on && o.position) { const b = sid.volumes.find((x) => x.id === o.rests_on); if (b && b.position && b.size) o.position[1] = r2(b.form === "bridge" ? b.position[1] : b.position[1] + b.size[1]); }
+  for (const o of sid.volumes) if (o && o.rests_on && !o.land && o.position) { const b = sid.volumes.find((x) => x.id === o.rests_on); if (b && b.position && b.size) o.position[1] = r2(b.form === "bridge" ? b.position[1] : b.position[1] + b.size[1]); }
   if (!planMode && landmark && spawn) { landmark.rotation_y = rotationToward(xz(landmark.position), xz(spawn.position)); spawn.rotation_y = rotationToward(xz(spawn.position), xz(landmark.position)); }
   const poi = sid.markers.find((m) => m.id === POI_ID);
   if (poi && landmark) poi.position = [landmark.position[0], r2(landmark.position[1] + landmark.size[1]), landmark.position[2]];

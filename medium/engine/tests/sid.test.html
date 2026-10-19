@@ -2,17 +2,19 @@
 <script type="module">
 import { test, run, assert, close, between } from "./harness.js";
 import { pointInPolygon, polygonCentroid } from "../terrain.js";
-import { newDoc, resolve, snapshot, restore, THEME, setTerraceHeight, resetTerraceHeight } from "../sid.js";
+import { newDoc, resolve, snapshot, restore, THEME, setTerraceHeight, resetTerraceHeight, landVolumes } from "../sid.js";
 import { compilePlan } from "../plan.js";
 import { villageSid, valleySid } from "./fixtures.js";
 
 const EX = {};
-for (const n of ["mountain-town", "valley-bridge", "ring-stilt"]) EX[n] = await fetch(`../../../spec/examples/plans/${n}.plan.json`, { cache: "no-store" }).then((r) => r.json());
+for (const n of ["mountain-village", "mine-maze", "sky-garden"]) EX[n] = await fetch(`../../../spec/examples/plans/${n}.plan.json`, { cache: "no-store" }).then((r) => r.json());
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const xz = (p) => [p[0], p[2]];
 const housesOf = (sid) => sid.volumes.filter((v) => v.kind === "building" && v.generated);
 const checkOf = (checks, id) => checks.find((c) => c.id === id);
-const build = (seed = 1, n = "mountain-town") => compilePlan(EX[n], { seed });
+const build = (seed = 1, n = "mountain-village") => compilePlan(EX[n], { seed });
+/** 平地上一块陡崖台（没有路上去）+ 一座塔：自动支路要补到崖顶 */
+const cliffPlan = () => ({ name: "崖台", site: { size_m: [140, 140], ground: "flat" }, terrain: [{ id: "mesa", op: "cliff", at: "site.N", shape: "rect", size_m: [50, 30], height_m: 9 }], nodes: [{ id: "keep", type: "tower", role: "landmark", at: "site.C", size_m: [8, 14] }], spawn: { at: "site.S", look_at: "keep" } });
 
 test("newDoc：含主题默认调色板、bounds、层高、玩家高度；THEME 有路 / 溪默认值", () => {
   const sid = newDoc();
@@ -35,16 +37,29 @@ test("旧模式：resolve 直接跑 fixtures（villageSid / valleySid），出�
   }
 });
 
-test("plan 模式：resolve 保留 plan 编译的主路与地标朝向（不按旧规则重算），只重放房子；跳过「地标在顶层」检查", () => {
-  const r = build(1, "ring-stilt"), sid = r.sid;
-  const trail = JSON.stringify(sid.paths.find((p) => p.id === "main_trail").points), rots = sid.volumes.filter((v) => v.importance === "landmark").map((v) => v.rotation_y).join();
+test("plan v2：resolve 保留编译的主路与形体（按 land 规则重新落地，不按旧规则重算），只重放房子；跳过「地标在顶层」检查", () => {
+  const r = build(1), sid = r.sid;
+  assert(sid.meta.plan_mode && sid.meta.plan_version === 2, "plan_version 2");
+  const trail = JSON.stringify(sid.paths.find((p) => p.id === "main_trail").points), pos = JSON.stringify(sid.volumes.filter((v) => v.land).map((v) => [v.id, v.position, v.rotation_y]));
   sid.volumes = sid.volumes.filter((v) => !v.generated);
   const again = resolve(sid, { seed: 1 });
   assert(JSON.stringify(sid.paths.find((p) => p.id === "main_trail").points) === trail, "主路不动");
-  assert(sid.volumes.filter((v) => v.importance === "landmark").map((v) => v.rotation_y).join() === rots, "地标朝向不动");
+  assert(JSON.stringify(sid.volumes.filter((v) => v.land).map((v) => [v.id, v.position, v.rotation_y])) === pos, "形体不动");
   assert(housesOf(sid).length === r.facts.houses, "房子按同 seed 重放");
   assert(!checkOf(again.checks, "landmark_on_top"), "plan 模式没有 landmark_on_top");
   assert(checkOf(again.checks, "trail_reaches_landmark").text.includes("鼓楼"), "主路检查看主路自己的终点：" + checkOf(again.checks, "trail_reaches_landmark").text);
+});
+
+test("plan v2：landVolumes 按 land 重新落地——立在别人顶上的跟着它，贴地的离地 < 1 m", () => {
+  const r = build(1, "sky-garden"), sid = r.sid, T = r.T;
+  const hub = sid.volumes.find((v) => v.id === "hub"), pav = sid.volumes.find((v) => v.id === "pavilion");
+  close(pav.position[1], hub.position[1] + hub.size[1], 0.02, "亭立在岛顶");
+  hub.land = { mode: "abs", abs: hub.position[1] + 5 };
+  landVolumes(sid, T);
+  close(pav.position[1], hub.position[1] + hub.size[1], 0.02, "岛抬高后亭子跟着");
+  const m = build(1, "mine-maze").sid;
+  const shed = m.volumes.find((v) => v.id === "sheds_0");
+  assert(shed.land.mode === "snap" && shed.elev < 1, "工棚贴地 " + JSON.stringify(shed.land) + " " + shed.elev);
 });
 
 test("snapshot / restore 往返相等，且丢掉 _ 开头的临时字段", () => {
@@ -79,7 +94,7 @@ test("性能：resolve 耗时在返回值顶层 ms，facts 本身逐字节确定
 test("人画的路与人圈的区域在 resolve 后保留；手画林子出树、房子不进林子", () => {
   const { sid } = build(1);
   sid.paths.push({ id: "my_path", kind: "trail", width: 2, points: [[-40, 50], [-40, 30]], surface: "dirt", label: "手画小路", user_drawn: true });
-  const t = sid.regions.find((r) => r.plan_id === "z_houses" && r.terrace_level === 2), c = polygonCentroid(t.polygon);
+  const c = [-50, 62]; // 山脚西南：不在台地 / 竹林 / 路上
   const poly = [[c[0] - 10, c[1] - 5], [c[0] + 10, c[1] - 5], [c[0] + 10, c[1] + 5], [c[0] - 10, c[1] + 5]];
   sid.regions.push({ id: "my_forest", kind: "forest", polygon: poly, density: 1, label: "我的林子", user_set: true });
   const r = resolve(sid, { seed: 1 });
@@ -91,35 +106,37 @@ test("人画的路与人圈的区域在 resolve 后保留；手画林子出树�
 });
 
 test("自动支路：够不到的台地默认补支路后每层可达；重复 resolve 幂等；autoSpur:false 或标「不重要」则不补", () => {
-  const a = build(1, "valley-bridge");
+  const a = compilePlan(cliffPlan(), { seed: 1 });
+  assert(a.facts.terraces >= 1, "崖顶登记成台地 " + a.facts.terraces);
   assert(a.facts.spurs.length >= 1, "补了支路 " + a.facts.spurs.length);
   assert(checkOf(a.checks, "terraces_reachable").ok, "补后每层可达：" + checkOf(a.checks, "terraces_reachable").detail);
   const s1 = snapshot(a.sid), again = resolve(a.sid, { seed: 1 });
   assert(snapshot(again.sid) === s1, "重复 resolve 幂等（自动支路先清再补）");
   const b = resolve(restore(s1), { seed: 1, autoSpur: false });
   assert(b.facts.spurs.length === 0 && !b.sid.paths.some((p) => p.auto_spur), "autoSpur:false 不补");
-  const c = compilePlan(EX["valley-bridge"], { seed: 1, ignored: ["terraces_reachable"] });
+  const c = compilePlan(cliffPlan(), { seed: 1, ignored: ["terraces_reachable"] });
   assert(c.facts.spurs.length === 0 && checkOf(c.checks, "terraces_reachable").ignored === true, "标了不重要就不补");
   for (const p of a.sid.paths.filter((q) => q.auto_spur)) assert(p.id.startsWith("spur_") && p.generated && p.kind === "trail" && p.points.length >= 2, "自动支路结构");
 });
 
-test("台地单独调高：吸附 0.5 m、写 user_height，房子贴新高度、人拖过的房子跟着走；恢复回规则高度", () => {
+test("台地单独调高：吸附 0.5 m、写 user_height，房子贴新高度、人拖过的房子跟着走；恢复回规则高度（层号 × 层高）", () => {
   const { sid } = build(1);
-  const f = sid.terrain.features.find((x) => x.plan_id === "steps" && x.level === 3);
-  setTerraceHeight(sid, f.id, 10.3);
-  assert(f.height === 10.5 && f.user_height === true && f.skirt === 8.4, "吸附与 skirt " + JSON.stringify([f.height, f.skirt]));
-  let r = resolve(sid, { seed: 1 });
+  const f = sid.terrain.features.find((x) => x.plan_id === "steps" && x.step === 2);
+  const h0 = f.height;
+  setTerraceHeight(sid, f.id, h0 + 1.3);
+  assert(f.height === h0 + 1.5 && f.user_height === true, "吸附 " + f.height);
+  const r = resolve(sid, { seed: 1 });
   const on = housesOf(sid).filter((h) => h.terrace_id === f.id);
   assert(on.length > 0, "那层还有房");
-  for (const h of on) close(h.position[1], 10.5, 0.3, `${h.id} 贴新高度`);
+  for (const h of on) close(h.position[1], h0 + 1.5, 0.3, `${h.id} 贴新高度`);
   assert(r.facts.errors === 0, "无 validate error");
   const h = on[0];
   Object.assign(h, { id: "u_house_1", generated: false, user_moved: true });
-  setTerraceHeight(sid, f.id, 11);
+  setTerraceHeight(sid, f.id, h0 + 2);
   resolve(sid, { seed: 1 });
-  close(sid.volumes.find((v) => v.id === "u_house_1").position[1], 11, 0.3, "user_moved 房子贴新高度");
+  close(sid.volumes.find((v) => v.id === "u_house_1").position[1], h0 + 2, 0.3, "user_moved 房子贴新高度");
   resetTerraceHeight(sid, f.id);
-  assert(f.height === 9 && !("user_height" in f), "恢复规则高度 " + f.height);
+  assert(f.height === f.level * 3 && !("user_height" in f), "恢复规则高度 " + f.height);
 });
 
 test("旧模式：主路为躲开人放的房子绕行，trail 事实记 detour_around，检查文案提一句", () => {
@@ -133,25 +150,27 @@ test("旧模式：主路为躲开人放的房子绕行，trail 事实记 detour_
   assert(c.ok && c.detail.includes("绕"), "不压路且提到绕行：" + c.detail);
 });
 
-test("窄带也有房：坡上台地 / 环台 × 3 / 5 / 7 级，密度 1 时每张 ≥ 6 栋、住人的每一级 ≥ 1 栋（环台顶上两级放地标除外），房子检查全过", () => {
-  for (const type of ["slope_terraces", "ring_terraces"]) for (const n of [3, 5, 7]) {
-    const t = type === "ring_terraces" ? { id: "t", type, at: { of: "site", dir: "C" }, size_m: [104, 104], steps: n, from_layer: 1, width_m: 8 } : { id: "t", type, at: { of: "site", dir: "C" }, size_m: [n * 11, 70], orient: "N", steps: n, from_layer: 1 };
-    const plan = { name: "窄带", site: { size_m: 140, relief_layers: 8, layer_m: 3 }, terrain: [t], zones: [{ id: "z", use: "housing", on: "t", density: 1 }], landmarks: [{ id: "lm", form: "hall", place: { rel: "top_of", target: "t" } }], spawn: { place: { rel: "edge_of", target: "site", side: "S" }, look_at: "lm" } };
-    const r = compilePlan(plan, { seed: 7 }), tag = `${type}/${n}`;
+test("窄带也有房：台地生成器（坡上 / 环台）× 3 / 5 / 7 级 + 撒房子，密度 1 时每张 ≥ 6 栋、住人的每一级 ≥ 1 栋（环台顶上两级除外），房子检查全过", () => {
+  for (const form of ["slope", "ring"]) for (const n of [3, 5, 7]) {
+    const t = form === "ring" ? { id: "t", type: "terraces", form, at: "site.C", size_m: [104, 104], steps: n, width_m: 8 } : { id: "t", type: "terraces", form, at: "site.C", size_m: [70, n * 11], orient: "N", steps: n };
+    const plan = { name: "窄带", site: { size_m: [140, 140], ground: "flat", layer_m: 3 }, nodes: [t, { id: "z", type: "scatter_houses", area: "t", density: 1 }, { id: "lm", type: "building", role: "landmark", at: "t.top", size_m: [10, 9, 9] }], spawn: { at: "site.S", look_at: "lm" } };
+    const r = compilePlan(plan, { seed: 7 }), tag = `${form}/${n}`;
     assert(r.facts.houses >= 6, `${tag} 只有 ${r.facts.houses} 栋`);
-    const levels = [...new Set(r.sid.regions.map((g) => g.terrace_level))];
-    for (const lv of levels) if (type === "slope_terraces" || lv < n - 1) assert((r.facts.perTerrace[lv] || 0) >= 1, `${tag} 第 ${lv} 层没房：${JSON.stringify(r.facts.perTerrace)}`);
+    const levels = [...new Set(r.sid.regions.filter((g) => g.plan_id === "z").map((g) => g.terrace_level))].sort((a, b) => a - b);
+    for (const lv of levels.slice(0, form === "ring" ? Math.max(1, levels.length - 2) : levels.length)) assert((r.facts.perTerrace[lv] || 0) >= 1, `${tag} 第 ${lv} 层没房：${JSON.stringify(r.facts.perTerrace)}`);
     for (const id of ["houses_on_terraces", "houses_clear_of_paths", "houses_no_overlap"]) assert(checkOf(r.checks, id).ok, `${tag} ${id}：${checkOf(r.checks, id).detail}`);
   }
 });
 
-test("facts：forms 按形制计数、stilt_houses、bridges（路过溪处）、spaces（interior.spaceFacts 的对象形状）", () => {
-  const ring = build(1, "ring-stilt"), valley = build(1, "valley-bridge");
-  assert(ring.facts.forms.stilt_house === ring.facts.houses && ring.facts.stilt_houses > 0, "吊脚楼计数");
-  assert(valley.facts.bridges.length >= 1 && valley.facts.bridges.every((b) => b.at.length === 2 && b.dir.length === 2), "桥");
-  assert(valley.facts.spaces.total === 0 && build(1, "mountain-town").facts.spaces.items.length === 0, "没有空间");
-  const sf = build(1, "mountain-town").facts.spaces;
-  assert(!Array.isArray(sf) && sf.total === 0 && sf.passage_m === 0 && sf.rooms === 0 && Array.isArray(sf.items), "spaces 是 interior.spaceFacts 的对象");
+test("facts：forms 按形制计数、bridges（路过河处）、spaces（interior.spaceFacts 的对象形状）", () => {
+  const v = build(1);
+  assert(v.facts.forms.house === v.facts.houses && v.facts.houses > 0, "民居计数 " + JSON.stringify(v.facts.forms));
+  const plan = { name: "过河", site: { size_m: [140, 140], ground: "flat" }, terrain: [{ id: "river", op: "river", from: "site.W", to: "site.E", width_m: 8, depth_m: 2 }], nodes: [{ id: "keep", type: "tower", role: "landmark", at: "site.N", size_m: [6, 12] }], spawn: { at: "site.S", look_at: "keep" } };
+  const r = compilePlan(plan, { seed: 1 });
+  assert(r.facts.bridges.length >= 1 && r.facts.bridges.every((b) => b.at.length === 2 && b.dir.length === 2), "路过河 = 桥：" + JSON.stringify(r.facts.bridges));
+  const sf = v.facts.spaces;
+  assert(!Array.isArray(sf) && sf.total === 0 && Array.isArray(sf.items), "spaces 是 interior.spaceFacts 的对象");
+  assert(build(1, "mine-maze").facts.spaces.total === 1, "矿洞一个空间");
 });
 
 run();

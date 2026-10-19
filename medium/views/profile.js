@@ -1,8 +1,9 @@
 // views/profile.js — 剖面：沿主路或一条直线、带宽度（数据来自 engine/section.js 的 sampleSection）。
 // 画：地面线、台地平台段（可拖）、带内体块、全部地标（顶边可拖）、地下 / 空中空间的内部切面（每个内部层的通道段、房间、层间连接）、
-// 连接点、每层高把手。层号与俯视图统一：第 1 层 = 入口地面。纵向有夸张，标注一律写真实米数。
+// 连接点、每层高把手。v5：带内形体按真实高度画轮廓（锥 / 尖顶三角、穹顶半圆、拱两腿 + 弧、环两截管、浮岛倒三角），悬空的画在空中。
+// 层号与俯视图统一：第 1 层 = 入口地面。纵向有夸张，标注一律写真实米数。
 // 拖动只改 DOM，节流 120 ms 调 onDragLive（给 3D 预览）；松手才回调。纯函数，不 import app.js / ui.js，不调 AI。
-import { svgel, spawnOf, landmarkOf, SELECT_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth } from "./map.js";
+import { svgel, spawnOf, spawnY, landmarkOf, SELECT_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth, shapeOf, volDims, roofOf, volumeBase, elevOf, volumeType, volumeColor, paletteOf, archThickness, torusTube, volToWorld, isUpright } from "./map.js";
 import { sampleSection, projectToPath, SECTION_WIDTH } from "../engine/section.js";
 import { SPACE_LABEL, VIA_LABEL, STRATUM_LABEL, LAYOUT_LABEL, SKY_LAYOUT_LABEL, ROLE_LABEL, levelsOf, levelStep } from "../engine/interior.js";
 
@@ -56,8 +57,9 @@ export function renderProfile(ctx, opts = {}) {
 
   // 纵向范围：最深的空间底到最高的体块 / 空中空间顶；上方留 18% 给往上拖
   const hs = S.ground.map((g) => g.h);
+  const PV = profileVolumes(sid, T, S);
   let lo = Math.min(0, ...hs), hi = Math.max(layer, ...hs);
-  for (const v of S.volumes) hi = Math.max(hi, v.y1);
+  for (const v of PV) hi = Math.max(hi, v.top);
   for (const sp of S.spaces) { if (sp.stratum === "underground") lo = Math.min(lo, sp.floor_y); else hi = Math.max(hi, envTop(sp)); }
   for (const c of S.connectors) { lo = Math.min(lo, c.bottom_y); hi = Math.max(hi, c.top_y); }
   hi += (hi - lo) * 0.18; if (lo < 0) lo -= 1.5;
@@ -104,13 +106,28 @@ export function renderProfile(ctx, opts = {}) {
     s.append(svgel("circle", { cx: fmt1(sx(p.d)), cy: fmt1(sy(g.h)), r: 1.6, fill: p.kind === "river" ? "#4f86c6" : "#8b7d5b", stroke: "#fff", "stroke-width": 0.4 }, svgel("title", {}, p.kind === "river" ? "溪" : "路")));
   }
 
-  // 带内体块（房子 / 树）；地标单独画
-  for (const v of S.volumes) {
+  // 带内体块（房子 / 树 / 形体）：按形体画轮廓、按真实高度；悬空的画在空中（虚线吊到地面 + 「↑18 m」）。地标单独画
+  const pal = paletteOf(sid), elevSeen = new Set(); // 「↑N m」每组一个（同一模板的实例算一组）
+  for (const v of PV) {
     if (v.importance === "landmark") continue;
-    const x0 = sx(v.d0), x1 = Math.max(x0 + 1, sx(v.d1)), tree = v.kind === "prop";
-    const g = grp(tree ? "tree" : "house", v.id);
-    g.append(svgel(tree ? "ellipse" : "rect", Object.assign(tree ? { cx: (x0 + x1) / 2, cy: (sy(v.y0) + sy(v.y1)) / 2, rx: (x1 - x0) / 2, ry: Math.max(0.8, (sy(v.y0) - sy(v.y1)) / 2), fill: "#7d9a5f", opacity: 0.55 } : { x: x0, y: sy(v.y1), width: x1 - x0, height: Math.max(1, sy(v.y0) - sy(v.y1)), fill: "#d9c9a3", stroke: "#8a7a5a", "stroke-width": 0.4, opacity: 0.85 }, { "data-vis": 1 })));
-    if (!tree) clickSelect(g, () => ({ type: "house", sid_id: v.id, plan_id: planOf.get(v.id) }));
+    const x0 = sx(v.d0), x1 = Math.max(x0 + 1, sx(v.d1)), legacyTree = v.kind === "prop" && !(v.v && v.v.plan_id), tree = legacyTree || v.kind === "tree";
+    const type = legacyTree ? "tree" : v.v ? volumeType(v.v) : "house";
+    const g = grp(type, v.id, { "data-shape": v.sh, "data-elev": v.elev > 0.5 ? fmt1(v.elev) : null });
+    if (legacyTree && v.sh === "box") g.append(svgel("ellipse", { cx: (x0 + x1) / 2, cy: (sy(v.y0) + sy(v.y1)) / 2, rx: (x1 - x0) / 2, ry: Math.max(0.8, (sy(v.y0) - sy(v.y1)) / 2), fill: "#7d9a5f", opacity: 0.55, "data-vis": 1 }));
+    else {
+      const o = volumeOutline(v, x0, x1, sy, v.y0, v.y1, v.roof ? v.roof.h : 0);
+      const fill = tree ? "#7d9a5f" : v.kind === "building" || v.kind === "tower" || !v.v ? "#d9c9a3" : volumeColor(v.v, pal, "side");
+      g.append(svgel("path", { d: o.body, fill, stroke: tree ? "none" : "#6f6250", "stroke-width": 0.4, "fill-rule": "evenodd", opacity: tree ? 0.6 : 0.85, "stroke-dasharray": v.elev > 0.5 ? "1.5 1" : null, "data-vis": 1, class: "vol-body" }));
+      if (o.roof) g.append(svgel("path", { d: o.roof, fill: "#8a5a4a", stroke: "#4a3a2a", "stroke-width": 0.4, opacity: 0.85, class: "vol-roof", "data-vis": 1 }));
+      if (o.extra) g.append(svgel("path", { d: o.extra, fill: "none", stroke: "#7d9a5f", "stroke-width": 1.2, "pointer-events": "none" }));
+    }
+    if (v.elev > 0.5) {
+      const gd = nearestGround(S.ground, (v.d0 + v.d1) / 2), xm = (x0 + x1) / 2;
+      if (gd) g.append(svgel("line", { x1: xm, x2: xm, y1: sy(gd.h), y2: sy(v.y0), stroke: "#2a6aa6", "stroke-width": 0.4, "stroke-dasharray": "1.2 1", "pointer-events": "none", class: "elev-line" }));
+      const ek = String((v.v && (v.v.instance_of || v.v.plan_id)) || v.id).replace(/\[\d+\]/g, "");
+      if (!elevSeen.has(ek)) { elevSeen.add(ek); g.append(svgel("text", { x: x1 + 1.5, y: sy(v.y0) + 2, "font-size": 4.5, fill: "#2a6aa6", "pointer-events": "none", class: "elev-label" }, `↑${Math.round(v.elev)} m`)); }
+    }
+    if (!legacyTree) clickSelect(g, () => ({ type, sid_id: v.id, plan_id: planOf.get(v.id) }));
     s.append(g);
   }
 
@@ -216,7 +233,7 @@ export function renderProfile(ctx, opts = {}) {
   if (sp0 && S.path && S.path.length > 1) {
     const pr = projectToPath(S.path, [sp0.position[0], sp0.position[2]]);
     if (pr.off <= S.width_m / 2 + 2) {
-      const g = nearestGround(S.ground, pr.d), h = g ? g.h : 0, x0 = sx(pr.d), y0 = sy(h), yh = sy(h + 1.7);
+      const g = nearestGround(S.ground, pr.d), h = Math.max(g ? g.h : 0, spawnY(sp0, T)), x0 = sx(pr.d), y0 = sy(h), yh = sy(h + 1.7);
       eye = { x: x0, y: yh };
       s.append(svgel("line", { x1: x0, x2: x0, y1: y0, y2: yh + 2, stroke: "#1f6feb", "stroke-width": 1.4 }), svgel("circle", { cx: x0, cy: yh + 1, r: 1.6, fill: "#1f6feb" }));
       s.append(svgel("text", { x: x0 + 3, y: yh - 1, "font-size": 5.5, fill: "#1f6feb" }, "出生点"));
@@ -225,27 +242,28 @@ export function renderProfile(ctx, opts = {}) {
 
   // 地标（全部）：顶边上下拖 = 这个地标的高度；入口到主地标画视线
   const focus = landmarkOf(sid);
-  for (const lmv of S.volumes.filter((v) => v.importance === "landmark")) {
-    const x0 = sx(lmv.d0), x1 = Math.max(x0 + 5, sx(lmv.d1)), h0 = lmv.y1 - lmv.y0, pid = planOf.get(lmv.id) || lmv.id;
-    const g = grp("landmark", lmv.id);
-    const body = svgel("rect", { x: x0, y: sy(lmv.y1), width: x1 - x0, height: Math.max(2, sy(lmv.y0) - sy(lmv.y1)), fill: "#b8452b", stroke: "#4a1a10", "stroke-width": 0.5, "data-vis": 1 });
-    const lab = svgel("text", { x: (x0 + x1) / 2, y: sy(lmv.y1) - 3, "font-size": 5.5, "text-anchor": "middle", fill: "#4a1a10", stroke: "#fff", "stroke-width": 1.2, "paint-order": "stroke" }, `${lmv.label || "地标"} ${fmt1(h0)} m`);
-    const top = svgel("rect", { x: x0 - 1, y: sy(lmv.y1) - 2.5, width: x1 - x0 + 2, height: 5, fill: "transparent", class: "h-landmark", "data-id": lmv.id, style: opts.onLandmarkHeight ? "cursor:ns-resize" : null }, svgel("title", {}, `${lmv.label || "地标"} 顶边（上下拖改高度）`));
+  for (const lmv of PV.filter((v) => v.importance === "landmark")) {
+    const x0 = sx(lmv.d0), x1 = Math.max(x0 + 5, sx(lmv.d1)), h0 = lmv.y1 - lmv.y0, rh = lmv.roof ? lmv.roof.h : 0, pid = planOf.get(lmv.id) || lmv.id;
+    const g = grp("landmark", lmv.id, { "data-shape": lmv.sh, "data-elev": lmv.elev > 0.5 ? fmt1(lmv.elev) : null });
+    const shapeD = (h) => { const o = volumeOutline(lmv, x0, x1, sy, lmv.y0, lmv.y0 + h, rh); return o.body + (o.roof || ""); };
+    const body = svgel("path", { d: shapeD(h0), fill: "#b8452b", stroke: "#4a1a10", "stroke-width": 0.5, "fill-rule": "evenodd", "stroke-dasharray": lmv.elev > 0.5 ? "1.5 1" : null, "data-vis": 1, class: "vol-body" });
+    const lab = svgel("text", { x: (x0 + x1) / 2, y: sy(lmv.y1 + rh) - 3, "font-size": 5.5, "text-anchor": "middle", fill: "#4a1a10", stroke: "#fff", "stroke-width": 1.2, "paint-order": "stroke" }, `${lmv.label || "地标"} ${fmt1(h0 + rh)} m`);
+    const top = svgel("rect", { x: x0 - 1, y: sy(lmv.y1 + rh) - 2.5, width: x1 - x0 + 2, height: 5, fill: "transparent", class: "h-landmark", "data-id": lmv.id, style: opts.onLandmarkHeight ? "cursor:ns-resize" : null }, svgel("title", {}, `${lmv.label || "地标"} 顶边（上下拖改高度）`));
     let sight = null;
-    if (eye && focus && focus.id === lmv.id) { sight = svgel("line", { x1: eye.x, y1: eye.y, x2: (x0 + x1) / 2, y2: sy(lmv.y1), stroke: "#1f6feb", "stroke-width": 0.5, "stroke-dasharray": "1.5 1.5", opacity: 0.8, "pointer-events": "none" }); s.append(sight); }
+    if (eye && focus && focus.id === lmv.id) { sight = svgel("line", { x1: eye.x, y1: eye.y, x2: (x0 + x1) / 2, y2: sy(lmv.y1 + rh), stroke: "#1f6feb", "stroke-width": 0.5, "stroke-dasharray": "1.5 1.5", opacity: 0.8, "pointer-events": "none" }); s.append(sight); }
     g.append(body, lab, top); s.append(g);
     const target = () => ({ type: "landmark", plan_id: pid, sid_id: lmv.id });
     clickSelect(body, target);
     if (typeof opts.onLandmarkHeight === "function") drag(top, {
       move: (dy) => {
-        const h = clampN(snap(h0 - dy / pxPerM), 1, 60), ty = sy(lmv.y0 + h);
-        body.setAttribute("y", ty); body.setAttribute("height", Math.max(2, sy(lmv.y0) - ty)); top.setAttribute("y", ty - 2.5); lab.setAttribute("y", ty - 3); lab.textContent = `${lmv.label || "地标"} ${h} m`;
+        const h = clampN(snap(h0 - dy / pxPerM), 1, 60), ty = sy(lmv.y0 + h + rh);
+        body.setAttribute("d", shapeD(h)); top.setAttribute("y", ty - 2.5); lab.setAttribute("y", ty - 3); lab.textContent = `${lmv.label || "地标"} ${fmt1(h + rh)} m`;
         if (sight) sight.setAttribute("y2", ty);
-        return { h, text: `${lmv.label || "地标"}高 ${h} m` };
+        return { h, text: `${lmv.label || "地标"}高 ${fmt1(h + rh)} m` };
       },
-      live: (r) => ({ kind: "landmark", id: lmv.id, value: r.h }),
+      live: (r) => ({ kind: "landmark", id: lmv.id, value: fmt1(r.h + rh) }),
       click: select ? () => select(target()) : null,
-      end: (r) => { if (r.h !== h0) opts.onLandmarkHeight(r.h, pid, lmv.id); },
+      end: (r) => { if (r.h !== h0) opts.onLandmarkHeight(fmt1(r.h + rh), pid, lmv.id); }, // 报总高（SID size[1] 含屋顶）
     });
   }
 
@@ -282,7 +300,7 @@ export function renderProfile(ctx, opts = {}) {
   const f = (ctx.facts && ctx.facts.trail) || {};
   const climb = mode === "trail" && f.climb_m != null ? f.climb_m : hs.length ? Math.max(...hs) - Math.min(...hs) : 0;
   const interior = S.spaces.reduce((a, x) => a + (x.passages || []).length + (x.rooms || []).length, 0);
-  const stats = { mode, width_m: S.width_m, length_m: Math.round(total), climb_m: Math.round(climb), max_slope: mode === "trail" ? f.max_slope : undefined, steps: mode === "trail" ? f.steps_estimate : undefined, folds: mode === "trail" ? f.folds : undefined, spaces: S.spaces.length, interior_parts: interior, connectors: S.connectors.length, landmarks: S.volumes.filter((v) => v.importance === "landmark").length };
+  const stats = { mode, width_m: S.width_m, length_m: Math.round(total), climb_m: Math.round(climb), max_slope: mode === "trail" ? f.max_slope : undefined, steps: mode === "trail" ? f.steps_estimate : undefined, folds: mode === "trail" ? f.folds : undefined, spaces: S.spaces.length, interior_parts: interior, connectors: S.connectors.length, landmarks: S.volumes.filter((v) => v.importance === "landmark").length, shapes: PV.length };
   const cap = document.createElement("div");
   cap.className = "caption";
   if (mode === "trail") {
@@ -304,6 +322,63 @@ export function renderProfile(ctx, opts = {}) {
 }
 
 /** 粗估文字宽（SVG 单位）：中文 ≈ 1 个字号，其它 ≈ 0.55 个字号 */
+// ------------------------------------------------------------ 形体轮廓（v5）
+/**
+ * 剖面带内体块 + 真实形体信息：{...sampleSection 的体块, v, sh, roof, elev, y0 底, y1 墙顶, top 最高点}。
+ * 底：悬空的按 volumeBase（地面 + elev），其余沿用 sampleSection（不低于中心地面）。
+ */
+export function profileVolumes(sid, T, S) {
+  const byId = new Map((sid.volumes || []).filter((v) => v && Array.isArray(v.position)).map((v) => [v.id, v]));
+  return S.volumes.map((sv) => {
+    const v = byId.get(sv.id);
+    if (!v) return Object.assign({}, sv, { v: null, sh: "box", roof: null, elev: 0, top: sv.y1 });
+    const e = elevOf(v), y0 = e > 0 ? volumeBase(v, T) : sv.y0, h = volDims(v)[1], roof = roofOf(v);
+    let hiRight = true;
+    if (shapeOf(v) === "wedge") { const [, , d] = volDims(v); hiRight = projectToPath(S.path, volToWorld(v, 0, -d / 2)).d >= projectToPath(S.path, volToWorld(v, 0, d / 2)).d; }
+    return Object.assign({}, sv, { v, sh: shapeOf(v), roof, elev: e, y0, y1: y0 + h, top: y0 + h + (roof ? roof.h : 0), plan_id: v.plan_id || null, hiRight });
+  });
+}
+/**
+ * 一个体块在剖面上的轮廓（屏幕坐标 path d）：x0..x1 横向，sy 把米换成屏幕 y；y0 底、y1 墙顶（米），rh 屋顶高。
+ * box / cylinder / prism 矩形；cone / pyramid 三角；dome 半椭圆；sphere 椭圆；wedge 直角三角（高边朝剖面上它真实的那一侧）；
+ * arch 两腿 + 拱弧；torus 两截管（立起来的 = 一个圈）；空心圆柱（剖面带 segs）= 带子上的几段壁；island 倒三角（顶面另给草线 extra）。屋顶：gable / hip 三角、spire 尖三角、dome 半椭圆、flat 薄板。
+ * @returns {{body: string, roof: string|null, extra: string|null}}
+ */
+export function volumeOutline(pv, x0, x1, sy, y0, y1, rh = 0) {
+  const f = (n) => fmt1(n), yb = sy(y0), yw = sy(y1), xm = (x0 + x1) / 2, hw = (x1 - x0) / 2, sh = pv.sh || "box";
+  const rect = (a, b, t, bt) => `M${f(a)} ${f(bt)}L${f(b)} ${f(bt)}L${f(b)} ${f(t)}L${f(a)} ${f(t)}Z`;
+  const halfEll = (a, b, base, top) => `M${f(a)} ${f(base)}A${f((b - a) / 2)} ${f(Math.max(0.5, base - top))} 0 0 1 ${f(b)} ${f(base)}Z`;
+  let body, extra = null;
+  if (pv.kind === "island") { body = `M${f(x0)} ${f(yw)}L${f(x1)} ${f(yw)}L${f(xm + hw * 0.15)} ${f(yb)}L${f(xm - hw * 0.15)} ${f(yb)}Z`; extra = `M${f(x0)} ${f(yw)}L${f(x1)} ${f(yw)}`; }
+  else if (sh === "cone" || sh === "pyramid") body = `M${f(x0)} ${f(yb)}L${f(xm)} ${f(yw)}L${f(x1)} ${f(yb)}Z`;
+  else if (sh === "dome") body = halfEll(x0, x1, yb, yw);
+  else if (sh === "sphere") { const ry = Math.max(0.5, (yb - yw) / 2), cy = (yb + yw) / 2; body = `M${f(x0)} ${f(cy)}A${f(hw)} ${f(ry)} 0 1 0 ${f(x1)} ${f(cy)}A${f(hw)} ${f(ry)} 0 1 0 ${f(x0)} ${f(cy)}Z`; }
+  else if (sh === "wedge") body = pv.hiRight === false ? `M${f(x0)} ${f(yb)}L${f(x1)} ${f(yb)}L${f(x0)} ${f(yw)}Z` : `M${f(x0)} ${f(yb)}L${f(x1)} ${f(yb)}L${f(x1)} ${f(yw)}Z`;
+  else if (sh === "torus" && pv.v && isUpright(pv.v)) { // 立起来的环：外圈 + 内圈（侧着看只剩一道竖的椭圆）
+    const [w, hh] = volDims(pv.v), t = torusTube(pv.v), ry = Math.max(0.5, (yb - yw) / 2), cy = (yb + yw) / 2, tx = ((x1 - x0) * t) / w, ty = (2 * ry * t) / Math.max(0.1, hh);
+    const ell = (rx, r2y) => `M${f(xm - rx)} ${f(cy)}A${f(rx)} ${f(r2y)} 0 1 0 ${f(xm + rx)} ${f(cy)}A${f(rx)} ${f(r2y)} 0 1 0 ${f(xm - rx)} ${f(cy)}Z`;
+    body = ell(Math.max(0.4, hw), ry) + (hw - tx > 0.4 && ry - ty > 0.4 ? ell(hw - tx, ry - ty) : "");
+  } else if (sh === "torus" && pv.v) {
+    const [w] = volDims(pv.v), tw = Math.max(0.8, ((x1 - x0) * torusTube(pv.v)) / w) / 2, ry = Math.max(0.5, (yb - yw) / 2), cy = (yb + yw) / 2;
+    body = [x0 + tw, x1 - tw].map((cx) => `M${f(cx - tw)} ${f(cy)}A${f(tw)} ${f(ry)} 0 1 0 ${f(cx + tw)} ${f(cy)}A${f(tw)} ${f(ry)} 0 1 0 ${f(cx - tw)} ${f(cy)}Z`).join("");
+  } else if (Array.isArray(pv.segs) && pv.segs.length && pv.d1 > pv.d0) { // 空心圆柱 / 环带：剖切线在带子上的几段（穿过内孔 = 两段壁，中间是空的）
+    const k = (x1 - x0) / (pv.d1 - pv.d0);
+    body = pv.segs.map(([a, b]) => { const xa = x0 + (a - pv.d0) * k, xb = Math.max(xa + 0.6, x0 + (b - pv.d0) * k); return rect(xa, xb, yw, yb); }).join("");
+  } else if (sh === "arch" && pv.v) {
+    const [w] = volDims(pv.v), tpx = Math.max(0.8, ((x1 - x0) * archThickness(pv.v)) / w), mpx = (yb - yw) / Math.max(0.1, y1 - y0);
+    const ryo = Math.min(yb - yw, (w / 2) * mpx), yc = yw + ryo, ri = Math.max(0.3, hw - tpx), ryi = Math.max(0.3, ryo * (ri / hw));
+    body = `M${f(x0)} ${f(yb)}L${f(x0)} ${f(yc)}A${f(hw)} ${f(ryo)} 0 0 1 ${f(x1)} ${f(yc)}L${f(x1)} ${f(yb)}L${f(x1 - tpx)} ${f(yb)}L${f(x1 - tpx)} ${f(yc)}A${f(ri)} ${f(ryi)} 0 0 0 ${f(x0 + tpx)} ${f(yc)}L${f(x0 + tpx)} ${f(yb)}Z`;
+  } else body = rect(x0, x1, yw, yb);
+  let roof = null;
+  if (pv.roof && rh > 0.05) {
+    const yt = sy(y1 + rh), o = Math.min(1.2, hw * 0.08), t = pv.roof.type;
+    if (t === "dome") roof = halfEll(x0, x1, yw, yt);
+    else if (t === "spire") roof = `M${f(xm - hw * 0.8)} ${f(yw)}L${f(xm)} ${f(yt)}L${f(xm + hw * 0.8)} ${f(yw)}Z`;
+    else if (t === "flat") roof = rect(x0 - o, x1 + o, yt, yw);
+    else roof = `M${f(x0 - o)} ${f(yw)}L${f(xm)} ${f(yt)}L${f(x1 + o)} ${f(yw)}Z`;
+  }
+  return { body, roof, extra };
+}
 function textWidth(t, size) { let w = 0; for (const ch of t) w += ch.charCodeAt(0) > 0x2e80 ? size : size * 0.55; return w; }
 function nearestGround(ground, d) { let best = null; for (const g of ground) if (!best || Math.abs(g.d - d) < Math.abs(best.d - d)) best = g; return best; }
 

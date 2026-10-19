@@ -6,7 +6,7 @@ import { polygonCentroid, pointInPolygon } from "./terrain.js";
 export const ID_RE = /^[a-z][a-z0-9_]*$/;
 export const COLLS = ["volumes", "regions", "paths", "markers", "spaces", "features"];
 const DEG = Math.PI / 180;
-const FEATURE_KINDS = ["hill", "pit", "ridge", "cliff", "plateau", "valley", "basin"];
+const FEATURE_KINDS = ["hill", "pit", "ridge", "cliff", "plateau", "valley", "basin", "raise", "lower", "flatten", "terrace", "ramp", "carve", "lake", "river", "dune", "noise"];
 const SPACE_KINDS = { underground: ["cave", "tunnel", "cellar", "crypt", "mine", "maze", "chamber", "halls", "rooms"], sky: ["platform", "walkway", "island", "bridge", "chamber", "network", "rooms"] };
 const VIAS = ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"];
 
@@ -120,10 +120,11 @@ export function validate(sid, T) {
   // 地形特征：有 polygon 的台地只要多边形合法；没有 polygon 的必须有 center / radius
   for (const f of collArray(sid, "features")) {
     if (f.kind && !FEATURE_KINDS.includes(f.kind)) push("warn", f.id, `${f.id} 的 kind「${f.kind}」不在 ${FEATURE_KINDS.join("/")}`);
-    if (Array.isArray(f.polygon)) {
+    if (f.op && (f.mask === "all" || Array.isArray(f.line))) { if (Array.isArray(f.line) && f.line.length < 2) push("error", f.id, `${f.id} 的 line 少于 2 个点`); }
+    else if (Array.isArray(f.polygon)) {
       if (f.polygon.length < 3) push("error", f.id, `${f.id} 的 polygon 少于 3 个点`);
-      if (f.polygon.length > 32) push("warn", f.id, `${f.id} 的 polygon 有 ${f.polygon.length} 个点（建议 ≤ 32）`);
-      for (const [x, z] of f.polygon) if (!inside(x, z)) { push("warn", f.id, `${f.id} 的 polygon 超出 bounds`); break; }
+      if (f.polygon.length > 32 && !f.op) push("warn", f.id, `${f.id} 的 polygon 有 ${f.polygon.length} 个点（建议 ≤ 32）`);
+      if (!f.op) for (const [x, z] of f.polygon) if (!inside(x, z)) { push("warn", f.id, `${f.id} 的 polygon 超出 bounds`); break; } // 雕刻遮罩可以伸出场地
     } else {
       if (!isVec3(f.center)) push("error", f.id, `${f.id} 没有 polygon，必须给 center [x, y, z]`);
       else if (!inside(f.center[0], f.center[2])) push("warn", f.id, `${f.id} 的 center 超出 bounds`);
@@ -139,7 +140,7 @@ export function validate(sid, T) {
     if (v.size.some((s) => !(s > 0))) push("error", v.id, `${v.id} 的尺寸必须大于 0`);
     if (v.kind === "building" && v.size[1] < 2.5) push("warn", v.id, `${v.id} 是建筑但高度只有 ${v.size[1]} m（玩家 1.8 m）`);
     if (v.color_role && !palette.some((p) => p.role === v.color_role)) push("warn", v.id, `${v.id} 的 color_role「${v.color_role}」不在调色板里`);
-    if (T && v.kind === "building" && v.form !== "stilt_house" && v.form !== "bridge" && !v.rests_on) { // 吊脚楼底面取上坡角、桥跨谷：不按贴地 / 跨台地查
+    if (T && v.kind === "building" && v.form !== "stilt_house" && v.form !== "bridge" && !v.rests_on && !v.land) { // plan v2 的形体（带 land）按自己的落地规则，不在这里查 // 吊脚楼底面取上坡角、桥跨谷：不按贴地 / 跨台地查
       const ground = T.heightAt(v.position[0], v.position[2]);
       if (Math.abs(v.position[1] - ground) > 1.5) push("warn", v.id, `${v.id} 未贴地：position.y=${v.position[1]}，地面 ${Math.round(ground * 10) / 10} m`);
       const levels = new Set(boxCorners(v.position, v.size, v.rotation_y || 0).map(([x, z]) => T.levelAt(x, z)));
@@ -181,12 +182,15 @@ export function validate(sid, T) {
   for (const k of Object.keys(sid.asset_hints || {})) if (!findObject(sid, k)) push("warn", null, `asset_hints 里的「${k}」不对应任何对象`);
 
   // 体块重叠（y 区间相交且俯视 OBB 相交）
-  const vols = (sid.volumes || []).filter((v) => isVec3(v.position) && isVec3(v.size)).map((v) => ({ v, poly: boxCorners(v.position, v.size, v.rotation_y || 0) }));
+  const vols = (sid.volumes || []).filter((v) => isVec3(v.position) && isVec3(v.size)).map((v) => { const poly = boxCorners(v.position, v.size, v.rotation_y || 0); let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity; for (const [x, z] of poly) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); } return { v, poly, bb: [x0, z0, x1, z1] }; });
   for (let i = 0; i < vols.length; i++) for (let j = i + 1; j < vols.length; j++) {
     const A = vols[i], B = vols[j];
+    if (A.bb[0] >= B.bb[2] || B.bb[0] >= A.bb[2] || A.bb[1] >= B.bb[3] || B.bb[1] >= A.bb[3]) continue;
     const ay = [A.v.position[1], A.v.position[1] + A.v.size[1]], by = [B.v.position[1], B.v.position[1] + B.v.size[1]];
     if (ay[1] <= by[0] + 1e-6 || by[1] <= ay[0] + 1e-6) continue;
     if (A.v.kind === "prop" && B.v.kind === "prop" && A.v.generated && B.v.generated) continue; // 林子里树冠挨着树冠是常态
+    if (A.v.land && B.v.land) continue; // plan v2 的两个形体之间：编译时已推开，推不开的由 program 的「形体不重叠」检查报
+    if (A.v.rests_on === B.v.id || B.v.rests_on === A.v.id || A.v.plinth_of === B.v.id || B.v.plinth_of === A.v.id) continue;
     if (obbOverlap(A.poly, B.poly)) push("warn", A.v.id, `${A.v.id} 与 ${B.v.id} 重叠`);
   }
   // 标记在体块里
@@ -200,7 +204,7 @@ export function validate(sid, T) {
       y = sp && sp.stratum === "underground" && Number.isFinite(m.top_y) ? m.top_y : y;
     }
     for (const { v, poly } of vols) {
-      if (y >= v.position[1] + v.size[1] || (m.kind === "connector" && y + 0.5 < v.position[1])) continue;
+      if (y >= v.position[1] + v.size[1] - 0.05 || (m.kind === "connector" && y + 0.5 < v.position[1]) || (m.kind !== "connector" && y + 1.7 <= v.position[1])) continue; // 在它下面（浮空的东西底下）不算
       if (pointInPolygon([m.position[0], m.position[2]], poly)) push("warn", m.id, `${m.id} 在 ${v.id} 内部`);
     }
   }

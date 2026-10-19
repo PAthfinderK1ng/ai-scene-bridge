@@ -1,4 +1,5 @@
 // terrain.js — 地形：特征 → 高度函数、台地、等高线、谷线（v3 的三种原型生成器已挪到 tests/fixtures.js，只给测试造样例）
+// plan v2（docs/06）：sid.terrain.sculpt = true 时特征按顺序雕刻（add / set / max / min / quant 合成 × 遮罩），平顶与台阶化的面登记成台地。
 // 约定见 SPEC.md 第 0–1 节。纯函数，确定性。
 
 export const DEFAULT_LAYER_M = 3;
@@ -103,6 +104,124 @@ export function heightFromFeatures(feats, base, x, z) {
   return base + pos + neg;
 }
 
+// ------------------------------------------------------------ 雕刻（plan v2 的地形操作，docs/06 §2.2）
+// sid.terrain.sculpt = true 时，features 按顺序作用在高度上（不再是「正取最大、负相加」）：
+//   每个带 op 的特征 = 遮罩（mask: poly / line / all，edge: slope|cliff|terraced|round，skirt 边坡宽）× 合成（blend）：
+//   add 相加（amount 或 wave 起伏）、set 覆盖（target 或 ramp 坡道）、max 抬到、min 压到、quant 台阶化（step / base）。
+//   不带 op 的旧特征（生成器的台地 plateau override 等）照旧：落在多边形里 = 它的高度，外面按坡裙取较大者。
+//   register: "top"（平顶 / 削平面）/ "quant"（台阶化的各级）→ 建好高度场后登记成台地（T.terraces，凸包多边形）。
+const smooth01 = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+function hash2(ix, iz, seed) { let h = (Math.imul(ix | 0, 374761393) + Math.imul(iz | 0, 668265263) + Math.imul(seed | 0, 2246822519)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+/** 种子化值噪声（0..1），双线性 + smoothstep */
+export function valueNoise(x, z, seed = 1) {
+  const ix = Math.floor(x), iz = Math.floor(z), fx = smooth01(x - ix), fz = smooth01(z - iz);
+  const a = hash2(ix, iz, seed), b = hash2(ix + 1, iz, seed), c = hash2(ix, iz + 1, seed), d = hash2(ix + 1, iz + 1, seed);
+  return (a * (1 - fx) + b * fx) * (1 - fz) + (c * (1 - fx) + d * fx) * fz;
+}
+/** 起伏函数（noise：±amp；dune：0..amp 的沙丘脊，沿 dir 排列） */
+function waveAt(w, x, z) {
+  const s = w.scale || 30;
+  if (w.kind === "dune") {
+    const d = w.dir || [1, 0], u = (x * d[0] + z * d[1]) / s, warp = valueNoise(x / (s * 1.3), z / (s * 1.3), w.seed) * 2.2;
+    const v = (Math.sin(2 * Math.PI * u + warp) + 1) / 2;
+    return w.amp * Math.pow(v, 1.6) * (0.75 + 0.5 * valueNoise(x / (s * 2.5), z / (s * 2.5), w.seed + 7));
+  }
+  const n = valueNoise(x / s, z / s, w.seed) * 0.7 + valueNoise((x * 2.1) / s, (z * 2.1) / s, w.seed + 11) * 0.3;
+  return w.amp * (n * 2 - 1);
+}
+const BBS = new WeakMap();
+/** 一个雕刻特征在 (x, z) 的遮罩权重 0..1 */
+export function maskWeight(f, x, z) {
+  if (f.mask === "all" || (!f.polygon && !f.line)) return 1;
+  let bb = BBS.get(f); if (!bb) { bb = sculptBBox(f); BBS.set(f, bb); }
+  if (x < bb[0] || x > bb[2] || z < bb[1] || z > bb[3]) return 0;
+  let inside, d;
+  if (f.line) { const dl = distToPolyline([x, z], f.line); inside = dl <= (f.half || 0); d = Math.abs(dl - (f.half || 0)); }
+  else {
+    inside = pointInPolygon([x, z], f.polygon) && !(f.hole && pointInPolygon([x, z], f.hole));
+    d = distToPolygon([x, z], f.polygon);
+    if (f.hole) d = Math.min(d, distToPolygon([x, z], f.hole));
+  }
+  const sk = Math.max(0.01, f.skirt || 0.01);
+  if (inside) return f.edge === "round" ? smooth01(d / sk) : 1;
+  if (f.edge === "round") return 0;
+  const t = 1 - d / sk;
+  if (t <= 0) return 0;
+  if (f.edge === "cliff") return t;
+  if (f.edge === "terraced") { const n = Math.max(1, f.steps || 3); return Math.floor(t * n + 1e-9) / n; }
+  return smooth01(t);
+}
+function sculptBBox(f) {
+  const pts = f.line || f.polygon, pad = (f.skirt || 0) + (f.half || 0) + 0.5;
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  for (const [x, z] of pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
+  return [x0 - pad, z0 - pad, x1 + pad, z1 + pad];
+}
+/** 一个特征作用在高度 h 上（雕刻模式） */
+export function applySculpt(f, h, x, z) {
+  if (!f.op) {
+    // 旧式特征：override 平顶（生成器的台地）落在多边形里就是它；外面 / 其它特征按贡献取大（负的相加）
+    if (f.override && f.polygon && pointInPolygon([x, z], f.polygon)) return f.height;
+    const c = featureContribution(f, x, z);
+    return c >= 0 ? Math.max(h, c) : h + c;
+  }
+  const w = maskWeight(f, x, z);
+  if (w <= 0) return h;
+  let tgt = f.target;
+  if (f.ramp) { const { a, b, ya, yb } = f.ramp, dx = b[0] - a[0], dz = b[1] - a[1], L2 = dx * dx + dz * dz || 1e-9; tgt = ya + (yb - ya) * clamp(((x - a[0]) * dx + (z - a[1]) * dz) / L2, 0, 1); }
+  switch (f.blend) {
+    case "add": return h + (f.wave ? waveAt(f.wave, x, z) : f.amount || 0) * w;
+    case "set": return h + (tgt - h) * w;
+    case "max": return Math.max(h, h + (tgt - h) * w);
+    case "min": return Math.min(h, h + (tgt - h) * w);
+    case "quant": { const st = f.step || 3, b0 = f.base || 0, q = b0 + Math.floor((h - b0) / st + 1e-6) * st; return h + (q - h) * w; }
+    default: return h;
+  }
+}
+/** 雕刻模式的高度：基准面 + 特征按顺序作用 */
+export function sculptHeight(feats, base, x, z) { let h = base; for (const f of feats) h = applySculpt(f, h, x, z); return h; }
+/** 平面点集的凸包（单调链），逆时针 */
+function hull(pts) {
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (p.length < 3) return p;
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const q of p) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+  for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], q) <= 0) up.pop(); up.push(q); }
+  return lo.slice(0, -1).concat(up.slice(0, -1));
+}
+/** 雕刻特征登记的台地：按格点取遮罩内的平顶 / 各级，每组取凸包（外扩半格，≤ 32 点） */
+function sculptTerraces(feats, grid, layer) {
+  const { xmin, zmin, res, nx, nz, h } = grid, out = [];
+  feats.forEach((f, order) => {
+    if (!f.op || !f.register) return;
+    const bb = f.mask === "all" || (!f.polygon && !f.line) ? [xmin, zmin, xmin + (nx - 1) * res, zmin + (nz - 1) * res] : sculptBBox(f);
+    const i0 = clamp(Math.floor((bb[0] - xmin) / res), 0, nx - 1), i1 = clamp(Math.ceil((bb[2] - xmin) / res), 0, nx - 1);
+    const j0 = clamp(Math.floor((bb[1] - zmin) / res), 0, nz - 1), j1 = clamp(Math.ceil((bb[3] - zmin) / res), 0, nz - 1);
+    const groups = new Map(), st = f.reg_step || layer, b0 = f.reg_base ?? 0;
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const x = xmin + i * res, z = zmin + j * res, w = maskWeight(f, x, z), hv = h[j * nx + i];
+      let key;
+      if (f.register === "top") { if (w < 0.999 || Math.abs(hv - f.target) > 0.35) continue; key = 0; }
+      else { if (w <= 0) continue; key = Math.round((hv - b0) / st); if (Math.abs(hv - (b0 + key * st)) > 0.35) continue; }
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push([x, z]);
+    }
+    for (const [key, pts] of [...groups.entries()].sort((a, b) => a[0] - b[0])) {
+      if (pts.length < 6) continue;
+      let poly = hull(pts);
+      if (poly.length < 3) continue;
+      const c = polygonCentroid(poly);
+      poly = poly.map(([x, z]) => { const dx = x - c[0], dz = z - c[1], L = Math.hypot(dx, dz) || 1, k = (L + res * 0.5) / L; return [r2(c[0] + dx * k), r2(c[1] + dz * k)]; });
+      if (poly.length > 32) { const step = poly.length / 32; poly = Array.from({ length: 32 }, (_, k) => poly[Math.floor(k * step)]); }
+      if (polygonArea(poly) < 40) continue;
+      const height = r2(f.register === "top" ? f.target : b0 + key * st);
+      out.push({ id: f.register === "top" ? f.id : `${f.id}_${key < 0 ? "m" + -key : key}`, level: Math.round(height / layer), height, polygon: poly, centroid: polygonCentroid(poly), feature: { id: f.id, override: false, sculpt: true }, order, plan_id: f.plan_id || null, sculpt: true });
+    }
+  });
+  return out;
+}
+
 // ------------------------------------------------------------ 地形对象
 export function buildTerrain(sid, opts = {}) {
   const b = sid.bounds || DEFAULT_BOUNDS;
@@ -110,18 +229,21 @@ export function buildTerrain(sid, opts = {}) {
   const res = opts.res || 2;
   const layer = Number(sid.meta && sid.meta.layer_height_m) || DEFAULT_LAYER_M;
   const base = (sid.terrain && sid.terrain.base_height) || 0;
-  const feats = ((sid.terrain && sid.terrain.features) || []).map((f) => normalizeFeature(f, layer));
+  const sculpt = !!(sid.terrain && sid.terrain.sculpt);
+  const feats = ((sid.terrain && sid.terrain.features) || []).map((f) => (sculpt && f.op ? Object.assign({}, f) : normalizeFeature(f, layer)));
   const nx = Math.ceil((xmax - xmin) / res) + 1, nz = Math.ceil((zmax - zmin) / res) + 1;
   const h = new Float32Array(nx * nz);
-  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) h[j * nx + i] = heightFromFeatures(feats, base, xmin + i * res, zmin + j * res);
+  const hf = sculpt ? sculptHeight : heightFromFeatures;
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) h[j * nx + i] = hf(feats, base, xmin + i * res, zmin + j * res);
 
-  const terraces = feats.map((f, order) => ({ f, order })).filter(({ f }) => (f.kind === "plateau" || f.kind === "ridge") && f.polygon && f.height >= 0)
-    .map(({ f, order }) => ({ id: f.id, level: typeof f.level === "number" ? f.level : Math.round((f.height - 0) / layer), height: f.height, polygon: f.polygon, centroid: polygonCentroid(f.polygon), feature: f, order, plan_id: f.plan_id || null }))
+  const legacy = feats.map((f, order) => ({ f, order })).filter(({ f }) => !f.op && (f.kind === "plateau" || f.kind === "ridge") && f.polygon && (sculpt || f.height >= 0))
+    .map(({ f, order }) => ({ id: f.id, level: typeof f.level === "number" ? f.level : Math.round((f.height - 0) / layer), height: f.height, polygon: f.polygon, centroid: polygonCentroid(f.polygon), feature: f, order, plan_id: f.plan_id || null }));
+  const terraces = legacy.concat(sculpt ? sculptTerraces(feats, { xmin, zmin, res, nx, nz, h }, layer) : [])
     .sort((a, b2) => a.height - b2.height || a.id.localeCompare(b2.id))
     .map((t, i) => Object.assign(t, { index: i }));
 
   const T = {
-    xmin, zmin, xmax, zmax, res, nx, nz, base, layer, features: feats, terraces,
+    xmin, zmin, xmax, zmax, res, nx, nz, base, layer, features: feats, terraces, sculpt,
     grid: { xmin, zmin, res, nx, nz, h },
     inside(x, z) { return x >= xmin && x <= xmax && z >= zmin && z <= zmax; },
     heightAt(x, z) {
@@ -218,3 +340,69 @@ function marchingSquares(T, iso) {
 // ------------------------------------------------------------ 台地带宽
 /** 环台 / 溪谷的台地带宽下限（米）：8 m 够放一排房，bounds 放不下时退到 7 m */
 export const MIN_BAND = 8, MIN_BAND_HARD = 7;
+
+// ------------------------------------------------------------ plan v2 的场地基础形态与河道（runProgram 用）
+const P2_ = (p) => [r2(p[0]), r2(p[1])];
+function ellipsePoly(c, rx, rz, deg = 0, n = 24) { const t0 = deg * Math.PI / 180, cs = Math.cos(t0), sn = Math.sin(t0), out = []; for (let k = 0; k < n; k++) { const t = (2 * Math.PI * k) / n, x = rx * Math.cos(t), z = rz * Math.sin(t); out.push(P2_([c[0] + cs * x + sn * z, c[1] - sn * x + cs * z])); } return out; }
+const GROUND_RELIEF = { flat: 0, rolling: 4, hills: 12, mountain: 28, canyon: 18, lake: 6, island: 6, coast: 5, desert: 3, cavern: 22, sky: 40 };
+/**
+ * 场地基础形态：返回特征（plan_id = "site"）、自动水面（海 / 湖）与是否「没有地面」。
+ * @returns {{feats: object[], waters: object[], voidGround: boolean, autoLake: object|null}}
+ */
+export function groundFeatures(site, seed, taken) {
+  const [W, D] = site.size_m, hw = W / 2, hd = D / 2, g = site.ground || "flat", R = site.relief_m ?? GROUND_RELIEF[g] ?? 0, m = Math.min(W, D);
+  const feats = [], waters = [];
+  const F = (id, o) => feats.push(Object.assign({ id, plan_id: "site", label: "基础地形", center: [0, 0, 0], radius: r2(Math.hypot(hw, hd)), height: 0 }, o));
+  const all = { mask: "all" };
+  const wave = (amp, scale, k) => ({ kind: "noise", amp, scale, seed: (131 + k) >>> 0 }); // 地形的起伏跟 plan 走，不跟布局种子走（换种子只换散布 / 布房）
+  let autoLake = null;
+  switch (g) {
+    case "rolling": F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(R, 60, 1), height: R }, all)); break;
+    case "hills": F("ground_hills", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(R, 48, 2), height: R }, all)); F("ground_bumps", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(R * 0.25, 16, 3), height: R * 0.25 }, all)); break;
+    case "mountain": F("ground_mountain", { kind: "raise", op: "raise", blend: "add", amount: R, mask: "poly", polygon: ellipsePoly([0, 0], m * 0.46, m * 0.46), edge: "round", skirt: m * 0.4, radius: m * 0.46, height: R }); F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(1.5, 26, 4), height: 1.5 }, all)); break;
+    case "canyon": F("ground_plateau", Object.assign({ kind: "raise", op: "raise", blend: "add", amount: R, height: R }, all)); F("ground_canyon", { kind: "carve", op: "carve", blend: "add", amount: -R, mask: "line", line: [[0, -hd - 4], [m * 0.04, -hd * 0.3], [-m * 0.04, hd * 0.3], [0, hd + 4]], half: m * 0.1, edge: "slope", skirt: 6, radius: hd, height: -R }); F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(1.2, 30, 5), height: 1.2 }, all)); break;
+    case "lake": {
+      const poly = ellipsePoly([0, 0], m * 0.34, m * 0.3);
+      const id = taken.has("lake") ? "ground_lake" : "lake";
+      F(id, { kind: "lake", op: "lake", blend: "min", target: -R, mask: "poly", polygon: poly, edge: "round", skirt: Math.min(m * 0.12, 14), radius: m * 0.34, height: -R });
+      waters.push({ id, polygon: poly, surface_y: -0.4, label: "湖" });
+      autoLake = { id, polygon: poly };
+      break;
+    }
+    case "island": {
+      F("ground_sea", Object.assign({ kind: "lower", op: "lower", blend: "add", amount: -R, height: -R }, all));
+      const land = ellipsePoly([0, 0], m * 0.3, m * 0.27);
+      F("ground_land", { kind: "raise", op: "raise", blend: "max", target: 2, mask: "poly", polygon: land, edge: "slope", skirt: 14, radius: m * 0.3, height: 2 });
+      F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(0.8, 24, 6), height: 0.8 }, all));
+      waters.push({ id: "sea", polygon: [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]], hole: ellipsePoly([0, 0], m * 0.3 + 5, m * 0.27 + 5), surface_y: 0, label: "海" });
+      break;
+    }
+    case "coast": {
+      F("ground_sea", Object.assign({ kind: "lower", op: "lower", blend: "add", amount: -R, height: -R }, all));
+      const z0 = hd * 0.15;
+      F("ground_land", { kind: "raise", op: "raise", blend: "max", target: 3, mask: "poly", polygon: [[-hw - 10, -hd - 10], [hw + 10, -hd - 10], [hw + 10, z0], [-hw - 10, z0]], edge: "slope", skirt: 18, radius: hw, height: 3 });
+      F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(0.8, 24, 7), height: 0.8 }, all));
+      waters.push({ id: "sea", polygon: [[-hw, z0 + 9], [hw, z0 + 9], [hw, hd], [-hw, hd]], surface_y: 0, label: "海" });
+      break;
+    }
+    case "desert": F("ground_dunes", Object.assign({ kind: "dune", op: "dune", blend: "add", wave: Object.assign(wave(R, 26, 8), { kind: "dune", dir: [0.8, 0.6] }), height: R }, all)); F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(1, 60, 9), height: 1 }, all)); break;
+    case "cavern": {
+      const outer = [[-hw - 6, -hd - 6], [hw + 6, -hd - 6], [hw + 6, hd + 6], [-hw - 6, hd + 6]], inner = ellipsePoly([0, 0], hw * 0.8, hd * 0.8, 0, 28);
+      F("ground_walls", { kind: "raise", op: "raise", blend: "max", target: R, mask: "poly", polygon: outer, hole: inner, edge: "cliff", skirt: 3, radius: hw, height: R });
+      F("ground_noise", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(1.2, 14, 10), height: 1.2 }, all));
+      break;
+    }
+    case "sky": F("ground_void", Object.assign({ kind: "lower", op: "lower", blend: "add", amount: -R, height: -R }, all)); F("ground_clouds", Object.assign({ kind: "noise", op: "noise", blend: "add", wave: wave(3, 50, 11), height: 3 }, all)); break;
+    default: break;
+  }
+  return { feats, waters, voidGround: g === "sky", autoLake };
+}
+
+
+/** 河：直线两端之间加种子化的蜿蜒 */
+export function meander(line, seed) {
+  const a = line[0], b = line[line.length - 1], L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, n = Math.max(4, Math.round(L / 18)), u = [(b[0] - a[0]) / L, (b[1] - a[1]) / L], nn = [-u[1], u[0]];
+  const rand = rng(seed >>> 0 || 1), ph = rand() * Math.PI * 2, amp = Math.min(14, L * 0.07), out = [];
+  for (let k = 0; k <= n; k++) { const t = k / n, off = amp * Math.sin(t * Math.PI * 2 + ph) * Math.sin(t * Math.PI); out.push(P2_([a[0] + (b[0] - a[0]) * t + nn[0] * off, a[1] + (b[1] - a[1]) * t + nn[1] * off])); }
+  return out;
+}

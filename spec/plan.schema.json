@@ -1,289 +1,255 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/PAthfinderK1ng/ai-scene-bridge/spec/plan.schema.json",
-  "title": "场景构成图（plan）v4",
-  "description": "AI 输出的场景构成图（docs/05 §2）。没有任何绝对坐标：位置全部用相对关系（at / place），尺寸用米。引擎（medium/engine/plan.js）把它编译成 SID。x-ui 是给界面生成旋钮的提示：label 中文名，kind number|enum|text|ref|refs|dir|bool|color|pair|triple，step / unit / min / max 给数字旋钮，options 给枚举的中文，ref 给引用可选的组，when 只在某些 type / form / layout 下显示，summary 出现在清单那一行的关键值里（short 是格式，{v} 为值），hidden 不出旋钮。x-groups 列出清单的分组；x-defaults 按 type / form 给默认值（plan.js 的 normalizePlan 与「＋ 加一个」都用它）。",
+  "title": "场景程序（plan）v2",
+  "description": "AI 写的场景程序（docs/06 §2）。AI 自己搭结构：形体组成组，组可以嵌套、重复，相对彼此定位；地形用雕刻操作组合。坐标规则：局部尺寸与偏移可以写（size_m / offset_m / rotate_deg / spacing_m / radius_m / path_m / polygon_m 都是米、都在父组的局部坐标里：x 东、z 南），全局摆放交给引擎：根节点只能用 at 锚点（site.N、hall.top、towers[2]…）。引擎（medium/engine/plan.js + program.js）负责落地 / 避让 / 路由 / 检查，同 plan + seed → 同结果。x-ui 给界面生成旋钮：label 中文名，kind number|enum|text|ref|refs|dir|bool|color|pair|triple|size|offset|anchor|node|nodes|tags|palette|rooms|links，step / unit / min / max 给数字，options 给枚举中文，when 只在某些 type / op / pattern / style / stratum 下显示，summary 出现在场景树那一行（short 是格式：{v} 值、{o} 枚举中文、{r} 引用名、{v0}{v1}{v2} 分量），hidden 不出旋钮。x-groups 列出右栏的分组；x-defaults 按 op / type 给默认值；x-node-classes 给「＋」菜单分类；x-size 给每种 type 的 size_m 各分量含义。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["name", "site", "terrain"],
+  "required": ["name", "site", "nodes"],
+  "x-version": 2,
   "x-groups": [
-    { "key": "terrain", "label": "地形", "def": "terrain", "min": 1, "max": 10, "type_field": "type" },
-    { "key": "zones", "label": "区域", "def": "zone", "min": 0, "max": 10, "type_field": "use" },
-    { "key": "buildings", "label": "建筑", "def": "building", "min": 0, "max": 6, "type_field": "form" },
-    { "key": "landmarks", "label": "地标", "def": "landmark", "min": 0, "max": 6, "type_field": "form" },
-    { "key": "paths", "label": "路", "def": "path", "min": 0, "max": 6, "type_field": "style" },
-    { "key": "water", "label": "水", "def": "water", "min": 0, "max": 3, "type_field": "type" },
-    { "key": "spaces", "label": "空间", "def": "space", "min": 0, "max": 4, "type_field": "layout" },
+    { "key": "terrain", "label": "地形", "def": "terrain_op", "min": 0, "max": 16, "type_field": "op" },
+    { "key": "nodes", "label": "场景", "def": "node", "min": 1, "max": 40, "type_field": "type", "tree": true },
     { "key": "relations", "label": "关系", "def": "relation", "min": 0, "max": 12, "type_field": "type" },
     { "key": "look", "label": "外观", "def": null, "min": 0, "max": 0, "fields": ["lighting", "palette", "mood"] }
   ],
+  "x-node-classes": [
+    { "key": "shape", "label": "形体", "types": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"] },
+    { "key": "part", "label": "建筑件", "types": ["building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water"] },
+    { "key": "compose", "label": "组合", "types": ["group", "repeat"] },
+    { "key": "link", "label": "连接", "types": ["link"] },
+    { "key": "generator", "label": "生成器", "types": ["terraces", "scatter_houses", "space", "grove", "field"] }
+  ],
+  "x-size": {
+    "box": ["宽", "高", "深"], "wedge": ["宽", "高", "深"], "pyramid": ["宽", "高", "深"], "arch": ["宽", "高", "厚"],
+    "cylinder": ["直径", "高", "南北直径"], "cone": ["直径", "高", "南北直径"], "dome": ["直径", "高", "南北直径"], "sphere": ["直径", "高", "南北直径"], "torus": ["直径", "管粗", "南北直径"], "prism": ["直径", "高", "南北直径"],
+    "building": ["宽", "高", "深"], "tower": ["直径", "高", "南北直径"], "wall": ["长", "高", "厚"], "courtyard": ["宽", "深"], "stairs": ["宽", "高", "长"], "platform": ["宽", "高", "深"], "column": ["直径", "高"], "gate": ["宽", "高", "厚"], "statue": ["宽", "高", "深"], "tree": ["冠径", "高"], "rock": ["宽", "高", "深"], "crystal": ["直径", "高"], "island": ["宽", "厚", "深"], "water": ["宽", "深"],
+    "terraces": ["长", "宽"], "scatter_houses": ["宽", "深"], "grove": ["宽", "深"], "field": ["宽", "深"], "space": ["宽", "深"], "group": [], "repeat": [], "link": []
+  },
   "x-defaults": {
     "terrain": {
-      "hill": { "label": "山", "size_m": [100, 90], "top_layer": 4 },
-      "ridge": { "label": "山脊", "size_m": [110, 34], "top_layer": 4, "orient": "E" },
-      "slope_terraces": { "label": "坡上台地", "size_m": [80, 80], "steps": 4, "from_layer": 1 },
-      "ring_terraces": { "label": "环台", "steps": 4, "from_layer": 1 },
-      "plateau": { "label": "平台", "size_m": [24, 20], "layer": 2 },
-      "cliff": { "label": "崖", "size_m": [50, 8], "layer": 4 },
-      "valley": { "label": "谷", "size_m": [150, 18], "depth_layers": 2, "orient": "N" },
-      "basin": { "label": "盆地", "size_m": [60, 50], "depth_layers": 1 },
-      "pit": { "label": "坑", "size_m": [14, 14], "depth_layers": 2 },
-      "island": { "label": "高台", "size_m": [30, 30], "layer": 3 }
+      "raise": { "label": "高地", "shape": "circle", "size_m": [60, 60], "height_m": 12, "edge": "slope" },
+      "lower": { "label": "洼地", "shape": "circle", "size_m": [40, 40], "depth_m": 4, "edge": "slope" },
+      "flatten": { "label": "平地", "shape": "circle", "size_m": [40, 40], "edge": "slope" },
+      "terrace": { "label": "台阶化", "shape": "circle", "size_m": [80, 80], "step_h_m": 3 },
+      "ramp": { "label": "坡道", "width_m": 8 },
+      "carve": { "label": "沟", "width_m": 10, "depth_m": 6, "edge": "slope" },
+      "lake": { "label": "湖", "shape": "ellipse", "size_m": [70, 50], "depth_m": 4 },
+      "river": { "label": "河", "width_m": 10, "depth_m": 3 },
+      "cliff": { "label": "崖", "shape": "rect", "size_m": [60, 20], "height_m": 16, "edge": "cliff" },
+      "dune": { "label": "沙丘", "amplitude_m": 3, "scale_m": 30 },
+      "noise": { "label": "起伏", "amplitude_m": 2, "scale_m": 40 }
     },
-    "buildings": {
-      "house": { "label": "民居", "size_m": [6, 4, 5], "floors": 1, "roof": "gable" },
-      "stilt_house": { "label": "吊脚楼", "size_m": [6, 7, 5], "floors": 2, "roof": "gable" },
-      "courtyard": { "label": "院落", "size_m": [16, 5, 16], "floors": 1, "roof": "gable" },
-      "round_house": { "label": "圆楼", "size_m": [18, 9, 18], "floors": 3, "roof": "round" },
-      "tower": { "label": "塔楼", "size_m": [6, 14, 6], "floors": 4, "roof": "pyramid" },
-      "hall": { "label": "大殿", "size_m": [12, 8, 9], "floors": 1, "roof": "hip" },
-      "pavilion": { "label": "亭", "size_m": [5, 5, 5], "floors": 1, "roof": "pyramid" },
-      "gate": { "label": "门楼", "size_m": [8, 7, 3], "floors": 1, "roof": "gable" },
-      "bridge": { "label": "桥", "size_m": [16, 5, 4], "floors": 1, "roof": "gable" },
-      "stage": { "label": "戏台", "size_m": [10, 6, 8], "floors": 1, "roof": "hip" },
-      "wall": { "label": "墙", "size_m": [20, 3, 1], "floors": 1, "roof": "none" },
-      "well": { "label": "井", "size_m": [2, 1, 2], "floors": 1, "roof": "none" },
-      "tree": { "label": "古树", "size_m": [7, 14, 7], "floors": 1, "roof": "none" },
-      "statue": { "label": "石像", "size_m": [3, 5, 3], "floors": 1, "roof": "none" },
-      "custom": { "label": "建筑", "size_m": [6, 5, 6], "floors": 1, "roof": "flat" }
+    "nodes": {
+      "box": { "label": "方块", "size_m": [6, 6, 6] },
+      "cylinder": { "label": "圆柱", "size_m": [6, 8] },
+      "cone": { "label": "圆锥", "size_m": [6, 8] },
+      "dome": { "label": "穹顶", "size_m": [10, 5] },
+      "pyramid": { "label": "金字塔", "size_m": [16, 10, 16] },
+      "wedge": { "label": "楔", "size_m": [6, 3, 6] },
+      "arch": { "label": "拱", "size_m": [8, 8, 2] },
+      "torus": { "label": "环", "size_m": [12, 2] },
+      "sphere": { "label": "球", "size_m": [6, 6] },
+      "prism": { "label": "棱柱", "size_m": [6, 8], "sides": 6 },
+      "building": { "label": "房子", "size_m": [12, 8, 10], "roof": "gable", "floors": 2 },
+      "tower": { "label": "塔", "size_m": [6, 20], "roof": "spire", "floors": 5 },
+      "wall": { "label": "墙", "size_m": [20, 4, 1] },
+      "courtyard": { "label": "院", "size_m": [24, 20], "wall_h_m": 4, "gate": "S" },
+      "stairs": { "label": "台阶", "size_m": [4, 3, 8] },
+      "platform": { "label": "平台", "size_m": [12, 1, 12] },
+      "column": { "label": "柱", "size_m": [1, 6] },
+      "gate": { "label": "门", "size_m": [6, 7, 2] },
+      "statue": { "label": "像", "size_m": [2, 5, 2] },
+      "tree": { "label": "树", "size_m": [5, 8] },
+      "rock": { "label": "岩", "size_m": [4, 3, 4] },
+      "crystal": { "label": "晶体", "size_m": [2, 6] },
+      "island": { "label": "浮岛", "size_m": [20, 8, 20], "elev_m": 20 },
+      "water": { "label": "水池", "size_m": [12, 8] },
+      "group": { "label": "组" },
+      "repeat": { "label": "重复", "pattern": "radial", "count": 6, "radius_m": 20 },
+      "link": { "label": "路", "style": "path" },
+      "terraces": { "label": "台地", "form": "slope", "size_m": [80, 80], "steps": 4 },
+      "scatter_houses": { "label": "民居", "size_m": [60, 60], "density": 1 },
+      "space": { "label": "地下室", "stratum": "underground", "layout": "chamber", "size_m": 20, "depth_m": 8 },
+      "grove": { "label": "树林", "size_m": [40, 40], "density": 1 },
+      "field": { "label": "田", "size_m": [40, 30] }
     },
-    "landmarks": {
-      "tower": { "label": "鼓楼", "size_m": [7, 14, 7], "floors": 5, "roof": "pyramid", "place": { "rel": "top_of", "target": "site" } },
-      "hall": { "label": "寺", "size_m": [10, 9, 9], "floors": 1, "roof": "hip", "place": { "rel": "top_of", "target": "site" } },
-      "gate": { "label": "寨门", "size_m": [8, 7, 3], "floors": 1, "roof": "gable", "place": { "rel": "at_entry", "target": "site" } },
-      "bridge": { "label": "风雨桥", "size_m": [18, 6, 5], "floors": 1, "roof": "gable", "place": { "rel": "center_of", "target": "site" } },
-      "stage": { "label": "戏台", "size_m": [10, 6, 8], "floors": 1, "roof": "hip", "place": { "rel": "center_of", "target": "site" } },
-      "pavilion": { "label": "亭", "size_m": [5, 5, 5], "floors": 1, "roof": "pyramid", "place": { "rel": "top_of", "target": "site" } },
-      "tree": { "label": "神木", "size_m": [7, 16, 7], "floors": 1, "roof": "none", "place": { "rel": "center_of", "target": "site" } },
-      "well": { "label": "古井", "size_m": [2.5, 1.2, 2.5], "floors": 1, "roof": "none", "place": { "rel": "center_of", "target": "site" } },
-      "statue": { "label": "石像", "size_m": [3, 6, 3], "floors": 1, "roof": "none", "place": { "rel": "center_of", "target": "site" } },
-      "round_house": { "label": "圆楼", "size_m": [20, 10, 20], "floors": 3, "roof": "round", "place": { "rel": "center_of", "target": "site" } },
-      "house": { "label": "大屋", "size_m": [8, 5, 6], "floors": 2, "roof": "gable", "place": { "rel": "center_of", "target": "site" } },
-      "stilt_house": { "label": "吊脚楼", "size_m": [7, 8, 6], "floors": 2, "roof": "gable", "place": { "rel": "edge_of", "target": "site" } },
-      "courtyard": { "label": "大院", "size_m": [18, 6, 18], "floors": 1, "roof": "gable", "place": { "rel": "center_of", "target": "site" } },
-      "wall": { "label": "寨墙", "size_m": [24, 4, 1.5], "floors": 1, "roof": "none", "place": { "rel": "edge_of", "target": "site" } },
-      "custom": { "label": "地标", "size_m": [6, 8, 6], "floors": 1, "roof": "flat", "place": { "rel": "center_of", "target": "site" } }
-    },
-    "zones": {
-      "housing": { "label": "民居", "density": 1 },
-      "market": { "label": "集市", "density": 0.9 },
-      "plaza": { "label": "广场", "density": 0 },
-      "farm": { "label": "田", "density": 0 },
-      "terrace_farm": { "label": "梯田", "density": 0 },
-      "forest": { "label": "林子", "density": 1 },
-      "temple": { "label": "寺院", "density": 0.35 },
-      "dock": { "label": "码头", "density": 0.5 },
-      "yard": { "label": "院子", "density": 0.6 },
-      "ruins": { "label": "废墟", "density": 0.5 },
-      "other": { "label": "区域", "density": 0.6 }
-    },
-    "paths": {
-      "winding": { "label": "山路", "width_m": 2 },
-      "stairs": { "label": "石阶", "width_m": 2.5 },
-      "zigzag": { "label": "之字路", "width_m": 2 },
-      "straight": { "label": "直路", "width_m": 3 },
-      "bridge": { "label": "桥路", "width_m": 3 },
-      "tunnel": { "label": "隧道", "width_m": 3 }
-    },
-    "water": {
-      "stream": { "label": "溪", "width_m": 4 },
-      "river": { "label": "河", "width_m": 9 },
-      "pond": { "label": "池塘", "size_m": [18, 14] }
-    },
-    "spaces": {
-      "chamber": { "label": "地下室", "size_m": 14 },
-      "corridor": { "label": "地道", "size_m": 30 },
-      "maze": { "label": "迷宫", "size_m": 40, "branching": "medium", "corridor_m": 2.5 },
-      "galleries": { "label": "矿道", "size_m": 44, "branching": "medium", "corridor_m": 3 },
-      "halls": { "label": "地宫", "size_m": 32 },
-      "network": { "label": "溶洞", "size_m": 40, "branching": "medium" },
-      "rooms": { "label": "房间", "size_m": 36 }
-    },
-    "relations": {
-      "visible_from": {}, "faces": {}, "adjacent": {}, "behind": {}, "above": {}, "below": {}, "between": {}, "far_from": {}
-    }
+    "relations": { "visible_from": {}, "reachable": {}, "adjacent": {}, "above": {}, "below": {}, "behind": {}, "between": {}, "far_from": {}, "faces": {} }
   },
   "properties": {
     "name": { "type": "string", "maxLength": 16, "x-ui": { "label": "名字", "kind": "text" } },
-    "one_liner": { "type": "string", "maxLength": 80, "x-ui": { "label": "一句话", "kind": "text" } },
+    "concept": { "type": "string", "maxLength": 120, "description": "一句话的空间概念（三张卡各不相同的那个想法）", "x-ui": { "label": "概念", "kind": "text" } },
+    "key_structures": { "type": "array", "maxItems": 6, "items": { "type": "string", "maxLength": 24 }, "description": "关键结构（构思阶段写的，最多 6 条）", "x-ui": { "label": "关键结构", "kind": "tags" } },
+    "one_liner": { "type": "string", "maxLength": 120, "description": "旧字段（v4），等同 concept", "x-ui": { "hidden": true } },
     "site": { "$ref": "#/definitions/site" },
-    "terrain": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/definitions/terrain" } },
-    "buildings": { "type": "array", "maxItems": 6, "items": { "$ref": "#/definitions/building" } },
-    "zones": { "type": "array", "maxItems": 10, "items": { "$ref": "#/definitions/zone" } },
-    "landmarks": { "type": "array", "maxItems": 6, "items": { "$ref": "#/definitions/landmark" } },
+    "terrain": { "type": "array", "maxItems": 16, "items": { "$ref": "#/definitions/terrain_op" } },
+    "nodes": { "type": "array", "minItems": 1, "maxItems": 40, "items": { "$ref": "#/definitions/node" } },
     "spawn": { "$ref": "#/definitions/spawn" },
-    "paths": { "type": "array", "maxItems": 6, "items": { "$ref": "#/definitions/path" } },
-    "water": { "type": "array", "maxItems": 3, "items": { "$ref": "#/definitions/water" } },
-    "spaces": { "type": "array", "maxItems": 4, "items": { "$ref": "#/definitions/space" } },
     "relations": { "type": "array", "maxItems": 12, "items": { "$ref": "#/definitions/relation" } },
     "palette": { "type": "array", "maxItems": 8, "items": { "$ref": "#/definitions/palette_entry" }, "x-ui": { "label": "色板", "kind": "palette" } },
     "lighting": { "$ref": "#/definitions/lighting" },
     "mood": { "type": "array", "maxItems": 6, "items": { "type": "string", "maxLength": 8 }, "x-ui": { "label": "气氛", "kind": "tags" } },
-    "locks": { "type": "array", "items": { "$ref": "#/definitions/id" }, "description": "人锁住的元素 id（换一批时不动）。只由界面写。", "x-ui": { "hidden": true } }
+    "locks": { "type": "array", "items": { "$ref": "#/definitions/id" }, "description": "人锁住的节点 id（换一批时不动）。只由界面写。", "x-ui": { "hidden": true } }
   },
   "definitions": {
-    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "AI 起的英文小写短名，供引用" },
-    "ref": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "引用：site / spawn / 任何元素 id" },
-    "label": { "type": "string", "minLength": 1, "maxLength": 12 },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "英文小写短名，被引用的才必须写" },
+    "ref": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}(\\[[0-9]{1,3}\\])?$", "description": "引用：site / spawn / 节点或地形操作的 id / 重复的第 k 个实例 id[k]" },
+    "anchor": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}(\\[([0-9]{1,3}|k)\\])?(\\.(top|bottom|center|C|N|NE|E|SE|S|SW|W|NW|inner|outer|start|mid|end|left|right))?$",
+      "description": "锚点（不是坐标）：site.<C|N|NE|E|SE|S|SW|W|NW>（场地中心 / 边）、<id>（它的中心）、<id>.<top|bottom|center|N|S|E|W|NE|…|inner|outer|start|mid|end|left|right>（沟 / 河 / 坡道这类线形地形：方位后缀 = 和该方位同侧的岸，left / right = 顺着 from → to 走的左 / 右岸）、<repeat id>[k]（第 k 个实例，从 0 数）、spawn。一组连接（repeat 的 child 是 link）里写 <repeat id> 或 <repeat id>[k]（字母 k）= 第 k 条连到那个重复的第 k 个实例，center = 这个重复的中心"
+    },
+    "label": { "type": "string", "minLength": 1, "maxLength": 16 },
     "dir": { "type": "string", "enum": ["C", "N", "NE", "E", "SE", "S", "SW", "W", "NW"] },
-    "size2": { "type": "array", "items": { "type": "number", "minimum": 4, "maximum": 240 }, "minItems": 2, "maxItems": 2 },
-    "size3": { "type": "array", "items": { "type": "number", "minimum": 0.5, "maximum": 80 }, "minItems": 3, "maxItems": 3 },
-    "nudge": { "type": "array", "items": { "type": "number", "minimum": -60, "maximum": 60 }, "minItems": 2, "maxItems": 2, "description": "人在图上拖过的微调 [dx, dz]（米）。AI 不写。" },
+    "offset": { "type": "array", "items": { "type": "number", "minimum": -500, "maximum": 500 }, "minItems": 2, "maxItems": 3, "description": "在父组局部坐标里的偏移 [dx, dz] 或 [dx, dy, dz]（米，x 东、z 南、y 上）" },
+    "pair": { "type": "array", "items": { "type": "number", "minimum": 0.5, "maximum": 600 }, "minItems": 2, "maxItems": 2 },
+    "local_pts": { "type": "array", "minItems": 2, "maxItems": 24, "items": { "type": "array", "items": { "type": "number", "minimum": -500, "maximum": 500 }, "minItems": 2, "maxItems": 2 }, "description": "局部折线 / 多边形 [[x, z], …]（米，相对 at 锚点，x 东、z 南）" },
 
     "site": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "size_m": { "type": "number", "minimum": 80, "maximum": 240, "default": 140, "x-ui": { "label": "场地边长", "kind": "number", "step": 10, "unit": "m", "summary": true, "short": "{v} m 见方" } },
-        "relief_layers": { "type": "integer", "minimum": 1, "maximum": 12, "default": 5, "x-ui": { "label": "总高差", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "高差 {v} 层" } },
-        "layer_m": { "type": "number", "minimum": 2, "maximum": 6, "default": 3, "x-ui": { "label": "每层高", "kind": "number", "step": 0.5, "unit": "m", "summary": true, "short": "每层 {v} m" } }
-      }
-    },
-
-    "at": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "相对位置：of 的中心 + dir 方向 × dist × of 在该方向的半径。不是坐标。",
-      "properties": {
-        "of": { "$ref": "#/definitions/ref", "default": "site", "x-ui": { "label": "相对于", "kind": "ref", "ref": ["site", "terrain"] } },
-        "dir": { "$ref": "#/definitions/dir", "default": "C", "x-ui": { "label": "方向", "kind": "dir", "options": { "C": "中", "N": "北", "NE": "东北", "E": "东", "SE": "东南", "S": "南", "SW": "西南", "W": "西", "NW": "西北" } } },
-        "dist": { "type": "number", "minimum": 0, "maximum": 1.5, "default": 0.5, "x-ui": { "label": "离中心", "kind": "number", "step": 0.05, "min": 0, "max": 1.5, "unit": "× 半径" } }
-      }
-    },
-
-    "terrain": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "type"],
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
-        "type": { "type": "string", "enum": ["hill", "ridge", "slope_terraces", "ring_terraces", "plateau", "cliff", "valley", "basin", "pit", "island"], "x-ui": { "label": "种类", "kind": "enum", "options": { "hill": "穹顶山", "ridge": "山脊", "slope_terraces": "坡上台地", "ring_terraces": "环台", "plateau": "平台", "cliff": "崖", "valley": "谷", "basin": "盆地", "pit": "坑", "island": "高台" } } },
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "at": { "$ref": "#/definitions/at", "x-ui": { "label": "位置" } },
-        "size_m": { "$ref": "#/definitions/size2", "description": "[长, 宽]（米）。谷 / 山脊 / 台地带：沿 orient 的长、横向的宽；崖 = [长, 厚]，厚夹在 4–12 m，前小后大时对调；平台 / 盆地 / 坑 / 高台没给 orient 时 = [东西, 南北]，若在别的块某一侧（at.dir 不是 C），长边顺着那一侧的边。", "x-ui": { "label": "尺寸", "kind": "pair", "step": 2, "unit": "m", "parts": ["长", "宽"], "ai_hint": "[长,宽]；崖=[长,厚] 厚4–12；平台/盆地没给orient=[东西,南北]，在别块某侧时长边顺着那条边", "when": { "type": ["hill", "ridge", "slope_terraces", "ring_terraces", "plateau", "cliff", "valley", "basin", "pit", "island"] } } },
-        "orient": { "$ref": "#/definitions/dir", "x-ui": { "label": "朝向", "kind": "dir", "hint": "台地带：上坡方向；山脊 / 谷 / 崖：长轴方向", "when": { "type": ["slope_terraces", "ridge", "valley", "cliff", "plateau", "hill"] }, "options": { "N": "北", "NE": "东北", "E": "东", "SE": "东南", "S": "南", "SW": "西南", "W": "西", "NW": "西北" } } },
-        "top_layer": { "type": "integer", "minimum": 1, "maximum": 12, "x-ui": { "label": "山顶高", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "顶 {v} 层", "when": { "type": ["hill", "ridge"] } } },
-        "layer": { "type": "integer", "minimum": 0, "maximum": 12, "x-ui": { "label": "所在层", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "第 {v} 层", "when": { "type": ["plateau", "cliff", "island"] } } },
-        "steps": { "type": "integer", "minimum": 2, "maximum": 10, "x-ui": { "label": "级数", "kind": "number", "step": 1, "unit": "级", "summary": true, "short": "{v} 级", "when": { "type": ["slope_terraces", "ring_terraces"] } } },
-        "from_layer": { "type": "integer", "minimum": 0, "maximum": 10, "x-ui": { "label": "起始层", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "从 {v} 层起", "when": { "type": ["slope_terraces", "ring_terraces"] } } },
-        "width_m": { "type": "number", "minimum": 5, "maximum": 30, "x-ui": { "label": "每级宽", "kind": "number", "step": 1, "unit": "m", "when": { "type": ["ring_terraces", "slope_terraces"] } } },
-        "inverse": { "type": "boolean", "x-ui": { "label": "内低外高", "kind": "bool", "when": { "type": ["ring_terraces"] } } },
-        "depth_layers": { "type": "integer", "minimum": 1, "maximum": 6, "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "深 {v} 层", "when": { "type": ["valley", "basin", "pit"] } } }
-      }
-    },
-
-    "building": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "form"],
-      "description": "建筑类型（不是一栋栋）：区域按它的 form 与尺寸生成房子",
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "form": { "$ref": "#/definitions/form", "x-ui": { "label": "形制", "kind": "enum", "summary": true, "short": "{o}" } },
-        "size_m": { "$ref": "#/definitions/size3", "x-ui": { "label": "尺寸", "kind": "triple", "step": 0.5, "unit": "m", "parts": ["宽", "高", "深"], "summary": true, "short": "{v0}×{v2} m" } },
-        "floors": { "type": "integer", "minimum": 1, "maximum": 9, "x-ui": { "label": "层数", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "{v} 层" } },
-        "roof": { "$ref": "#/definitions/roof", "x-ui": { "label": "屋顶", "kind": "enum" } }
-      }
-    },
-
-    "form": { "type": "string", "enum": ["house", "stilt_house", "courtyard", "round_house", "tower", "hall", "pavilion", "gate", "bridge", "stage", "wall", "well", "tree", "statue", "custom"], "x-ui": { "options": { "house": "民居", "stilt_house": "吊脚楼", "courtyard": "院落", "round_house": "圆楼", "tower": "塔楼", "hall": "殿堂", "pavilion": "亭", "gate": "门", "bridge": "桥", "stage": "戏台", "wall": "墙", "well": "井", "tree": "树", "statue": "像", "custom": "自定" } } },
-    "roof": { "type": "string", "enum": ["gable", "hip", "flat", "pyramid", "round", "none"], "x-ui": { "options": { "gable": "人字", "hip": "庑殿", "flat": "平顶", "pyramid": "攒尖", "round": "圆顶", "none": "无" } } },
-
-    "zone": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "use", "on"],
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "use": { "type": "string", "enum": ["housing", "market", "plaza", "farm", "terrace_farm", "forest", "temple", "dock", "yard", "ruins", "other"], "x-ui": { "label": "用途", "kind": "enum", "summary": true, "short": "{o}", "options": { "housing": "民居", "market": "集市", "plaza": "广场", "farm": "田", "terrace_farm": "梯田", "forest": "林子", "temple": "寺院", "dock": "码头", "yard": "院子", "ruins": "废墟", "other": "其它" } } },
-        "on": { "$ref": "#/definitions/ref", "x-ui": { "label": "在哪", "kind": "ref", "ref": ["site", "terrain", "spaces"], "summary": true, "short": "在 {r}" } },
-        "levels": {
-          "oneOf": [
-            { "type": "string", "enum": ["all", "low", "mid", "high"] },
-            { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 12 }, "minItems": 1, "maxItems": 12 }
-          ],
-          "x-ui": { "label": "哪几层", "kind": "enum", "options": { "all": "全部", "low": "低处", "mid": "中间", "high": "高处" } }
+        "size_m": {
+          "oneOf": [ { "type": "number", "minimum": 60, "maximum": 400 }, { "type": "array", "items": { "type": "number", "minimum": 60, "maximum": 400 }, "minItems": 2, "maxItems": 2 } ],
+          "default": [160, 160],
+          "x-ui": { "label": "场地", "kind": "pair", "step": 10, "unit": "m", "parts": ["东西", "南北"], "summary": true, "short": "{v0}×{v1} m" }
         },
-        "side": { "$ref": "#/definitions/dir", "x-ui": { "label": "哪一侧", "kind": "dir", "options": { "C": "不限", "N": "北", "NE": "东北", "E": "东", "SE": "东南", "S": "南", "SW": "西南", "W": "西", "NW": "西北" } } },
-        "building": { "$ref": "#/definitions/ref", "x-ui": { "label": "建筑", "kind": "ref", "ref": ["buildings"], "summary": true, "short": "{r}" } },
-        "density": { "type": "number", "minimum": 0, "maximum": 1.6, "x-ui": { "label": "密度", "kind": "number", "step": 0.1, "min": 0, "max": 1.6, "summary": true, "short": "密度 {v}" } }
+        "ground": { "type": "string", "enum": ["flat", "rolling", "hills", "mountain", "canyon", "lake", "island", "coast", "desert", "cavern", "sky"], "default": "flat",
+          "description": "基础形态：flat 平地；rolling 缓坡起伏；hills 丘陵；mountain 中间高；canyon 高原中间一道峡谷（南北走）；lake 中间低、带湖；island 中间陆地、四周海；coast 北陆南海；desert 沙丘；cavern 四周岩壁围住的洞底；sky 没有地面（远处云海），只有浮岛",
+          "x-ui": { "label": "基础地形", "kind": "enum", "summary": true, "short": "{o}", "options": { "flat": "平地", "rolling": "缓坡", "hills": "丘陵", "mountain": "山", "canyon": "峡谷", "lake": "湖", "island": "海岛", "coast": "海岸", "desert": "沙漠", "cavern": "洞穴", "sky": "天空" } } },
+        "relief_m": { "type": "number", "minimum": 0, "maximum": 80, "description": "基础形态的高差（米）；不写按 ground 默认", "x-ui": { "label": "高差", "kind": "number", "step": 1, "unit": "m" } },
+        "layer_m": { "type": "number", "minimum": 2, "maximum": 6, "default": 3, "description": "一层多高（台地、剖面刻度用）", "x-ui": { "label": "每层高", "kind": "number", "step": 0.5, "unit": "m" } }
       }
     },
 
-    "place": {
+    "terrain_op": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["rel"],
-      "description": "相对放置：引擎按 rel 求候选点，按「不压路、不压房、关系成立更多」挑第一名",
+      "required": ["op"],
+      "description": "地形雕刻操作，按顺序作用在高度场上。合成：raise / lower / cliff = 抬到 / 压到（锚点处原高度 ± height / depth，平顶；edge round 时是相加的圆丘）；flatten / ramp = 覆盖；carve / river / dune / noise = 相加；lake = 压到 + 水面；terrace = 把已有坡面台阶化。台阶化的面登记成台地。只能锚到 site.* 和前面的地形操作。",
       "properties": {
-        "rel": { "type": "string", "enum": ["top_of", "center_of", "edge_of", "end_of", "beside", "behind", "between", "under", "above", "along", "at_entry"], "x-ui": { "label": "放在", "kind": "enum", "summary": true, "short": "{o}", "options": { "top_of": "顶上", "center_of": "中央", "edge_of": "边上", "end_of": "尽头", "beside": "旁边", "behind": "后面", "between": "之间", "under": "下面", "above": "上面", "along": "沿着", "at_entry": "入口处" } } },
-        "target": {
-          "oneOf": [ { "$ref": "#/definitions/ref" }, { "type": "array", "items": { "$ref": "#/definitions/ref" }, "minItems": 2, "maxItems": 2 } ],
-          "default": "site",
-          "x-ui": { "label": "目标", "kind": "ref", "ref": ["site", "spawn", "terrain", "zones", "landmarks", "paths", "water", "spaces"], "summary": true, "short": "{r}" }
+        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
+        "op": { "type": "string", "enum": ["raise", "lower", "flatten", "terrace", "ramp", "carve", "lake", "river", "cliff", "dune", "noise"],
+          "x-ui": { "label": "操作", "kind": "enum", "summary": true, "short": "{o}", "options": { "raise": "抬起", "lower": "压低", "flatten": "削平", "terrace": "台阶化", "ramp": "坡道", "carve": "开沟", "lake": "成湖", "river": "河", "cliff": "立崖", "dune": "沙丘", "noise": "起伏" } } },
+        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
+        "at": { "$ref": "#/definitions/anchor", "x-ui": { "label": "在哪", "kind": "anchor", "ref": ["site", "terrain"], "summary": true, "short": "@{r}" } },
+        "offset_m": { "$ref": "#/definitions/offset", "x-ui": { "label": "偏移", "kind": "offset", "step": 1, "unit": "m" } },
+        "shape": { "type": "string", "enum": ["circle", "ellipse", "rect", "ring", "line", "polygon"],
+          "x-ui": { "label": "形状", "kind": "enum", "options": { "circle": "圆", "ellipse": "椭圆", "rect": "矩形", "ring": "环", "line": "线", "polygon": "多边形" }, "when": { "op": ["raise", "lower", "flatten", "terrace", "lake", "cliff", "dune", "noise"] } } },
+        "size_m": { "$ref": "#/definitions/pair", "description": "[东西, 南北]（米，转 rotate_deg 之前）；圆取较小的那个作直径", "x-ui": { "label": "尺寸", "kind": "pair", "step": 2, "unit": "m", "parts": ["东西", "南北"], "summary": true, "short": "{v0}×{v1} m", "when": { "op": ["raise", "lower", "flatten", "terrace", "lake", "cliff", "dune", "noise"] } } },
+        "polygon_m": { "$ref": "#/definitions/local_pts", "x-ui": { "hidden": true } },
+        "path_m": { "$ref": "#/definitions/local_pts", "x-ui": { "hidden": true } },
+        "from": { "$ref": "#/definitions/anchor", "x-ui": { "label": "从", "kind": "anchor", "ref": ["site", "terrain"], "when": { "op": ["ramp", "carve", "river"] } } },
+        "to": { "$ref": "#/definitions/anchor", "x-ui": { "label": "到", "kind": "anchor", "ref": ["site", "terrain"], "when": { "op": ["ramp", "carve", "river"] } } },
+        "rotate_deg": { "type": "number", "minimum": -360, "maximum": 360, "x-ui": { "label": "转", "kind": "number", "step": 15, "unit": "°" } },
+        "height_m": { "type": "number", "minimum": 0, "maximum": 150, "x-ui": { "label": "高", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "高 {v} m", "when": { "op": ["raise", "cliff", "flatten"] } } },
+        "depth_m": { "type": "number", "minimum": 0, "maximum": 80, "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "深 {v} m", "when": { "op": ["lower", "carve", "lake", "river"] } } },
+        "edge": { "type": "string", "enum": ["slope", "cliff", "terraced", "round"], "x-ui": { "label": "边", "kind": "enum", "options": { "slope": "缓坡", "cliff": "陡崖", "terraced": "台阶", "round": "圆丘" }, "when": { "op": ["raise", "lower", "flatten", "carve", "cliff", "lake"] } } },
+        "edge_m": { "type": "number", "minimum": 0.5, "maximum": 60, "description": "边坡宽（米）", "x-ui": { "label": "边坡宽", "kind": "number", "step": 1, "unit": "m" } },
+        "steps": { "type": "integer", "minimum": 2, "maximum": 12, "x-ui": { "label": "级数", "kind": "number", "step": 1, "unit": "级", "summary": true, "short": "{v} 级", "when": { "edge": ["terraced"] } } },
+        "step_h_m": { "type": "number", "minimum": 1, "maximum": 12, "x-ui": { "label": "每级高", "kind": "number", "step": 0.5, "unit": "m", "when": { "op": ["terrace"] } } },
+        "width_m": { "type": "number", "minimum": 1, "maximum": 80, "x-ui": { "label": "宽", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "宽 {v} m", "when": { "op": ["ramp", "carve", "river"] } } },
+        "ring_m": { "type": "number", "minimum": 2, "maximum": 100, "description": "环的带宽（shape ring）", "x-ui": { "label": "环宽", "kind": "number", "step": 1, "unit": "m", "when": { "shape": ["ring"] } } },
+        "amplitude_m": { "type": "number", "minimum": 0, "maximum": 40, "x-ui": { "label": "起伏", "kind": "number", "step": 0.5, "unit": "m", "summary": true, "short": "±{v} m", "when": { "op": ["dune", "noise"] } } },
+        "scale_m": { "type": "number", "minimum": 5, "maximum": 300, "x-ui": { "label": "尺度", "kind": "number", "step": 5, "unit": "m", "when": { "op": ["dune", "noise"] } } }
+      }
+    },
+
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "description": "场景树的节点：形体 / 建筑件 / 组合 / 连接 / 生成器。局部坐标（x 东、z 南、米）。根节点用 at 锚到 site.* 或别的节点 / 地形操作；组内的节点用 offset_m（也可以 at 兄弟节点）。",
+      "properties": {
+        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
+        "type": {
+          "type": "string",
+          "enum": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "link", "terraces", "scatter_houses", "space", "grove", "field"],
+          "x-ui": { "label": "类型", "kind": "enum", "options": { "box": "方块", "cylinder": "圆柱", "cone": "圆锥", "dome": "穹顶", "pyramid": "金字塔", "wedge": "楔", "arch": "拱", "torus": "环", "sphere": "球", "prism": "棱柱", "building": "房子", "tower": "塔", "wall": "墙", "courtyard": "院", "stairs": "台阶", "platform": "平台", "column": "柱", "gate": "门", "statue": "像", "tree": "树", "rock": "岩", "crystal": "晶体", "island": "浮岛", "water": "水", "group": "组", "repeat": "重复", "link": "连接", "terraces": "台地", "scatter_houses": "撒房子", "space": "空间", "grove": "树林", "field": "田" } }
         },
-        "side": { "$ref": "#/definitions/dir", "x-ui": { "label": "哪一侧", "kind": "dir", "options": { "C": "不限", "N": "北", "NE": "东北", "E": "东", "SE": "东南", "S": "南", "SW": "西南", "W": "西", "NW": "西北" } } },
-        "facing": { "type": "string", "pattern": "^([a-z][a-z0-9_]{0,31}|C|N|NE|E|SE|S|SW|W|NW)$", "description": "spawn / 元素 id / 方向", "x-ui": { "label": "朝向", "kind": "ref", "ref": ["spawn", "landmarks", "terrain", "zones"], "dirs": true } },
-        "gap_m": { "type": "number", "minimum": 0, "maximum": 40, "x-ui": { "label": "间距", "kind": "number", "step": 1, "unit": "m" } },
-        "nudge_m": { "$ref": "#/definitions/nudge", "x-ui": { "hidden": true } }
-      }
-    },
-
-    "landmark": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "form", "place"],
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
         "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "form": { "$ref": "#/definitions/form", "x-ui": { "label": "形制", "kind": "enum" } },
-        "size_m": { "$ref": "#/definitions/size3", "x-ui": { "label": "尺寸", "kind": "triple", "step": 0.5, "unit": "m", "parts": ["宽", "高", "深"], "summary": true, "short": "高 {v1} m" } },
-        "floors": { "type": "integer", "minimum": 1, "maximum": 9, "x-ui": { "label": "层数", "kind": "number", "step": 1, "unit": "层" } },
-        "roof": { "$ref": "#/definitions/roof", "x-ui": { "label": "屋顶", "kind": "enum" } },
-        "place": { "$ref": "#/definitions/place", "x-ui": { "label": "位置" } }
-      }
-    },
-
-    "spawn": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "place": { "$ref": "#/definitions/place", "x-ui": { "label": "位置" } },
-        "look_at": { "$ref": "#/definitions/ref", "x-ui": { "label": "第一眼看", "kind": "ref", "ref": ["landmarks", "terrain", "zones"], "summary": true, "short": "看 {r}" } }
-      }
-    },
-
-    "path": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "from", "to"],
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "from": { "$ref": "#/definitions/ref", "x-ui": { "label": "从", "kind": "ref", "ref": ["spawn", "landmarks", "zones", "terrain", "water", "spaces", "paths"], "summary": true, "short": "{r} →" } },
-        "to": { "$ref": "#/definitions/ref", "x-ui": { "label": "到", "kind": "ref", "ref": ["spawn", "landmarks", "zones", "terrain", "water", "spaces", "paths"], "summary": true, "short": "{r}" } },
-        "via": { "type": "array", "maxItems": 4, "items": { "$ref": "#/definitions/ref" }, "x-ui": { "label": "经过", "kind": "refs", "ref": ["landmarks", "zones", "terrain", "water"] } },
-        "style": { "type": "string", "enum": ["winding", "stairs", "zigzag", "straight", "bridge", "tunnel"], "x-ui": { "label": "走法", "kind": "enum", "summary": true, "short": "{o}", "options": { "winding": "顺坡绕", "stairs": "石阶", "zigzag": "之字", "straight": "直", "bridge": "桥", "tunnel": "隧道" } } },
-        "width_m": { "type": "number", "minimum": 1, "maximum": 8, "x-ui": { "label": "路宽", "kind": "number", "step": 0.5, "unit": "m" } }
-      }
-    },
-
-    "water": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "type"],
-      "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
-        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "type": { "type": "string", "enum": ["stream", "river", "pond"], "x-ui": { "label": "种类", "kind": "enum", "summary": true, "short": "{o}", "options": { "stream": "溪", "river": "河", "pond": "池塘" } } },
-        "from": { "$ref": "#/definitions/at", "x-ui": { "label": "源头", "when": { "type": ["stream", "river"] } } },
-        "to": { "$ref": "#/definitions/at", "x-ui": { "label": "流向", "when": { "type": ["stream", "river"] } } },
-        "at": { "$ref": "#/definitions/at", "x-ui": { "label": "位置", "when": { "type": ["pond"] } } },
-        "size_m": { "$ref": "#/definitions/size2", "x-ui": { "label": "尺寸", "kind": "pair", "step": 2, "unit": "m", "parts": ["长", "宽"], "when": { "type": ["pond"] } } },
-        "width_m": { "type": "number", "minimum": 1, "maximum": 20, "x-ui": { "label": "宽", "kind": "number", "step": 0.5, "unit": "m", "summary": true, "short": "宽 {v} m", "when": { "type": ["stream", "river"] } } }
+        "role": { "type": "string", "enum": ["landmark", "primary", "secondary", "detail"], "description": "landmark = 地标（出生点要看得见、走得到）", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "space"] }, "label": "角色", "kind": "enum", "options": { "landmark": "地标", "primary": "主要", "secondary": "次要", "detail": "细节" } } },
+        "at": { "$ref": "#/definitions/anchor", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "锚点", "kind": "anchor", "ref": ["site", "terrain", "nodes", "spawn"], "summary": true, "short": "@{r}" } },
+        "offset_m": { "$ref": "#/definitions/offset", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "偏移", "kind": "offset", "step": 1, "unit": "m" } },
+        "rotate_deg": { "type": "number", "minimum": -360, "maximum": 360, "description": "绕竖轴转（度，0 = 门朝北，俯视逆时针为正）", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "scatter_houses", "grove", "field"] }, "label": "转", "kind": "number", "step": 15, "unit": "°" } },
+        "elev_m": { "type": "number", "minimum": -60, "maximum": 200, "description": "离地高度（> 0 即悬空）。形体的子节点：从父体底面量（= 立面上的高度，挂墙平台 / 招牌 / 阳台），≥ 父体高就到屋顶以上，不写 = 立在父体顶上；at 是 X.top 时是离 X 顶面的高度；浮岛的子节点从岛面量", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "space"] }, "label": "离地", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "离地 {v} m" } },
+        "ground": { "type": "string", "enum": ["snap", "float", "carve"], "description": "贴地（大形体取覆盖范围最高点、脚下补基座）/ 悬空（用 elev_m）/ 嵌入地下", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat"] }, "label": "落地", "kind": "enum", "options": { "snap": "贴地", "float": "悬空", "carve": "嵌入" } } },
+        "size_m": {
+          "oneOf": [ { "type": "number", "minimum": 0.2, "maximum": 400 }, { "type": "array", "items": { "type": "number", "minimum": 0.2, "maximum": 400 }, "minItems": 1, "maxItems": 3 } ],
+          "description": "按类型：盒 / 楔 / 金字塔 / 房子 / 平台 / 门 [宽, 高, 深]；圆柱 / 圆锥 / 穹顶 / 球 / 环 / 棱柱 / 塔 / 柱 / 树 / 晶体 [直径, 高, (南北直径)]；墙 [长, 高, 厚]；院 / 水 / 生成器 [宽, 深]；空间可以只写一个数",
+          "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "尺寸", "kind": "size", "step": 1, "unit": "m", "summary": true, "short": "{v} m" }
+        },
+        "shape": { "type": "string", "enum": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"], "description": "建筑件换形体（例：圆平台 platform + shape cylinder）",
+          "x-ui": { "label": "形体", "kind": "enum", "options": { "box": "方", "cylinder": "圆柱", "cone": "锥", "dome": "穹顶", "pyramid": "金字塔", "wedge": "楔", "arch": "拱", "torus": "环", "sphere": "球", "prism": "棱柱" }, "when": { "type": ["building", "tower", "platform", "column", "statue", "rock", "crystal", "island", "stairs", "gate"] } } },
+        "sides": { "type": "integer", "minimum": 3, "maximum": 12, "x-ui": { "label": "边数", "kind": "number", "step": 1, "when": { "type": ["prism", "tower", "column", "crystal", "platform"] } } },
+        "hollow": { "type": "boolean", "description": "空心：圆柱 / 圆平台 = 一圈带子（环形回廊、摊道、竖井筒壁），中间是空的、可以放别的东西；wall_m = 带宽 / 壁厚", "x-ui": { "label": "空心", "kind": "bool", "when": { "type": ["arch", "torus", "tower", "cylinder", "prism", "platform"] } } },
+        "wall_m": { "type": "number", "minimum": 0.2, "maximum": 80, "description": "空心圆柱的带宽 / 壁厚（米）；不写 = 半径的 15%", "x-ui": { "label": "带宽", "kind": "number", "step": 0.5, "unit": "m", "when": { "hollow": [true] } } },
+        "roof": { "type": "string", "enum": ["gable", "hip", "flat", "dome", "spire", "cone", "pyramid", "none"], "x-ui": { "label": "屋顶", "kind": "enum", "options": { "gable": "人字", "hip": "四坡", "flat": "平顶", "dome": "穹顶", "spire": "尖顶", "cone": "锥顶", "pyramid": "攒尖", "none": "无" }, "when": { "type": ["building", "tower"] } } },
+        "floors": { "type": "integer", "minimum": 1, "maximum": 30, "x-ui": { "label": "层数", "kind": "number", "step": 1, "unit": "层", "when": { "type": ["building", "tower"] } } },
+        "color": { "type": "string", "maxLength": 16, "description": "色板角色（roof / wall / stone / foliage / mist / 自定义角色）", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water"] }, "label": "颜色", "kind": "text" } },
+        "material": { "type": "string", "maxLength": 24, "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water"] }, "label": "材质", "kind": "text" } },
+        "wall_h_m": { "type": "number", "minimum": 0.5, "maximum": 40, "x-ui": { "label": "墙高", "kind": "number", "step": 0.5, "unit": "m", "when": { "type": ["courtyard", "wall"] } } },
+        "thickness_m": { "type": "number", "minimum": 0.3, "maximum": 12, "x-ui": { "label": "墙厚", "kind": "number", "step": 0.5, "unit": "m", "when": { "type": ["courtyard", "wall", "arch", "torus"] } } },
+        "gate": { "type": "string", "enum": ["N", "E", "S", "W", "none"], "x-ui": { "label": "门在", "kind": "enum", "options": { "N": "北", "E": "东", "S": "南", "W": "西", "none": "无门" }, "when": { "type": ["courtyard", "wall"] } } },
+        "path_m": { "$ref": "#/definitions/local_pts", "x-ui": { "hidden": true } },
+        "around": { "$ref": "#/definitions/ref", "description": "墙围着谁（围墙）", "x-ui": { "label": "围着", "kind": "ref", "ref": ["nodes", "terrain"], "when": { "type": ["wall"] } } },
+        "children": { "type": "array", "maxItems": 32, "items": { "$ref": "#/definitions/node" }, "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group"] }, "label": "子节点", "kind": "nodes" } },
+        "child": { "$ref": "#/definitions/node", "x-ui": { "label": "模板", "kind": "node", "when": { "type": ["repeat", "scatter_houses"] } } },
+        "pattern": { "type": "string", "enum": ["linear", "grid", "radial", "along", "scatter", "mirror", "stack"],
+          "x-ui": { "label": "排法", "kind": "enum", "summary": true, "short": "{o}", "options": { "linear": "一排", "grid": "网格", "radial": "环形", "along": "沿路", "scatter": "散布", "mirror": "镜像", "stack": "叠层" }, "when": { "type": ["repeat"] } } },
+        "count": { "type": "integer", "minimum": 1, "maximum": 200, "x-ui": { "label": "个数", "kind": "number", "step": 1, "summary": true, "short": "× {v}", "when": { "pattern": ["linear", "radial", "along", "scatter"] } } },
+        "spacing_m": {
+          "oneOf": [ { "type": "number", "minimum": 0, "maximum": 200 }, { "type": "array", "items": { "type": "number", "minimum": 0, "maximum": 200 }, "minItems": 2, "maxItems": 2 } ],
+          "x-ui": { "label": "间距", "kind": "number", "step": 1, "unit": "m", "when": { "pattern": ["linear", "grid", "stack", "along"] } }
+        },
+        "rows": { "type": "integer", "minimum": 1, "maximum": 30, "x-ui": { "label": "行", "kind": "number", "step": 1, "when": { "pattern": ["grid"] } } },
+        "cols": { "type": "integer", "minimum": 1, "maximum": 30, "x-ui": { "label": "列", "kind": "number", "step": 1, "when": { "pattern": ["grid"] } } },
+        "radius_m": { "type": "number", "minimum": 1, "maximum": 300, "x-ui": { "label": "半径", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "半径 {v} m", "when": { "pattern": ["radial"] } } },
+        "start_deg": { "type": "number", "minimum": -360, "maximum": 360, "description": "第一个的方位（0 = 北，90 = 东）", "x-ui": { "label": "起始方位", "kind": "number", "step": 15, "unit": "°", "when": { "pattern": ["radial"] } } },
+        "sweep_deg": { "type": "number", "minimum": 10, "maximum": 360, "x-ui": { "label": "张角", "kind": "number", "step": 15, "unit": "°", "when": { "pattern": ["radial"] } } },
+        "face": { "type": "string", "enum": ["center", "out", "path", "none"], "x-ui": { "label": "朝向", "kind": "enum", "options": { "center": "朝心", "out": "朝外", "path": "朝路", "none": "不转" }, "when": { "pattern": ["radial", "along", "grid", "linear", "scatter"] } } },
+        "along": { "$ref": "#/definitions/ref", "description": "沿哪条 link 排", "x-ui": { "label": "沿着", "kind": "ref", "ref": ["nodes"], "when": { "pattern": ["along"] } } },
+        "area": { "$ref": "#/definitions/ref", "description": "散布在哪：节点 / 地形操作 id / site", "x-ui": { "label": "范围", "kind": "ref", "ref": ["site", "terrain", "nodes"], "when": { "type": ["repeat", "scatter_houses", "grove", "field"] } } },
+        "axis": { "type": "string", "enum": ["x", "z"], "description": "linear：一排沿哪个方向（x 东西 / z 南北）；mirror：沿哪个方向翻（x = 东西对称，模板要偏开 offset_m [d, 0]）", "x-ui": { "label": "方向", "kind": "enum", "options": { "x": "东西", "z": "南北" }, "when": { "pattern": ["mirror", "linear"] }, "variants": [{ "when": { "pattern": ["mirror"] }, "label": "镜像轴", "options": { "x": "东西对称", "z": "南北对称" } }] } },
+        "levels": { "type": "integer", "minimum": 1, "maximum": 20, "x-ui": { "label": "层数", "kind": "number", "step": 1, "summary": true, "short": "{v} 层", "when": { "pattern": ["stack"] } } },
+        "taper": { "type": "number", "minimum": 0, "maximum": 0.6, "description": "叠层每层缩小的比例", "x-ui": { "label": "收分", "kind": "number", "step": 0.05, "when": { "pattern": ["stack"] } } },
+        "seed_hint": { "type": "string", "enum": ["loose", "even", "clustered"], "x-ui": { "label": "疏密", "kind": "enum", "options": { "loose": "随意", "even": "均匀", "clustered": "成簇" }, "when": { "pattern": ["scatter"] } } },
+        "gap_m": { "type": "number", "minimum": 0, "maximum": 60, "description": "散布的最小间距", "x-ui": { "label": "最小间距", "kind": "number", "step": 1, "unit": "m", "when": { "pattern": ["scatter"] } } },
+        "skip": { "type": "array", "maxItems": 200, "items": { "type": "integer", "minimum": 0, "maximum": 199 }, "description": "删掉的实例序号（界面 / revise 删 id[k] 时写）", "x-ui": { "hidden": true } },
+        "overrides": { "type": "object", "description": "单个实例的改动 { \"k\": { 字段: 值 } }（界面 / revise 改 id[k] 时写）", "x-ui": { "hidden": true } },
+        "style": { "type": "string", "enum": ["path", "road", "stairs", "ramp", "bridge", "rope_bridge", "tunnel", "canal", "portal"],
+          "x-ui": { "label": "样式", "kind": "enum", "summary": true, "short": "{o}", "options": { "path": "小路", "road": "大路", "stairs": "台阶", "ramp": "坡道", "bridge": "桥", "rope_bridge": "索桥", "tunnel": "隧道", "canal": "水渠", "portal": "传送门" }, "when": { "type": ["link"] } } },
+        "from": { "$ref": "#/definitions/anchor", "x-ui": { "label": "从", "kind": "anchor", "ref": ["spawn", "site", "nodes", "terrain"], "summary": true, "short": "{r} →", "when": { "type": ["link"] } } },
+        "to": { "$ref": "#/definitions/anchor", "x-ui": { "label": "到", "kind": "anchor", "ref": ["spawn", "site", "nodes", "terrain"], "summary": true, "short": "{r}", "when": { "type": ["link"] } } },
+        "via": { "type": "array", "maxItems": 4, "items": { "$ref": "#/definitions/anchor" }, "x-ui": { "label": "经过", "kind": "refs", "ref": ["nodes", "terrain"], "when": { "type": ["link"] } } },
+        "width_m": { "type": "number", "minimum": 0.5, "maximum": 40, "x-ui": { "label": "宽", "kind": "number", "step": 0.5, "unit": "m", "when": { "type": ["link", "terraces"] } } },
+        "density": { "type": "number", "minimum": 0, "maximum": 1.6, "x-ui": { "label": "密度", "kind": "number", "step": 0.1, "min": 0, "max": 1.6, "summary": true, "short": "密度 {v}", "when": { "type": ["scatter_houses", "grove"] } } },
+        "form": { "type": "string", "enum": ["slope", "ring"], "x-ui": { "label": "台地形式", "kind": "enum", "summary": true, "short": "{o}", "options": { "slope": "坡上台地", "ring": "环台" }, "when": { "type": ["terraces"] } } },
+        "steps": { "type": "integer", "minimum": 2, "maximum": 10, "x-ui": { "label": "级数", "kind": "number", "step": 1, "unit": "级", "summary": true, "short": "{v} 级", "when": { "type": ["terraces"] } } },
+        "step_h_m": { "type": "number", "minimum": 1, "maximum": 12, "x-ui": { "label": "每级高", "kind": "number", "step": 0.5, "unit": "m", "when": { "type": ["terraces"] } } },
+        "orient": { "type": "string", "enum": ["C", "N", "NE", "E", "SE", "S", "SW", "W", "NW", "flat", "upright"], "description": "坡上台地：上坡方向（N / NE / …）；环 torus：flat 平放（缺省）/ upright 立起来（环面朝 rotate_deg，0 = 从南北方向穿过去）", "x-ui": { "label": "上坡朝", "kind": "dir", "enum": ["C", "N", "NE", "E", "SE", "S", "SW", "W", "NW"], "options": { "N": "北", "NE": "东北", "E": "东", "SE": "东南", "S": "南", "SW": "西南", "W": "西", "NW": "西北" }, "when": { "type": ["terraces", "torus"] }, "variants": [{ "when": { "type": ["torus"] }, "label": "摆法", "kind": "enum", "enum": ["flat", "upright"], "options": { "flat": "平放", "upright": "立起" } }] } },
+        "inverse": { "type": "boolean", "x-ui": { "label": "内低外高", "kind": "bool", "when": { "form": ["ring"] } } },
+        "stratum": { "type": "string", "enum": ["underground", "sky"], "x-ui": { "label": "在哪层", "kind": "enum", "summary": true, "short": "{o}", "options": { "underground": "地下", "sky": "天上" }, "when": { "type": ["space"] } } },
+        "under": { "$ref": "#/definitions/ref", "x-ui": { "label": "在谁下面", "kind": "ref", "ref": ["site", "terrain", "nodes"], "when": { "stratum": ["underground"] } } },
+        "over": { "$ref": "#/definitions/ref", "x-ui": { "label": "在谁上面", "kind": "ref", "ref": ["site", "terrain", "nodes"], "when": { "stratum": ["sky"] } } },
+        "depth_m": { "type": "number", "minimum": 2, "maximum": 80, "description": "空间顶板在地面以下多深 / 水深", "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "深 {v} m", "when": { "type": ["space", "water"] } } },
+        "layout": { "type": "string", "enum": ["chamber", "corridor", "maze", "galleries", "halls", "network", "rooms"], "x-ui": { "label": "布局", "kind": "enum", "summary": true, "short": "{o}", "options": { "chamber": "单室", "corridor": "地道", "maze": "迷宫", "galleries": "矿道", "halls": "厅堂", "network": "洞穴网", "rooms": "按房间" }, "when": { "type": ["space"] } } },
+        "branching": { "type": "string", "enum": ["low", "medium", "high"], "x-ui": { "label": "岔路", "kind": "enum", "options": { "low": "少", "medium": "中", "high": "多" }, "when": { "layout": ["maze", "galleries", "network"] } } },
+        "sublevels": { "type": "integer", "minimum": 1, "maximum": 3, "x-ui": { "label": "内部层数", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "{v} 层", "when": { "type": ["space"] } } },
+        "corridor_m": { "type": "number", "minimum": 1.5, "maximum": 6, "x-ui": { "label": "走廊宽", "kind": "number", "step": 0.5, "unit": "m", "when": { "layout": ["maze", "galleries", "corridor", "network", "halls", "rooms"] } } },
+        "height_m": { "type": "number", "minimum": 2.2, "maximum": 12, "description": "空间每层净高", "x-ui": { "label": "净高", "kind": "number", "step": 0.5, "unit": "m", "when": { "type": ["space"] } } },
+        "rooms": { "type": "array", "maxItems": 12, "items": { "$ref": "#/definitions/room" }, "x-ui": { "label": "房间", "kind": "rooms", "when": { "layout": ["rooms"] } } },
+        "links": { "type": "array", "maxItems": 24, "items": { "type": "array", "items": { "$ref": "#/definitions/ref" }, "minItems": 2, "maxItems": 2 }, "description": "房间连线；\"entry\" 是入口", "x-ui": { "label": "连接", "kind": "links", "when": { "layout": ["rooms"] } } },
+        "connect": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "via": { "type": "string", "enum": ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"], "x-ui": { "label": "怎么连", "kind": "enum", "options": { "stairs": "楼梯", "ladder": "梯子", "well": "井", "shaft": "竖井", "elevator": "升降台", "rope_bridge": "索桥", "ramp": "坡道" } } },
+            "from": { "$ref": "#/definitions/ref", "x-ui": { "label": "从哪下 / 上", "kind": "ref", "ref": ["site", "spawn", "nodes", "terrain"] } }
+          },
+          "x-ui": { "label": "连接", "when": { "type": ["space"] } }
+        },
+        "layout_seed": { "type": "integer", "minimum": 0, "maximum": 2147483647, "description": "「换一个」换的内部布局种子（人点的，AI 不写）", "x-ui": { "hidden": true } }
       }
     },
 
@@ -298,37 +264,14 @@
       }
     },
 
-    "space": {
+    "spawn": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "stratum", "layout"],
       "properties": {
-        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
         "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "stratum": { "type": "string", "enum": ["underground", "sky"], "x-ui": { "label": "在哪层", "kind": "enum", "summary": true, "short": "{o}", "options": { "underground": "地下", "sky": "天上" } } },
-        "under": { "$ref": "#/definitions/ref", "x-ui": { "label": "在谁下面", "kind": "ref", "ref": ["site", "terrain", "zones", "landmarks"], "when": { "stratum": ["underground"] } } },
-        "over": { "$ref": "#/definitions/ref", "x-ui": { "label": "在谁上面", "kind": "ref", "ref": ["site", "terrain", "zones", "landmarks", "water"], "when": { "stratum": ["sky"] } } },
-        "depth_layers": { "type": "integer", "minimum": 1, "maximum": 6, "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "深 {v} 层", "when": { "stratum": ["underground"] } } },
-        "height_layers": { "type": "integer", "minimum": 1, "maximum": 8, "x-ui": { "label": "高", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "高 {v} 层", "when": { "stratum": ["sky"] } } },
-        "layout": { "type": "string", "enum": ["chamber", "corridor", "maze", "galleries", "halls", "network", "rooms"], "x-ui": { "label": "布局", "kind": "enum", "summary": true, "short": "{o}", "options": { "chamber": "单室", "corridor": "地道", "maze": "迷宫", "galleries": "矿道", "halls": "厅堂", "network": "洞穴网", "rooms": "按房间" } } },
-        "size_m": { "type": "number", "minimum": 8, "maximum": 80, "x-ui": { "label": "大小", "kind": "number", "step": 2, "unit": "m", "summary": true, "short": "{v} m" } },
-        "branching": { "type": "string", "enum": ["low", "medium", "high"], "x-ui": { "label": "岔路", "kind": "enum", "options": { "low": "少", "medium": "中", "high": "多" }, "when": { "layout": ["maze", "galleries", "network"] } } },
-        "sublevels": { "type": "integer", "minimum": 1, "maximum": 3, "x-ui": { "label": "内部层数", "kind": "number", "step": 1, "unit": "层", "summary": true, "short": "{v} 层", "when": { "layout": ["maze", "galleries", "network", "halls", "corridor", "chamber"] } } },
-        "corridor_m": { "type": "number", "minimum": 1.5, "maximum": 6, "x-ui": { "label": "走廊宽", "kind": "number", "step": 0.5, "unit": "m", "when": { "layout": ["maze", "galleries", "corridor", "network", "halls", "rooms"] } } },
-        "height_m": { "type": "number", "minimum": 2.2, "maximum": 12, "description": "每层净高（米）；不写按布局默认", "x-ui": { "label": "净高", "kind": "number", "step": 0.5, "unit": "m" } },
-        "rooms": { "type": "array", "maxItems": 12, "items": { "$ref": "#/definitions/room" }, "x-ui": { "label": "房间", "kind": "rooms", "when": { "layout": ["rooms"] } } },
-        "links": { "type": "array", "maxItems": 24, "items": { "type": "array", "items": { "$ref": "#/definitions/ref" }, "minItems": 2, "maxItems": 2 }, "description": "房间连线；\"entry\" 是从地面下来的入口", "x-ui": { "label": "连接", "kind": "links", "when": { "layout": ["rooms"] } } },
-        "connect": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "via": { "type": "string", "enum": ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"], "x-ui": { "label": "怎么连", "kind": "enum", "options": { "stairs": "楼梯", "ladder": "梯子", "well": "井", "shaft": "竖井", "elevator": "升降台", "rope_bridge": "索桥", "ramp": "坡道" } } },
-            "from": { "$ref": "#/definitions/ref", "x-ui": { "label": "从哪下 / 上", "kind": "ref", "ref": ["site", "spawn", "terrain", "zones", "landmarks", "spaces"] } }
-          },
-          "x-ui": { "label": "连接" }
-        },
-        "offset_m": { "$ref": "#/definitions/nudge", "x-ui": { "hidden": true } },
-        "layout_seed": { "type": "integer", "minimum": 0, "maximum": 2147483647, "description": "「换一个」换的内部布局种子（人点的，AI 不写）", "x-ui": { "hidden": true } }
+        "at": { "$ref": "#/definitions/anchor", "default": "site.S", "x-ui": { "label": "在哪", "kind": "anchor", "ref": ["site", "terrain", "nodes"], "summary": true, "short": "@{r}" } },
+        "offset_m": { "$ref": "#/definitions/offset", "x-ui": { "label": "偏移", "kind": "offset", "step": 1, "unit": "m" } },
+        "look_at": { "$ref": "#/definitions/ref", "x-ui": { "label": "第一眼看", "kind": "ref", "ref": ["nodes", "terrain"], "summary": true, "short": "看 {r}" } }
       }
     },
 
@@ -337,10 +280,11 @@
       "additionalProperties": false,
       "required": ["type", "a", "b"],
       "properties": {
-        "type": { "type": "string", "enum": ["visible_from", "faces", "adjacent", "behind", "above", "below", "between", "far_from"], "x-ui": { "label": "关系", "kind": "enum", "options": { "visible_from": "从…看得见", "faces": "朝向", "adjacent": "挨着", "behind": "在…后面", "above": "在…上方", "below": "在…下方", "between": "在…之间", "far_from": "远离" } } },
-        "a": { "$ref": "#/definitions/ref", "x-ui": { "label": "谁", "kind": "ref", "ref": ["spawn", "landmarks", "zones", "terrain", "spaces", "water", "paths"] } },
-        "b": { "$ref": "#/definitions/ref", "x-ui": { "label": "对谁", "kind": "ref", "ref": ["spawn", "landmarks", "zones", "terrain", "spaces", "water", "paths"] } },
-        "c": { "$ref": "#/definitions/ref", "x-ui": { "label": "和谁（之间）", "kind": "ref", "ref": ["spawn", "landmarks", "zones", "terrain", "spaces", "water", "paths"], "when": { "type": ["between"] } } }
+        "type": { "type": "string", "enum": ["visible_from", "reachable", "adjacent", "above", "below", "behind", "between", "far_from", "faces"],
+          "x-ui": { "label": "关系", "kind": "enum", "options": { "visible_from": "从…看得见", "reachable": "从…走得到", "adjacent": "挨着", "above": "在…上方", "below": "在…下方", "behind": "在…后面", "between": "在…之间", "far_from": "远离", "faces": "朝向" } } },
+        "a": { "$ref": "#/definitions/ref", "x-ui": { "label": "谁", "kind": "ref", "ref": ["spawn", "nodes", "terrain"] } },
+        "b": { "$ref": "#/definitions/ref", "x-ui": { "label": "对谁", "kind": "ref", "ref": ["spawn", "nodes", "terrain"] } },
+        "c": { "$ref": "#/definitions/ref", "x-ui": { "label": "和谁（之间）", "kind": "ref", "ref": ["spawn", "nodes", "terrain"], "when": { "type": ["between"] } } }
       }
     },
 
@@ -367,22 +311,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["op", "id", "field", "value"],
-      "description": "改一个字段：id 是元素 id，或 site / spawn / lighting / plan（根上的 name / one_liner / mood / palette）；field 可以是嵌套路径（place.rel、at.dir、connect.via）",
+      "description": "改一个字段：id 是节点 / 地形操作 id（树里任何深度），id[k] 改单个实例（写进 repeat 的 overrides），或 site / spawn / lighting / plan（根上的 name / concept / mood / palette）；field 可以是嵌套路径（connect.via、size_m）。value 为 null 表示删掉该字段",
       "properties": {
         "op": { "const": "set" },
         "id": { "$ref": "#/definitions/ref" },
-        "field": { "type": "string", "pattern": "^[a-z_]+(\\.[a-z_]+)*$" },
+        "field": { "type": "string", "pattern": "^[a-z_]+(\\.[a-z_0-9]+)*$" },
         "value": {}
       }
     },
     "op_add": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["op", "group", "value"],
-      "description": "加一项：value 必须通过该组的 schema",
+      "required": ["op", "to", "value"],
+      "description": "加一项：to = root（根节点）/ terrain（地形操作）/ relations / <group 或带 children 的节点 id>（加成它的子节点）；value 按对应定义校验；index 可选（插到第几个）",
       "properties": {
         "op": { "const": "add" },
-        "group": { "type": "string", "enum": ["terrain", "buildings", "zones", "landmarks", "paths", "water", "spaces", "relations"] },
+        "to": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+        "index": { "type": "integer", "minimum": 0, "maximum": 64 },
         "value": { "type": "object" }
       }
     },
@@ -390,7 +335,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["op", "id"],
-      "description": "删一项：引用它的东西本地降级（改指 site 或删掉那条关系）；关系用 \"rel:<序号>\" 删",
+      "description": "删一项：节点（连同子树）/ 地形操作 / 单个实例 id[k]（写进 repeat 的 skip）/ 关系 \"rel:<序号>\"；引用它的东西本地降级（锚点改到它的父组或 site，连接去掉）",
       "properties": {
         "op": { "const": "remove" },
         "id": { "type": "string" }
@@ -400,7 +345,7 @@
     "ops": { "type": "array", "maxItems": 16, "items": { "$ref": "#/definitions/op" } },
     "revise": {
       "type": "object",
-      "description": "AI 改动（revise）的回复（docs/05 §5）",
+      "description": "AI 改动（revise）的回复（docs/06 §3）：ops 作用在程序树上",
       "required": ["understood", "ops"],
       "properties": {
         "understood": { "type": "boolean" },

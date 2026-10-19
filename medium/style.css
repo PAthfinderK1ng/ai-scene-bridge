@@ -315,3 +315,27 @@ dialog .actions { display: flex; gap: 8px; margin-top: 14px; align-items: center
 body:not(.has-scene) #toolbar, body.comparing #toolbar { display: none; }
 /* 还没选卡 / 正在三选一：视图标签用不上，先藏起来 */
 body:not(.has-scene) .tab, body.comparing .tab { visibility: hidden; }
+
+/* ---------- v5：场景树（docs/06 §5） */
+.item[style*="--d"] > .irow { padding-left: calc(3px + var(--d) * 14px); }
+.item[style*="--d"] > .knobs { padding-left: calc(26px + var(--d) * 14px); }
+.panel .irow button.tcaret { flex: none; width: 14px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 10px; line-height: 1; }
+.tcaret-sp { flex: none; width: 14px; }
+.item.tpl .nm { font-style: italic; }
+.item.tpl .nm::before { content: "↳ "; color: var(--muted); font-style: normal; }
+.inst-tag { flex: none; font-size: 10px; color: #fff; background: #f08c00; border-radius: 3px; padding: 0 4px; }
+.addrow.in { padding-left: 0; }
+.sctl.anchor select { max-width: 9.5em; }
+.krow[data-kind=size], .krow[data-kind=offset], .krow[data-kind=pair] { grid-template-columns: 52px 1fr; }
+.keys { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; margin-top: 3px; }
+.keys .kk { font-size: 11px; color: var(--muted); margin-right: 2px; }
+.keys .key { font-size: 11px; line-height: 1.6; padding: 0 6px; border-radius: 4px; background: #eef2e6; color: #3d5a2a; border: 1px solid #d3e0c4; }
+.tag.org { background: #e8eefb; color: #2f4f8f; }
+.tag.org.diff { background: #fff1c2; color: #7a5a00; }
+.cmp .why { font-size: 11px; }
+.cmp .keys { margin-top: 2px; }
+.cmp-head.warn { color: #a8730a; }
+.w-samples { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+.chip.sm { font-size: 12px; padding: 2px 8px; }
+.sw-dot.dash { background: transparent !important; border: 1.5px dashed #2a6aa6; box-sizing: border-box; }
+g[data-elev-drag] { cursor: ns-resize; }

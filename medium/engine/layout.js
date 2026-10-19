@@ -184,7 +184,7 @@ export function layoutHouses(sid, T, opts = {}) {
   const paths = (sid.paths || []).filter((p) => p && Array.isArray(p.points) && p.points.length >= 2);
   const roads = paths.filter((p) => p.kind !== "river").map((p) => p.points);
   const obstacles = (sid.volumes || []).filter((v) => v && !v.generated && v.position && v.size)
-    .map((v) => ({ rect: boxCorners(v.position, v.size, v.rotation_y || 0), clearance: v.importance === "landmark" ? o.landmarkClearance : 1 }))
+    .flatMap((v) => footRects(v).map((rect) => ({ rect, clearance: v.importance === "landmark" ? o.landmarkClearance : 1 }))) // 环带按一段段带子（孔里能布房）
     // 多层空间的连接点（楼梯口 / 井口 / 梯子）按 3×3 m 占地避让
     .concat((sid.markers || []).filter((m) => m && m.kind === "connector" && Array.isArray(m.position)).map((m) => ({ rect: boxCorners(m.position, [3, 1, 3], 0), clearance: 1.5 })));
   const bounds = sid.bounds || { min: [T.xmin, 0, T.zmin], max: [T.xmax, 40, T.zmax] };
@@ -394,6 +394,8 @@ function resolveRegions(sid, T) {
       const level = t ? t.level : typeof r.terrace_level === "number" ? r.terrace_level : T.levelAt(c[0], c[1]);
       return { id: r.id, kind: r.kind || "other", polygon: r.polygon, density: typeof r.density === "number" ? r.density : 1, level, terraceId: t ? t.id : null, building: r.building || null, zone_id: r.plan_id || null, floorOnly: !!r.floor_of };
     });
+  } else if (sid.meta && Number(sid.meta.plan_version) >= 2) {
+    list = []; // plan v2：只在「撒房子」生成器给的区域里布房，不再默认铺满台地
   } else {
     list = T.terraces.map((t) => ({ id: "r_" + t.id, kind: "other", polygon: t.polygon, density: 1, level: t.level, terraceId: t.id }));
   }
@@ -462,4 +464,213 @@ export function scatterTrees(region, T, density, seed = 1, opts = {}) {
     out.push({ id: `tree_${rid}_${n}`, kind: "prop", shape: "cylinder", position: [px, r2(T.heightAt(px, pz)), pz], size, rotation_y: 0, label: "树", color_role: "foliage", importance: "detail", generated: true, region_id: region.id });
   }
   return out;
+}
+
+// ------------------------------------------------------------ 局部坐标系（2×2 矩阵，x 东 z 南）与程序的自动修（program.js 调用）
+export const rotM = (deg) => { const t = ((deg || 0) * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t); return [c, s, -s, c]; };
+export const mulM = (A, B) => [A[0] * B[0] + A[1] * B[2], A[0] * B[1] + A[1] * B[3], A[2] * B[0] + A[3] * B[2], A[2] * B[1] + A[3] * B[3]];
+export const apM = (M, v) => [M[0] * v[0] + M[1] * v[1], M[2] * v[0] + M[3] * v[1]];
+export const invM = (M) => { const d = M[0] * M[3] - M[1] * M[2] || 1; return [M[3] / d, -M[1] / d, -M[2] / d, M[0] / d]; };
+
+/**
+ * 挂在立面上的子形体（elev_m 低于父体顶）中心还在父体里面：沿偏移方向推到外墙外（只搭进去 ≤ 0.5 m）。
+ * @returns {number[]|null} 世界坐标里要挪的 [dx, dz]；偏移为 0（套在柱子上的环）或已经在外面 → null
+ */
+export function attachOffset(off, sz, rotDeg, p, frame) {
+  off = off || [0, 0];
+  const lx = off[0] || 0, lz = (off.length >= 3 ? off[2] : off[1]) || 0;
+  if (Math.hypot(lx, lz) < 0.05) return null;
+  const pv = frame.pv, ph = [pv.size[0] / 2, pv.size[2] / 2], q = apM(invM(frame.m), [p[0] - frame.o[0], p[1] - frame.o[1]]);
+  const ax = Math.abs(q[0]) / ph[0] >= Math.abs(q[1]) / ph[1] ? 0 : 1;
+  if (Math.abs(q[ax]) >= ph[ax] - 0.05) return null;
+  const loc = apM(invM(rotM(rotDeg || 0)), ax ? [0, 1] : [1, 0]), own = Math.abs(loc[0]) * sz[0] / 2 + Math.abs(loc[1]) * sz[2] / 2;
+  const to = (Math.sign(q[ax]) || 1) * (ph[ax] + own - Math.min(0.5, own / 2));
+  return apM(frame.m, ax ? [0, to - q[1]] : [to - q[0], 0]);
+}
+
+/**
+ * 镜像的模板正好在翻转轴上（两份完全重合，只看得见一份）——模型最常见的写法错：
+ * ① 重复自己写了沿翻转方向的偏移 → 当成对称半间距挪给模板；② 模板只在另一个方向偏 → 轴写反了，换轴；③ 单个形体 → 偏开半个宽 + 1 m。
+ * @returns {{tpl: object, mirrorAxis: string, p?: number[], how: string, text: string}|null}
+ */
+export function mirrorFix(node, tpl, parentM, M, p, mirrorAxis, tplSize, tplSolid) {
+  const to = tpl.offset_m || [0, 0], t3 = to.length >= 3 ? [to[0] || 0, to[2] || 0] : [to[0] || 0, to[1] || 0];
+  const ai = mirrorAxis === "z" ? 1 : 0, bi = 1 - ai, ro = node.offset_m || [0, 0];
+  if (Math.abs(t3[ai]) >= 0.05) return null;
+  const rl = apM(invM(M), apM(parentM, [ro[0] || 0, (ro.length >= 3 ? ro[2] : ro[1]) || 0]));
+  const setT = (k, val) => { const t2 = t3.slice(); t2[k] = r2(val); return to.length >= 3 ? [t2[0], to[1] || 0, t2[1]] : t2; };
+  if (Math.abs(rl[ai]) > 0.5) {
+    const back = apM(M, ai ? [0, rl[1]] : [rl[0], 0]);
+    return { tpl: Object.assign({}, tpl, { offset_m: setT(ai, rl[ai]) }), mirrorAxis, p: [p[0] - back[0], p[1] - back[1]], how: "offset",
+      text: `重复自己的偏移 ${r2(Math.abs(rl[ai]))} m 当成对称半间距，两份在 ${mirrorAxis === "x" ? "东西" : "南北"}两侧各一` };
+  }
+  if (Math.abs(t3[bi]) > 0.5) {
+    const ax = mirrorAxis === "x" ? "z" : "x";
+    return { tpl, mirrorAxis: ax, how: "axis", text: `模板偏在${ax === "x" ? "东西" : "南北"}方向，翻转轴改成 axis:${ax}` };
+  }
+  if (tplSolid) {
+    const half = tplSize[ai ? 2 : 0] / 2 + 1;
+    return { tpl: Object.assign({}, tpl, { offset_m: setT(ai, -half) }), mirrorAxis, how: "spread", text: `模板在翻转轴上，两份各偏开 ${r2(half)} m` };
+  }
+  return null;
+}
+
+// ------------------------------------------------------------ 程序用的平面几何（program.js / sid.js / section.js / relations.js 调用；从 program.js 挪来）
+const P2_ = (p) => [r2(p[0]), r2(p[1])];
+const d2_ = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const unit_ = (v) => { const L = Math.hypot(v[0], v[1]); return L < 1e-9 ? [0, 0] : [v[0] / L, v[1] / L]; };
+/** 多边形在方向 u 上离 c 最远多少 */
+export function support(poly, c, u) { let m = 0; for (const p of poly) m = Math.max(m, (p[0] - c[0]) * u[0] + (p[1] - c[1]) * u[1]); return m; }
+export function ellipsePoly(c, rx, rz, deg = 0, n = 24) { const M = rotM(deg), out = []; for (let k = 0; k < n; k++) { const t = (2 * Math.PI * k) / n, q = apM(M, [rx * Math.cos(t), rz * Math.sin(t)]); out.push(P2_([c[0] + q[0], c[1] + q[1]])); } return out; }
+export function rectPoly(c, w, d, deg = 0) { const M = rotM(deg); return [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]].map((q) => { const r = apM(M, q); return P2_([c[0] + r[0], c[1] + r[1]]); }); }
+export function hull(pts) {
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (p.length < 3) return p;
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const q of p) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+  for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], q) <= 0) up.pop(); up.push(q); }
+  return lo.slice(0, -1).concat(up.slice(0, -1));
+}
+export function bboxOf(pts) { let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity; for (const [x, z] of pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); } return [x0, z0, x1, z1]; }
+export const bbHit = (a, b, m = 0) => a[0] - m < b[2] && b[0] - m < a[2] && a[1] - m < b[3] && b[1] - m < a[3];
+export function polyLen(pts) { let L = 0; for (let i = 0; i < pts.length - 1; i++) L += d2_(pts[i], pts[i + 1]); return L; }
+/** 折线上比例 f 处的点与切向 */
+export function alongLine(pts, f) {
+  const L = polyLen(pts); let want = clamp(f, 0, 1) * L;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const d = d2_(pts[i], pts[i + 1]);
+    if (want <= d || i === pts.length - 2) { const t = d > 1e-9 ? clamp(want / d, 0, 1) : 0; return { p: [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t], tan: unit_([pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]]) }; }
+    want -= d;
+  }
+  return { p: pts[0].slice(), tan: [1, 0] };
+}
+/**
+ * 线形地形（沟 / 河 / 坡道）的岸：方位后缀取线的法向里和该方位同侧的那一边（.left / .right 按 start → end 的走向），
+ * 在线的中段离中线 off 米（= 半宽 + 边坡宽 + 1.5）。方位和线差不多平行（|cos| < 0.2）返回 null（交给调用方取端点）。
+ * @param {number[][]} line @param {number} off @param {number[]|null} u 方位向量 @param {number} side 1 左 / -1 右 / 0 按 u
+ */
+export function lineBank(line, off, u, side = 0) {
+  const m = alongLine(line, 0.5), nL = [m.tan[1], -m.tan[0]]; // 走向的左手法向（x 东、z 南：往东走，左手是北）
+  let s = side;
+  if (!s) { if (!u) return null; const dt = u[0] * nL[0] + u[1] * nL[1]; if (Math.abs(dt) < 0.2) return null; s = Math.sign(dt); }
+  return [m.p[0] + nL[0] * s * off, m.p[1] + nL[1] * s * off];
+}
+/** 锚在线形地形上的矩形 / 椭圆的缺省转角：长边顺着线（rotM 约定：局部 x → [cos, -sin]） */
+export function alongDeg(tan, size) {
+  const t = (size && size[1] > size[0]) ? Math.atan2(tan[0], tan[1]) : Math.atan2(-tan[1], tan[0]);
+  return Math.round((t * 180) / Math.PI * 10) / 10;
+}
+/**
+ * 高架组（组离地 lift 米）里的子节点该不该落地当支撑：写了 ground:"snap" 的；或柱 / 方 / 圆柱 / 棱柱（重复看模板）没写 elev_m、
+ * 高在 0.7–1.25 × lift 之间（从地面撑到台面的墩）。组里有浮岛的不算（岛上的尖塔不是墩）。
+ * @param {object} node @param {number} lift @param {(n: object) => number[]} sizeOf size3 @param {number} [sc]
+ */
+export function isSupport(node, lift, sizeOf, sc = 1) {
+  if (!(lift > 2.5) || !node || node.at || node.elev_m > 0) return false;
+  if (node.ground === "snap") return true;
+  let t = node; while (t && t.type === "repeat") t = t.child;
+  if (!t || !SUPPORT_T.has(t.type) || t.elev_m > 0 || t.ground === "float" || t.at) return false;
+  const h = sizeOf(t)[1] * sc;
+  return h >= 0.7 * lift && h <= 1.25 * lift + 2;
+}
+const SUPPORT_T = new Set(["column", "box", "cylinder", "prism"]);
+/** 高架组里没落地、又高到戳出台面的竖向件（拱、墙、墩）：给「支撑悬空」检查 */
+export function hangsAbove(node, lift, sizeOf, sc = 1) {
+  if (!(lift > 2.5) || !node || node.at || node.elev_m > 0 || !HANG_T.has(node.type)) return false;
+  const s = sizeOf(node).map((v) => v * sc);
+  return s[1] >= Math.max(4, 0.5 * lift) && s[1] > 1.2 * Math.min(s[0], s[2]);
+}
+const HANG_T = new Set(["column", "box", "cylinder", "prism", "arch", "wall", "gate"]);
+/** 高架组里戳出台面的拱 / 门 / 柱（或它们的一排）：返回模板高度（米），不是返回 0。程序把它立到台面上（矮的）或落地（高的 / 组里没台面） */
+export function standsUp(node, lift, sizeOf, sc = 1) {
+  if (!(lift > 2.5) || !node || node.at || node.elev_m > 0 || node.ground) return 0;
+  let t = node; while (t && t.type === "repeat") { t = t.child; if (t && (t.at || t.elev_m > 0 || t.ground)) return 0; }
+  return t && STAND_T.has(t.type) && hangsAbove(t, lift, sizeOf, sc) ? sizeOf(t)[1] * sc : 0;
+}
+const STAND_T = new Set(["arch", "gate", "column"]);
+/** 落地的墩 / 柱 / 拱：从脚下的地面撑到高架台面底（不戳出台面，也不悬在台面下） */
+export function fitSupport(vols, deckY) { for (const v of vols || []) if (deckY != null) v.size[1] = r2(Math.max(0.5, deckY - v.position[1])); }
+/** 组里的台面高度：扁平的 platform / box / cylinder（没自己的锚点、elev_m），没有 = 0 */
+export const deckOf = (children, sizeOf, sc = 1) => Math.max(0, ...(children || []).filter((c) => c && !c.at && !(c.elev_m > 0) && (c.type === "platform" || ((c.type === "box" || c.type === "cylinder") && sizeOf(c)[1] <= 3))).map((c) => sizeOf(c)[1] * sc));
+/** 多边形内离边最远的格点 */
+export function deepPoint(poly, step = 2) {
+  const [x0, z0, x1, z1] = bboxOf(poly);
+  let best = null, bd = -1;
+  for (let z = z0 + step / 2; z < z1; z += step) for (let x = x0 + step / 2; x < x1; x += step) if (pointInPolygon([x, z], poly)) { const d = distToPolygon([x, z], poly); if (d > bd + 1e-9) { bd = d; best = [x, z]; } }
+  return best || polygonCentroid(poly);
+}
+/** 两个凸多边形的最小平移（把 A 推出 B）：{ o 距离, d 方向 }；不重叠（贴着 ≤ 10 cm）= null */
+export function mtv(A, B) {
+  let best = null;
+  for (const poly of [A, B]) for (let i = 0; i < poly.length; i++) {
+    const p1 = poly[i], p2 = poly[(i + 1) % poly.length], ax = unit_([-(p2[1] - p1[1]), p2[0] - p1[0]]);
+    const pr = (pts) => { let mn = Infinity, mx = -Infinity; for (const q of pts) { const v = q[0] * ax[0] + q[1] * ax[1]; mn = Math.min(mn, v); mx = Math.max(mx, v); } return [mn, mx]; };
+    const [a0, a1] = pr(A), [b0, b1] = pr(B);
+    if (Math.min(a1, b1) - Math.max(a0, b0) <= 0.1) return null;
+    const up = b1 - a0, down = a1 - b0, o = Math.min(up, down); // 往两边取近的；A 整个在 B 里面时也对
+    if (!best || o < best.o) best = { o, d: up <= down ? ax : [-ax[0], -ax[1]] };
+  }
+  return best;
+}
+
+// ------------------------------------------------------------ 环带：空心圆柱（hollow，壁厚 / 带宽 wall）与平放的 torus（带宽 = 管粗）
+/**
+ * SID 体块是不是一圈「带子」：空心圆柱（v.hollow，带宽 v.wall，缺省短半径的 15%、至少 0.4 m）或平放的 torus（带宽 = 管粗 size[1]，≤ 半径一半）。
+ * @returns {{rx: number, rz: number, wall: number, ix: number, iz: number, torus: boolean}|null} 外半径 / 带宽 / 内孔半径
+ */
+export function ringOf(v) {
+  if (!v || !Array.isArray(v.size)) return null;
+  const torus = v.shape === "torus" && v.orient !== "upright";
+  if (!torus && !(v.hollow && v.shape === "cylinder")) return null;
+  const w = Number(v.size[0]) || 1, d = Number(v.size[2]) > 0 ? Number(v.size[2]) : w, m = Math.min(w, d) / 2;
+  const wall = torus ? Math.min(Math.max(0.1, Number(v.size[1]) || 0.5), m * 0.5) : Math.min(m * 0.9, Number(v.wall) > 0 ? Number(v.wall) : Math.max(0.4, m * 0.15));
+  return { rx: w / 2, rz: d / 2, wall, ix: Math.max(0.05, w / 2 - wall), iz: Math.max(0.05, d / 2 - wall), torus };
+}
+/** 环带的局部 → 世界（同 boxCorners 的 rotation_y 约定） */
+const ringPt = (v, lx, lz) => { const t = (v.rotation_y || 0) * DEG, c = Math.cos(t), s = Math.sin(t); return [v.position[0] + lx * c + lz * s, v.position[2] - lx * s + lz * c]; };
+/** 落地采样点：只在带子上（外沿、中线、内沿各一圈），不采中间的空洞——环带底面按环上最高点 */
+export function ringSamples(v) {
+  const R = ringOf(v);
+  if (!R) return null;
+  const n = clamp(Math.ceil((Math.PI * 2 * Math.max(R.rx, R.rz)) / 6), 12, 32), out = [];
+  for (let k = 0; k < n; k++) { const a = (2 * Math.PI * k) / n, ca = Math.cos(a), sa = Math.sin(a); for (const f of [0.98, 0.5, 0.02]) out.push(ringPt(v, (R.ix + (R.rx - R.ix) * f) * ca, (R.iz + (R.rz - R.iz) * f) * sa)); }
+  return out;
+}
+/** 环带的「钥匙孔」多边形（外圈 + 一道缝 + 反向内圈）：pointInPolygon（奇偶规则）在带上为真、内孔里为假 */
+export function ringPoly(v, n = 32) {
+  const R = ringOf(v);
+  if (!R) return null;
+  const outer = [], inner = [];
+  for (let k = 0; k <= n; k++) { const a = (2 * Math.PI * k) / n; outer.push(P2_(ringPt(v, R.rx * Math.cos(a), R.rz * Math.sin(a)))); inner.push(P2_(ringPt(v, R.ix * Math.cos(a), R.iz * Math.sin(a)))); }
+  return outer.concat(inner.reverse());
+}
+/** 环带拆成 n 段四边形（避让 / 寻路 / 布房当障碍用；中间的孔是空的）；不是环 → [四角] */
+export function footRects(v, n = 16) {
+  const R = ringOf(v);
+  if (!R) return [boxCorners(v.position, v.size, v.rotation_y || 0)];
+  n = clamp(Math.round((Math.PI * 2 * R.rx) / 8), 8, n * 2);
+  const out = [], pt = (r, a) => ringPt(v, r[0] * Math.cos(a), r[1] * Math.sin(a)), o = [R.rx / Math.cos(Math.PI / n), R.rz / Math.cos(Math.PI / n)], i = [R.ix, R.iz];
+  for (let k = 0; k < n; k++) { const a0 = (2 * Math.PI * k) / n, a1 = (2 * Math.PI * (k + 1)) / n; out.push([pt(i, a0), pt(o, a0), pt(o, a1), pt(i, a1)]); }
+  return out;
+}
+/** 点 q 落在体块脚下（环带只算带子，不算中间的孔） */
+export function onFoot(v, q) {
+  const R = ringOf(v);
+  if (!R) return pointInPolygon(q, boxCorners(v.position, v.size, v.rotation_y || 0));
+  const t = -(v.rotation_y || 0) * DEG, dx = q[0] - v.position[0], dz = q[1] - v.position[2], lx = dx * Math.cos(t) + dz * Math.sin(t), lz = -dx * Math.sin(t) + dz * Math.cos(t);
+  return (lx / R.rx) ** 2 + (lz / R.rz) ** 2 <= 1 && (lx / R.ix) ** 2 + (lz / R.iz) ** 2 >= 1;
+}
+/**
+ * 圆环带（圆心 c、外半径 R、内孔半径 h）与凸多边形 P 的重叠：null = 不重叠（P 整个在孔里或在环外）；
+ * 否则 { o, d } = 把 P 推开的最小距离与方向（P 的中心在带子中线以内 → 往环心推进孔里，否则往外推）。
+ */
+export function ringPolyMtv(c, R, h, P) {
+  const inside = pointInPolygon(c, P), near = inside ? 0 : distToPolygon(c, P);
+  let far = 0; for (const q of P) far = Math.max(far, d2_(q, c));
+  if (near >= R - 0.1 || far <= h + 0.1) return null;
+  const pc = polygonCentroid(P), u0 = unit_([pc[0] - c[0], pc[1] - c[1]]), u = u0[0] || u0[1] ? u0 : [1, 0];
+  if (!inside && d2_(pc, c) < (R + h) / 2 && far - h < R - near) return { o: far - h, d: [-u[0], -u[1]] };
+  if (inside && far - h < R - near) return { o: far - h, d: u, shrink: r2(h) }; // 套在孔里、只是四角伸进带子：报伸进去的深度（缩到内径以内就好），不报「往外推一整圈」
+  return { o: R - near, d: u };
 }

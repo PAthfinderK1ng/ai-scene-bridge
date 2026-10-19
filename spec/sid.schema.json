@@ -1,13 +1,16 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/PAthfinderK1ng/ai-scene-bridge/spec/sid.schema.json",
-  "title": "Scene Intent Document (SID) v0.1（含 v0.3 / v0.4 增补）",
-  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。v0.3 增补（全部可选，sid_version 仍为 0.1）：多层空间 spaces、连接点 markers[kind=connector]、自选剖切 meta.section、台地单独调高 features[].user_height、人拖过的体块 volumes[].user_moved、主路绕行 paths[].detour_around。v0.4 增补（全部可选）：SID 由构成图 plan 编译而来（spec/plan.schema.json，meta.plan 是那份 plan），每个生成物带 plan_id 指回 plan 里的元素；区域带建筑类型 regions[].building；体块带形制 form / roof / floors；空间带内部布局 passages / rooms / links / entrance / goal / facts。",
+  "title": "Scene Intent Document (SID) v0.1（含 v0.3 / v0.4 / v0.5 增补）",
+  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。v0.3 增补（全部可选，sid_version 仍为 0.1）：多层空间 spaces、连接点 markers[kind=connector]、自选剖切 meta.section、台地单独调高 features[].user_height、人拖过的体块 volumes[].user_moved、主路绕行 paths[].detour_around。v0.4 增补（全部可选）：SID 由构成图 plan 编译而来（spec/plan.schema.json，meta.plan 是那份 plan），每个生成物带 plan_id 指回 plan 里的元素；区域带建筑类型 regions[].building；体块带形制 form / roof / floors；空间带内部布局 passages / rooms / links / entrance / goal / facts。 v0.5 增补（全部可选）：SID 由场景程序 plan v2 编译而来（docs/06，meta.plan_version = 2）：地形是雕刻特征（terrain.sculpt = true，features[].op / blend / mask），体块的形体扩到 10 种（box / cylinder / cone / dome / pyramid / wedge / arch / torus / sphere / prism），带落地规则 land 与离地高度 elev、所属节点 plan_path / 实例 instance_of；路带样式（桥 deck_y / piers、隧道、水渠、传送门）；水面区域带 surface_y。",
   "type": "object",
   "required": ["sid_version", "meta", "volumes"],
   "additionalProperties": false,
   "properties": {
-    "sid_version": { "type": "string", "const": "0.1" },
+    "sid_version": {
+      "type": "string",
+      "const": "0.1"
+    },
     "meta": {
       "type": "object",
       "required": ["name", "units", "up_axis", "handedness", "north"],
@@ -32,81 +35,28 @@
         "trail_target": { "type": "string", "description": "主路终点的 volume id（主路通向地标时）" },
         "seed": { "type": "integer", "description": "编译 / 布局用的随机种子" },
         "ignored_checks": { "type": "array", "items": { "type": "string" }, "description": "人标了「不重要」的检查 id" },
-        "section": {
-          "type": "object",
-          "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上",
-          "properties": {
-            "mode": { "type": "string", "enum": ["trail", "line"] },
-            "line": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "直线模式的两个端点 [x, z]" },
-            "width_m": { "type": "number", "minimum": 2, "maximum": 60, "default": 12 }
-          }
-        }
+        "section": { "type": "object", "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上", "properties": { "mode": { "type": "string", "enum": ["trail", "line"] }, "line": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "直线模式的两个端点 [x, z]" }, "width_m": { "type": "number", "minimum": 2, "maximum": 60, "default": 12 } } },
+        "plan_version": { "type": "integer", "description": "v0.5：2 = 由场景程序（plan v2）编译；resolve 按体块的 land 重新落地" },
+        "ground": { "type": "string", "description": "v0.5：plan.site.ground（flat / rolling / hills / mountain / canyon / lake / island / coast / desert / cavern / sky）" }
       }
     },
     "intent": {
       "type": "object",
-      "properties": {
-        "summary": { "type": "string" },
-        "mood": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "gameplay": { "type": "string" },
-        "scale_reference": { "type": "string" }
-      }
+      "properties": { "summary": { "type": "string" }, "mood": { "type": "array", "items": { "type": "string" } }, "gameplay": { "type": "string" }, "scale_reference": { "type": "string" } }
     },
     "style": {
       "type": "object",
       "properties": {
-        "palette": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["role", "hex"],
-            "properties": {
-              "role": { "type": "string" },
-              "hex": { "$ref": "#/definitions/hex" },
-              "note": { "type": "string" }
-            }
-          }
-        },
-        "references": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["path"],
-            "properties": {
-              "path": { "type": "string" },
-              "note": { "type": "string" },
-              "applies_to": {
-                "type": "array",
-                "items": { "$ref": "#/definitions/id" }
-              }
-            }
-          }
-        },
-        "lighting": {
-          "type": "object",
-          "properties": {
-            "time_of_day": { "type": "string", "enum": ["dawn", "morning", "noon", "afternoon", "dusk", "night", "overcast"] },
-            "sun_azimuth_deg": { "type": "number", "minimum": 0, "maximum": 360 },
-            "sun_elevation_deg": { "type": "number", "minimum": -10, "maximum": 90 },
-            "note": { "type": "string" }
-          }
-        },
-        "material_intents": {
-          "type": "object",
-          "additionalProperties": { "type": "string" }
-        }
+        "palette": { "type": "array", "items": { "type": "object", "required": ["role", "hex"], "properties": { "role": { "type": "string" }, "hex": { "$ref": "#/definitions/hex" }, "note": { "type": "string" } } } },
+        "references": { "type": "array", "items": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "note": { "type": "string" }, "applies_to": { "type": "array", "items": { "$ref": "#/definitions/id" } } } } },
+        "lighting": { "type": "object", "properties": { "time_of_day": { "type": "string", "enum": ["dawn", "morning", "noon", "afternoon", "dusk", "night", "overcast"] }, "sun_azimuth_deg": { "type": "number", "minimum": 0, "maximum": 360 }, "sun_elevation_deg": { "type": "number", "minimum": -10, "maximum": 90 }, "note": { "type": "string" } } },
+        "material_intents": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },
     "bounds": {
       "type": "object",
       "required": ["min", "max"],
-      "properties": {
-        "min": { "$ref": "#/definitions/vec3" },
-        "max": { "$ref": "#/definitions/vec3" }
-      }
+      "properties": { "min": { "$ref": "#/definitions/vec3" }, "max": { "$ref": "#/definitions/vec3" } }
     },
     "terrain": {
       "type": "object",
@@ -121,19 +71,13 @@
             "required": ["id", "kind", "center", "radius", "height"],
             "properties": {
               "id": { "$ref": "#/definitions/id" },
-              "kind": { "type": "string", "enum": ["hill", "pit", "plateau", "cliff", "ridge", "valley", "basin"], "description": "valley / basin / pit 有 polygon 时是负的平底（height < 0）" },
+              "kind": { "type": "string", "enum": ["hill", "pit", "plateau", "cliff", "ridge", "valley", "basin", "raise", "lower", "flatten", "terrace", "ramp", "carve", "lake", "river", "dune", "noise"], "description": "valley / basin / pit 有 polygon 时是负的平底（height < 0）；v0.5 的雕刻特征 kind = op" },
               "center": { "$ref": "#/definitions/vec3" },
               "radius": { "type": "number", "exclusiveMinimum": 0 },
               "height": { "type": "number", "description": "正为凸起，负为凹陷" },
               "label": { "type": "string" },
               "notes": { "type": "string" },
-              "polygon": {
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 32,
-                "items": { "$ref": "#/definitions/vec2" },
-                "description": "台地俯视多边形（D13）；有它时 center/radius 由引擎回填为质心与外接半径"
-              },
+              "polygon": { "type": "array", "minItems": 3, "maxItems": 32, "items": { "$ref": "#/definitions/vec2" }, "description": "台地俯视多边形（D13）；有它时 center/radius 由引擎回填为质心与外接半径；v0.5 雕刻特征的遮罩多边形" },
               "level": { "type": "integer", "minimum": 0, "description": "层号（0 = 最低），height = level × meta.layer_height_m" },
               "skirt": { "type": "number", "minimum": 0, "description": "台地边缘坡面宽度（米），默认 clamp(height×0.8, 2, 10)" },
               "user_height": { "type": "boolean", "description": "人在剖面上单独调过这一层的高度：height 是实际值，重算 / 换参数（同原型）时沿用" },
@@ -142,12 +86,29 @@
               "rx": { "type": "number", "description": "椭圆穹顶沿长轴的半径（米）" },
               "rz": { "type": "number", "description": "椭圆穹顶沿短轴的半径（米）" },
               "angle": { "type": "number", "description": "椭圆长轴方向（弧度，atan2(z, x)）" },
-              "step": { "type": "integer", "description": "台地带 / 环台的第几级（0 = 最低 / 最外）" },
+              "step": { "type": "number", "description": "台地带 / 环台的第几级（0 = 最低 / 最外）；v0.5 雕刻 quant 时是级高（米）" },
               "ring": { "type": "boolean", "description": "环台的一圈（多边形带一条零宽缝：外圈 + 反向内圈）" },
-              "cliff": { "type": "boolean", "description": "崖：坡裙极窄" }
+              "cliff": { "type": "boolean", "description": "崖：坡裙极窄" },
+              "op": { "type": "string", "enum": ["raise", "lower", "flatten", "terrace", "ramp", "carve", "lake", "river", "cliff", "dune", "noise"], "description": "v0.5：雕刻操作（来自 plan.terrain[].op 或 site.ground）" },
+              "blend": { "type": "string", "enum": ["add", "set", "max", "min", "quant"], "description": "v0.5：合成——add 相加 amount（或 wave）× 权重；set 覆盖到 target（或 ramp）；max 抬到；min 压到；quant 按 step / base 台阶化" },
+              "mask": { "type": "string", "enum": ["poly", "line", "all"], "description": "v0.5：遮罩——polygon（可带 hole）/ line（折线 + half 半宽）/ 整个场地" },
+              "hole": { "type": "array", "items": { "$ref": "#/definitions/vec2" }, "description": "v0.5：环形遮罩的内圈" },
+              "line": { "type": "array", "items": { "$ref": "#/definitions/vec2" }, "description": "v0.5：线形遮罩（沟 / 河 / 坡道）" },
+              "half": { "type": "number", "description": "v0.5：线形遮罩的核心半宽（米）" },
+              "edge": { "type": "string", "enum": ["slope", "cliff", "terraced", "round"], "description": "v0.5：遮罩边缘——缓坡 / 陡崖 / 台阶（steps 级）/ 圆丘（只在里面渐变）" },
+              "steps": { "type": "integer", "description": "v0.5：terraced 边的级数" },
+              "amount": { "type": "number", "description": "v0.5：add 的高度增量（米）" },
+              "target": { "type": "number", "description": "v0.5：set / max / min 的目标高度（米，绝对）" },
+              "ramp": { "type": "object", "description": "v0.5：坡道 { a, b, ya, yb }：目标高度沿 a→b 线性" },
+              "wave": { "type": "object", "description": "v0.5：起伏 { kind: noise|dune, amp, scale, seed, dir }" },
+              "base": { "type": "number", "description": "v0.5：quant 的基准高度" },
+              "register": { "type": "string", "enum": ["top", "quant"], "description": "v0.5：登记成台地——top（平顶 / 削平面）/ quant（各级）" },
+              "reg_step": { "type": "number" },
+              "reg_base": { "type": "number" }
             }
           }
-        }
+        },
+        "sculpt": { "type": "boolean", "description": "v0.5：features 按顺序作用在高度上（雕刻），见 features[].op / blend" }
       }
     },
     "volumes": {
@@ -157,13 +118,10 @@
         "required": ["id", "kind", "shape", "position", "size"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": {
-            "type": "string",
-            "enum": ["building", "wall", "platform", "rock", "prop", "water", "cover", "blocker", "placeholder"]
-          },
-          "shape": { "type": "string", "enum": ["box", "cylinder", "ramp", "custom"] },
+          "kind": { "type": "string", "enum": ["building", "wall", "platform", "rock", "prop", "water", "cover", "blocker", "placeholder", "tower", "stairs", "column", "gate", "statue", "tree", "crystal", "island", "structure"], "description": "v0.5 增加 tower / stairs / column / gate / statue / tree / crystal / island / structure（纯形体）" },
+          "shape": { "type": "string", "enum": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "ramp", "custom"], "description": "v0.5：10 种形体。size 总是 [x 宽, 高, z 深]：圆的类（cylinder / cone / dome / sphere / torus / prism）x / z 是两个方向的直径；wedge / stairs 前面（局部 −z，门的一侧）最高；torus 的高 = 管粗；arch 的厚 = z" },
           "position": { "$ref": "#/definitions/vec3", "description": "底面中心" },
-          "size": { "$ref": "#/definitions/vec3", "description": "x 宽、y 高、z 深（米）" },
+          "size": { "$ref": "#/definitions/vec3", "description": "x 宽、y 高（含屋顶 roof_h）、z 深（米）；圆的类 x / z 是直径" },
           "rotation_y": { "type": "number", "default": 0, "description": "绕 +Y 的角度，0 = 面朝北(-Z)，逆时针为正（俯视）" },
           "label": { "type": "string" },
           "material_intent": { "type": "string" },
@@ -179,13 +137,25 @@
           "plan_id": { "type": ["string", "null"], "description": "v0.4：地标 = plan.landmarks 的 id；房子 = plan.buildings 的 id（建筑类型）" },
           "zone_id": { "type": "string", "description": "v0.4：房子所在的 plan 区域 id" },
           "form": { "type": "string", "enum": ["house", "stilt_house", "courtyard", "round_house", "tower", "hall", "pavilion", "gate", "bridge", "stage", "wall", "well", "tree", "statue", "custom"], "description": "v0.4：形制（决定体块怎么画：屋顶 / 柱脚 / 圆形）" },
-          "roof": { "type": "string", "enum": ["gable", "hip", "flat", "pyramid", "round", "none"] },
+          "roof": { "type": "string", "enum": ["gable", "hip", "flat", "pyramid", "round", "none", "dome", "spire"] },
           "floors": { "type": "integer", "minimum": 1 },
           "stilt_m": { "type": "number", "minimum": 0, "description": "吊脚楼的柱脚高（底面取上坡角，= 上坡角 − 下坡角地面高）" },
           "courtyard": { "type": "string", "description": "院落组号（一组四栋围合）" },
           "wing": { "type": "string", "enum": ["front", "back", "left", "right"], "description": "院落里的哪一栋" },
           "span_ends": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "桥的两头 [x, z]（form bridge）" },
-          "rests_on": { "type": "string", "description": "立在哪个体块身上（plan 里 place.rel = above 且目标是地标，如桥心楼阁在风雨桥上）：y = 它的桥面 / 顶面，和它不算重叠" }
+          "rests_on": { "type": "string", "description": "立在哪个体块身上（plan 里 place.rel = above 且目标是地标，如桥心楼阁在风雨桥上）：y = 它的桥面 / 顶面，和它不算重叠" },
+          "roof_h": { "type": "number", "minimum": 0, "description": "v0.5：屋顶占的高度（在 size[1] 之内，顶部那一段）" },
+          "elev": { "type": "number", "description": "v0.5：底面离地高度（position.y − 中心地面高；悬空 > 0）" },
+          "land": { "type": "object", "description": "v0.5：落地规则 { mode: snap|float|carve|rest|abs|plinth, elev, on, abs }：贴地（取覆盖范围最高点）/ 悬空（地面 + elev）/ 嵌入（最低点 + elev）/ 立在 on 那块顶上 / 绝对高度 / 基座", "properties": { "mode": { "type": "string", "enum": ["snap", "float", "carve", "rest", "abs", "plinth"] }, "elev": { "type": "number" }, "on": { "type": "string" }, "abs": { "type": "number" } } },
+          "plan_path": { "type": "array", "items": { "type": "string" }, "description": "v0.5：祖先节点 id（组 / 重复 / 实例 id[k]），plan 里按 id 找整组用" },
+          "instance_of": { "type": "string", "description": "v0.5：属于哪个 repeat 的实例" },
+          "instance": { "type": "integer", "minimum": 0, "description": "v0.5：第几个实例（从 0 数，对应 id[k]）" },
+          "sides": { "type": "integer", "minimum": 3, "description": "v0.5：prism 的边数" },
+          "hollow": { "type": "boolean", "description": "v0.5：空心（拱、环、塔架）。空心圆柱（shape cylinder）= 一圈带子 / 筒壁：俯视画环、3D 是开口的环形壳、剖面穿过内孔是两段壁，落地按带子上的最高点，孔里能放别的东西" },
+          "wall": { "type": "number", "minimum": 0, "description": "v0.5：空心圆柱的带宽 / 壁厚（米）；内孔直径 = size[0] − 2·wall" },
+          "orient": { "type": "string", "enum": ["flat", "upright"], "description": "v0.5：torus 的摆法。upright = 立起来（环面竖着，按 rotation_y 朝向）：size = [直径, 直径（高）, 管粗（厚）]" },
+          "inverted": { "type": "boolean", "description": "v0.5：倒过来画（浮岛 = 倒锥）" },
+          "plinth_of": { "type": "string", "description": "v0.5：这是哪个体块的基座（贴地时脚下高差大，自动补的）" }
         }
       }
     },
@@ -196,29 +166,8 @@
         "required": ["id", "kind", "polygon"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": {
-            "type": "string",
-            "enum": [
-              "danger",
-              "encounter",
-              "farmland",
-              "forest",
-              "gathering",
-              "grass",
-              "other",
-              "plaza",
-              "safe",
-              "sand",
-              "terrace",
-              "water"
-            ]
-          },
-          "polygon": {
-            "type": "array",
-            "minItems": 3,
-            "items": { "$ref": "#/definitions/vec2" },
-            "description": "XZ 平面上的顶点，按顺序"
-          },
+          "kind": { "type": "string", "enum": ["danger", "encounter", "farmland", "forest", "gathering", "grass", "other", "plaza", "safe", "sand", "terrace", "water"] },
+          "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的顶点，按顺序" },
           "surface": { "type": "string", "description": "引用 style.palette 中的 role 或材质意图键" },
           "density": { "type": "number", "minimum": 0, "maximum": 1.6 },
           "label": { "type": "string" },
@@ -229,18 +178,10 @@
           "use": { "type": "string", "description": "v0.4：plan 里的用途（housing / market / plaza / farm / terrace_farm / forest / temple / dock / yard / ruins / other）" },
           "terrace_id": { "type": "string", "description": "这个区域对应的台地 feature id" },
           "floor_of": { "type": "string", "description": "v0.4：区域在谷 / 盆地 / 坑的底上（plan 地形 id）：布房只放在不属于任何台地的真实地面" },
-          "building": {
-            "type": "object",
-            "description": "v0.4：区域里放什么建筑（plan.buildings 的一种）：布房按它的形制与尺寸",
-            "properties": {
-              "form": { "type": "string" },
-              "size": { "$ref": "#/definitions/vec3", "description": "[宽, 高, 深]（米）" },
-              "floors": { "type": "integer" },
-              "roof": { "type": "string" },
-              "label": { "type": "string" },
-              "plan_id": { "type": ["string", "null"] }
-            }
-          }
+          "building": { "type": "object", "description": "v0.4：区域里放什么建筑（plan.buildings 的一种）：布房按它的形制与尺寸", "properties": { "form": { "type": "string" }, "size": { "$ref": "#/definitions/vec3", "description": "[宽, 高, 深]（米）" }, "floors": { "type": "integer" }, "roof": { "type": "string" }, "label": { "type": "string" }, "plan_id": { "type": ["string", "null"] } } },
+          "surface_y": { "type": "number", "description": "v0.5：水面高度（kind water：湖 / 海 / 池）" },
+          "hole": { "type": "array", "items": { "$ref": "#/definitions/vec2" }, "description": "v0.5：挖掉的内圈（海岛四周的海）" },
+          "plan_path": { "type": "array", "items": { "type": "string" } }
         }
       }
     },
@@ -252,12 +193,7 @@
         "properties": {
           "id": { "$ref": "#/definitions/id" },
           "kind": { "type": "string", "enum": ["road", "trail", "river", "wall_line", "fence", "bridge", "other"] },
-          "points": {
-            "type": "array",
-            "minItems": 2,
-            "items": { "$ref": "#/definitions/vec2" },
-            "description": "XZ 平面上的折线"
-          },
+          "points": { "type": "array", "minItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "XZ 平面上的折线" },
           "width": { "type": "number", "exclusiveMinimum": 0 },
           "surface": { "type": "string" },
           "label": { "type": "string" },
@@ -267,11 +203,23 @@
           "detour_around": { "type": "array", "items": { "$ref": "#/definitions/id" }, "description": "主路为躲开这几栋人放的房子（user_moved / locked）绕了路（引擎算，只读）" },
           "facts": { "type": "object", "description": "引擎算出的路径事实（length_m / climb_m / folds / max_slope / steps_estimate）" },
           "plan_id": { "type": ["string", "null"], "description": "v0.4：来自 plan.paths / plan.water 的哪一条（main_trail 是第一条路）" },
-          "style": { "type": "string", "enum": ["winding", "stairs", "zigzag", "straight", "bridge", "tunnel"], "description": "v0.4：路的走法" },
+          "style": { "type": "string", "enum": ["winding", "stairs", "zigzag", "straight", "bridge", "tunnel", "path", "road", "ramp", "rope_bridge", "canal", "portal"], "description": "v0.4：路的走法；v0.5：连接的样式（path / road / stairs / ramp 走地形，bridge / rope_bridge 直线跨越，tunnel 走地下，canal 开沟，portal 只有两端标记）" },
           "nodes": { "type": "array", "items": { "type": "string" }, "description": "v0.4：经过的 plan 节点（spawn / 元素 id）" },
           "tunnel": { "type": "boolean" },
           "fallback": { "type": ["string", "null"], "description": "路由退回的原因（如「直上石阶」）" },
-          "auto_spur": { "type": "boolean", "description": "引擎自动补的支路（重算先清再补）" }
+          "auto_spur": { "type": "boolean", "description": "引擎自动补的支路（重算先清再补）" },
+          "ends_y": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" }, "description": "v0.5：两端的高度（米，绝对；桥面 / 台阶两头）" },
+          "elevated": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "boolean" }, "description": "v0.5：两端是不是在高处（离地 > 2.5 m）" },
+          "deck_y": { "type": "number", "description": "v0.5：桥面高度（取两端高者；斜桥按 ends_y 插值）" },
+          "piers": { "type": "array", "items": { "$ref": "#/definitions/vec2" }, "description": "v0.5：桥墩位置（桥面离地 > 4 m 处每 12 m 一个）" },
+          "from_id": { "type": ["string", "null"], "description": "v0.5：起点引用的 plan id（spawn / 节点 / 实例 / 地形）" },
+          "to_id": { "type": ["string", "null"], "description": "v0.5：终点引用的 plan id" },
+          "straight": { "type": "boolean", "description": "v0.5：台阶绕不上去，直上" },
+          "instance_of": { "type": "string", "description": "v0.5：一组连接（repeat 的模板是 link）里的第几条：属于哪个 repeat" },
+          "instance": { "type": "integer", "minimum": 0, "description": "v0.5：第几条（对应 plan_id = id[k]）" },
+          "unrouted": { "type": "boolean", "description": "v0.5：按样式走不通（坡太陡），只有两端点；视图画两端标记 + 虚线、不画路面，可达分析不把它当路" },
+          "portal": { "type": "boolean" },
+          "auto": { "type": "boolean", "description": "v0.5：没有连接碰到出生点时自动补的主路" }
         }
       }
     },
@@ -282,10 +230,7 @@
         "required": ["id", "kind", "position"],
         "properties": {
           "id": { "$ref": "#/definitions/id" },
-          "kind": {
-            "type": "string",
-            "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "connector", "other"]
-          },
+          "kind": { "type": "string", "enum": ["player_spawn", "objective", "enemy_spawn", "light", "camera", "poi", "prop", "trigger", "connector", "other", "portal"] },
           "position": { "$ref": "#/definitions/vec3" },
           "rotation_y": { "type": "number" },
           "size": { "$ref": "#/definitions/vec3" },
@@ -299,7 +244,10 @@
           "bottom_y": { "type": "number", "description": "连接点下端高度（米）；position 是下端" },
           "generated": { "type": "boolean", "description": "引擎自动放的连接点（重算时按主路重新选位置）" },
           "user_moved": { "type": "boolean", "description": "人拖过的连接点：重算只改两端高度，不动位置" },
-          "plan_id": { "type": ["string", "null"], "description": "v0.4：出生点为 spawn；连接点为所连空间的 plan id" }
+          "plan_id": { "type": ["string", "null"], "description": "v0.4：出生点为 spawn；连接点为所连空间的 plan id" },
+          "pair": { "type": "string", "description": "v0.5：传送门的另一端 marker id" },
+          "link": { "type": "string", "description": "v0.5：传送门所属的路 id" },
+          "rests_on": { "type": "string", "description": "v0.5：出生点站在哪个体块上（浮岛）" }
         }
       }
     },
@@ -342,22 +290,7 @@
           "room_graph": {
             "type": "object",
             "description": "plan 给的房间清单与连线（rooms 布局；\"entry\" 是保留节点 = 从地面下来的入口）",
-            "properties": {
-              "rooms": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "required": ["id"],
-                  "properties": {
-                    "id": { "type": "string" },
-                    "label": { "type": "string" },
-                    "size": { "type": "string", "enum": ["s", "m", "l"] },
-                    "size_m": { "type": "number", "exclusiveMinimum": 0 }
-                  }
-                }
-              },
-              "links": { "type": "array", "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string" } } }
-            }
+            "properties": { "rooms": { "type": "array", "items": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "label": { "type": "string" }, "size": { "type": "string", "enum": ["s", "m", "l"] }, "size_m": { "type": "number", "exclusiveMinimum": 0 } } } }, "links": { "type": "array", "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string" } } } }
           },
           "passages": {
             "type": "array",
@@ -393,19 +326,7 @@
               }
             }
           },
-          "links": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string" },
-                "at": { "$ref": "#/definitions/vec2" },
-                "from": { "type": "integer", "minimum": 0, "description": "下（小）的内部层号" },
-                "to": { "type": "integer", "minimum": 0 },
-                "via": { "type": "string", "enum": ["ladder", "ramp", "winze", "stairs"], "description": "层间连接：梯子 / 坡道 / 暗井 / 楼梯" }
-              }
-            }
-          },
+          "links": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "at": { "$ref": "#/definitions/vec2" }, "from": { "type": "integer", "minimum": 0, "description": "下（小）的内部层号" }, "to": { "type": "integer", "minimum": 0 }, "via": { "type": "string", "enum": ["ladder", "ramp", "winze", "stairs"], "description": "层间连接：梯子 / 坡道 / 暗井 / 楼梯" } } } },
           "entrance": { "$ref": "#/definitions/vec2", "description": "入口 [x, z]（地面连接点落在这里）" },
           "goal": { "oneOf": [{ "$ref": "#/definitions/vec2" }, { "type": "null" }], "description": "终点 [x, z]；没有终点（单室等）为 null" },
           "facts": {
@@ -426,51 +347,14 @@
     },
     "relations": {
       "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["type", "a", "b"],
-        "properties": {
-          "type": {
-            "type": "string",
-            "enum": [
-              "faces",
-              "adjacent",
-              "on_top_of",
-              "inside",
-              "visible_from",
-              "connects",
-              "blocks",
-              "aligned_with",
-              "far_from"
-            ]
-          },
-          "a": { "$ref": "#/definitions/id" },
-          "b": { "$ref": "#/definitions/id" },
-          "notes": { "type": "string" }
-        }
-      }
+      "items": { "type": "object", "required": ["type", "a", "b"], "properties": { "type": { "type": "string", "enum": ["faces", "adjacent", "on_top_of", "inside", "visible_from", "connects", "blocks", "aligned_with", "far_from"] }, "a": { "$ref": "#/definitions/id" }, "b": { "$ref": "#/definitions/id" }, "notes": { "type": "string" } } }
     },
     "constraints": {
       "type": "array",
       "items": {
         "type": "object",
         "required": ["type"],
-        "properties": {
-          "type": {
-            "type": "string",
-            "enum": ["locked", "min_clearance", "keep_inside", "max_count", "must_reach", "no_overlap"]
-          },
-          "targets": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "id 列表，\"*\" 表示全部"
-          },
-          "from": { "$ref": "#/definitions/id" },
-          "region": { "type": "string" },
-          "meters": { "type": "number" },
-          "count": { "type": "integer" },
-          "notes": { "type": "string" }
-        }
+        "properties": { "type": { "type": "string", "enum": ["locked", "min_clearance", "keep_inside", "max_count", "must_reach", "no_overlap"] }, "targets": { "type": "array", "items": { "type": "string" }, "description": "id 列表，\"*\" 表示全部" }, "from": { "$ref": "#/definitions/id" }, "region": { "type": "string" }, "meters": { "type": "number" }, "count": { "type": "integer" }, "notes": { "type": "string" } }
       }
     },
     "views": {
@@ -483,15 +367,7 @@
           "image": { "type": "string", "description": "相对路径" },
           "scale_m_per_px": { "type": "number", "description": "俯视图用" },
           "north_up": { "type": "boolean", "default": true },
-          "camera": {
-            "type": "object",
-            "properties": {
-              "position": { "$ref": "#/definitions/vec3" },
-              "look_at": { "$ref": "#/definitions/vec3" },
-              "fov_deg": { "type": "number", "description": "垂直视场角（three.js / Unity 口径；UE 的 FOV 是水平，需换算）" },
-              "aspect": { "type": "number" }
-            }
-          },
+          "camera": { "type": "object", "properties": { "position": { "$ref": "#/definitions/vec3" }, "look_at": { "$ref": "#/definitions/vec3" }, "fov_deg": { "type": "number", "description": "垂直视场角（three.js / Unity 口径；UE 的 FOV 是水平，需换算）" }, "aspect": { "type": "number" } } },
           "labels_drawn": { "type": "boolean", "description": "图上是否已画出 id/label" },
           "note": { "type": "string" }
         }
@@ -506,28 +382,23 @@
           "search": { "type": "string", "description": "资产库检索词" },
           "generator_prompt": { "type": "string", "description": "3D 生成服务的提示词" },
           "file": { "type": "string", "description": "导出包内的素材相对路径（assets/…），由编辑器导入素材时写入；只是提示，文件可能不存在" },
-          "front_axis": {
-            "type": "string",
-            "enum": ["+Z", "-Z"],
-            "default": "+Z",
-            "description": "素材模型的正面朝向。glTF 规范为 +Z；SID 的 rotation_y 0 朝 −Z，编辑器与 glb 导出对 +Z 素材补偿 180°"
-          },
+          "front_axis": { "type": "string", "enum": ["+Z", "-Z"], "default": "+Z", "description": "素材模型的正面朝向。glTF 规范为 +Z；SID 的 rotation_y 0 朝 −Z，编辑器与 glb 导出对 +Z 素材补偿 180°" },
           "fit": { "type": "string", "enum": ["scale_to_volume", "scale_uniform", "keep_size"] },
-          "scatter": {
-            "type": "object",
-            "properties": {
-              "min_spacing": { "type": "number" },
-              "scale_jitter": { "type": "number" }
-            }
-          },
+          "scatter": { "type": "object", "properties": { "min_spacing": { "type": "number" }, "scale_jitter": { "type": "number" } } },
           "fallback": { "type": "string" }
         }
       }
     }
   },
   "definitions": {
-    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
-    "hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "hex": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
     "vec2": {
       "type": "array",
       "items": { "type": "number" },

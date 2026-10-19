@@ -1,0 +1,146 @@
+<!doctype html><meta charset="utf-8"><title>示例与模拟输出：编译 + 视图约定 + 渲染</title>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }</script>
+<style>
+  body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#fff}
+  #stage{position:absolute;left:0;top:0;width:700px;height:700px} #stage svg{width:700px;height:700px;display:block}
+  #side{position:absolute;left:710px;top:0;width:730px} #side svg{width:730px;display:block} #side .caption{display:none}
+  #three{position:absolute;left:710px;top:470px;width:730px;height:420px}
+  #out{position:absolute;left:0;top:900px;font-size:11px;white-space:pre-wrap;width:1400px}
+  #name{position:absolute;left:8px;top:6px;font-size:18px;font-weight:bold;background:#fffc;padding:2px 6px;z-index:5}
+  body.shot #out{display:none} body.shot #stage{width:880px;height:880px} body.shot #stage svg{width:880px;height:880px}
+  body.shot #side{left:890px;width:550px} body.shot #side svg{width:550px} body.shot #three{left:890px;top:470px;width:550px;height:420px}
+</style>
+<div id="stage"></div><div id="side"></div><div id="three"></div><div id="name"></div><pre id="out">running</pre>
+<script type="module">
+// examples.test.html — 解释器 × 视图 × 后端的接缝：
+//  1) spec/examples/plans 的 7 个 v2 示例；2) build/eval/mock-drafts.json（desktop/test_app.py 的 t_engine_fixture 写：模拟 AI 的 draft、
+//     每个片段的最小 plan、revise 前后，有就测，没有跳过）；或 ?src=<json>（{plans, revisions?} 或数组）只测它。
+// 每张：compilePlan 0 error、< 500 ms、同 seed 确定；SID v0.5 字段与视图约定逐项对齐（shape / size 含屋顶 / elev / roof / style / deck_y / piers / water / portal）；
+// 俯视 / 剖面 / 人眼渲染不报错（示例另挂 3D，CDN 不通时只跳过 3D 断言）。revise：Python apply_ops 与 JS applyOps 结果相同、都能编。
+// 截图：?plan=magic-academy 或 ?src=…&k=0（四个视图摆一页）。
+import { test, run, assert } from "./harness.js";
+import { compilePlan, applyOps } from "../plan.js";
+import { renderMap, SHAPES, ROOFS, PATH_STYLES, volDims, roofOf, volumeTop, volumeBase } from "../../views/map.js";
+import { renderProfile } from "../../views/profile.js";
+import { renderEye } from "../../views/eye.js";
+import { mountView3d } from "../../views/view3d.js";
+
+const Q = new URLSearchParams(location.search);
+const NAMES = ["magic-academy", "sky-garden", "pirate-harbor", "desert-temple", "cyber-market", "mountain-village", "mine-maze"];
+const stage = document.getElementById("stage"), side = document.getElementById("side"), box3 = document.getElementById("three");
+let REVS = [];
+const fromFile = (j, name) => { const list = Array.isArray(j) ? j : j.plans || [j]; REVS = REVS.concat(j.revisions || []); return list.map((p, i) => [`${name}#${i} ${p.name || ""}`, p]); };
+const load = async () => {
+  if (Q.get("src")) return fromFile(await fetch(Q.get("src"), { cache: "no-store" }).then((r) => r.json()), Q.get("src").split("/").pop());
+  const out = []; for (const n of NAMES) out.push([n, await fetch(`../../../spec/examples/plans/${n}.plan.json`, { cache: "no-store" }).then((r) => r.json())]);
+  try { const r = await fetch("../../../build/eval/mock-drafts.json", { cache: "no-store" }); if (r.ok) out.push(...fromFile(await r.json(), "mock")); } catch (e) { /* 没跑过 test_app.py：只测示例 */ }
+  return out;
+};
+const ALL = await load();
+const fin = (x) => typeof x === "number" && Number.isFinite(x);
+const isPt = (q) => Array.isArray(q) && q.length >= 2 && q.every(fin);
+
+/** SID v0.5 与视图约定的逐项对齐：返回问题列表 */
+function conventions(r) {
+  const bad = [], { sid } = r;
+  for (const v of sid.volumes) {
+    const w = `体块 ${v.id}`;
+    if (!SHAPES.includes(v.shape)) bad.push(`${w} shape「${v.shape}」`);
+    if (!Array.isArray(v.size) || v.size.length !== 3 || !v.size.every((x) => fin(x) && x > 0)) bad.push(`${w} size ${JSON.stringify(v.size)}`);
+    if (!Array.isArray(v.position) || v.position.length !== 3 || !v.position.every(fin)) bad.push(`${w} position ${JSON.stringify(v.position)}`);
+    if (v.rotation_y != null && !fin(v.rotation_y)) bad.push(`${w} rotation_y`);
+    if (v.elev != null && !(fin(v.elev) && v.elev >= 0)) bad.push(`${w} elev ${v.elev}`);
+    if (typeof v.kind !== "string") bad.push(`${w} 没有 kind`);
+    if (v.roof != null) {
+      if (v.kind !== "building" && v.kind !== "tower") bad.push(`${w} kind ${v.kind} 不该有 roof`);
+      if (!ROOFS.includes(v.roof)) bad.push(`${w} roof「${v.roof}」`);
+      if (v.roof_h != null && !(fin(v.roof_h) && v.roof_h >= 0 && v.roof_h < v.size[1])) bad.push(`${w} roof_h ${v.roof_h} 不在 size[1] ${v.size[1]} 之内`);
+    }
+    if (v.shape === "prism" && v.sides != null && !(Number.isInteger(v.sides) && v.sides >= 3)) bad.push(`${w} sides ${v.sides}`);
+    // 视图读到的总高 = SID 总高（屋顶在 size[1] 之内）
+    const r0 = roofOf(v), tot = volDims(v)[1] + (r0 ? r0.h : 0);
+    if (Math.abs(tot - v.size[1]) > 0.06) bad.push(`${w} 视图总高 ${tot} ≠ size[1] ${v.size[1]}`);
+  }
+  for (const p of sid.paths) {
+    const w = `路 ${p.id}`;
+    if (p.style != null && !PATH_STYLES.includes(p.style)) bad.push(`${w} style「${p.style}」`);
+    if (!Array.isArray(p.points) || p.points.length < 2 || !p.points.every(isPt)) bad.push(`${w} points`);
+    if ((p.style === "bridge" || p.style === "rope_bridge") && !fin(p.deck_y)) bad.push(`${w} 没有 deck_y`);
+    if (p.style === "bridge" && !Array.isArray(p.piers)) bad.push(`${w} 没有 piers`);
+    if (p.piers && !p.piers.every(isPt)) bad.push(`${w} piers 点不对`);
+    if (fin(p.width) === false) bad.push(`${w} width`);
+  }
+  for (const g of sid.regions) {
+    if (g.kind === "water" && !fin(g.surface_y)) bad.push(`水 ${g.id} 没有 surface_y`);
+    if (!Array.isArray(g.polygon) || g.polygon.length < 3 || !g.polygon.every(isPt)) bad.push(`区域 ${g.id} polygon`);
+  }
+  for (const m of sid.markers) if (m.kind === "portal" && !(Array.isArray(m.position) && m.position.length === 3 && m.position.every(fin))) bad.push(`传送门 ${m.id} position`);
+  return bad;
+}
+
+if (Q.get("plan") || Q.get("k") != null) {
+  document.body.classList.add("shot");
+  const k = Q.get("plan") ? ALL.findIndex(([n]) => n === Q.get("plan")) : Number(Q.get("k"));
+  const [name, plan] = ALL[k];
+  const r = compilePlan(plan, { seed: Number(Q.get("seed") || 1) });
+  document.getElementById("name").textContent = `${plan.name || name} · ${r.sid.volumes.length} 体块 · ${r.ms} ms`;
+  const ctx = { sid: r.sid, T: r.T, facts: r.facts, index: r.index, plan: r.plan };
+  stage.append(renderMap(ctx));
+  side.append(renderProfile(ctx, {}).node);
+  const eye = renderEye(ctx); eye.node.querySelector("svg").style.width = "550px"; side.append(eye.node);
+  const h = mountView3d(box3, ctx);
+  h.ready.then((ok) => { document.title = ok ? "3d-ok " + JSON.stringify(h.debug().volumes.shapes) : "3d-offline"; });
+} else {
+  const R = {};
+  for (const [name, plan] of ALL) {
+    test(`${name}：编译 0 error、< 500 ms、确定`, () => {
+      const r = (R[name] = compilePlan(plan, { seed: 1 }));
+      const errs = r.facts.validation.filter((m) => m.level === "error");
+      assert(!errs.length, errs.map((m) => m.msg).slice(0, 4).join("；"));
+      assert(r.ms < 500, `${r.ms} ms`);
+      const r2 = compilePlan(plan, { seed: 1 });
+      assert(JSON.stringify(r2.sid.volumes) === JSON.stringify(r.sid.volumes) && JSON.stringify(r2.sid.paths) === JSON.stringify(r.sid.paths), "同 plan + seed 结果不同");
+    });
+    test(`${name}：SID 字段与视图约定对齐（shape / size / elev / roof / style / deck_y / water / portal）`, () => {
+      const bad = conventions(R[name]);
+      assert(!bad.length, bad.slice(0, 6).join("；") + (bad.length > 6 ? ` …共 ${bad.length}` : ""));
+    });
+    test(`${name}：俯视 / 剖面 / 人眼 / 3D 渲染不报错`, async () => {
+      const r = R[name], ctx = { sid: r.sid, T: r.T, facts: r.facts, index: r.index, plan: r.plan };
+      const svg = renderMap(ctx);
+      const shapes = svg.querySelectorAll("[data-shape]").length;
+      assert(shapes >= Math.min(5, r.sid.volumes.filter((v) => v.kind !== "prop" || v.plan_id).length), `俯视只有 ${shapes} 个形体元素`);
+      renderProfile(ctx, {});
+      renderEye(ctx);
+      if (!NAMES.includes(name)) return; // 3D 只挂示例（模拟输出几十张，挂 3D 太慢；2D 已覆盖字段）
+      const host = document.createElement("div"); host.style.cssText = "width:400px;height:300px;position:absolute;left:-9999px"; document.body.append(host);
+      const h = mountView3d(host, ctx);
+      const ok = await Promise.race([h.ready, new Promise((res) => setTimeout(() => res("timeout"), 20000))]);
+      if (ok === true) { const d = h.debug(); assert(d.volumes && d.volumes.meshes > 0, "3D 没有网格"); }
+      h.dispose && h.dispose(); host.remove();
+    });
+  }
+  // 后端（Python apply_ops）改过的 plan 与前端 applyOps 改出来的：都能编译、0 error；树相同
+  const strip = (o) => JSON.parse(JSON.stringify(o, (k, v) => (k === "locks" ? undefined : v)));
+  REVS.forEach((rv, i) => test(`revise #${i}「${rv.text}」→ ${rv.base.name}：Python 与 JS 应用 ops 一致、编译 0 error`, () => {
+    const js = applyOps(rv.base, rv.ops);
+    const rp = compilePlan(rv.plan, { seed: 1 }), rj = compilePlan(js.plan, { seed: 1 });
+    for (const r of [rp, rj]) { const e = r.facts.validation.filter((m) => m.level === "error"); assert(!e.length, e.map((m) => m.msg).slice(0, 3).join("；")); }
+    const a = JSON.stringify(strip(normalizeForCmp(rv.plan))), b = JSON.stringify(strip(normalizeForCmp(js.plan)));
+    assert(a === b, `树不同：${firstDiff(a, b)}`);
+    assert(rp.sid.volumes.length === rj.sid.volumes.length, `体块数 Python ${rp.sid.volumes.length} vs JS ${rj.sid.volumes.length}；ops ${JSON.stringify(rv.ops).slice(0, 200)}`);
+  }));
+  function firstDiff(a, b) { let i = 0; while (i < a.length && a[i] === b[i]) i++; return `…${a.slice(Math.max(0, i - 80), i + 60)} ‖ JS …${b.slice(Math.max(0, i - 80), i + 60)}`; }
+  function normalizeForCmp(p) { return compilePlan(p, { seed: 1 }).plan; }
+  test("每个 plan 的高度：视图最高点 = SID 最高体块顶（屋顶不重复叠加）", () => {
+    for (const [name] of ALL) {
+      const r = R[name]; if (!r) continue;
+      for (const v of r.sid.volumes) {
+        const top = volumeTop(v, r.T), base = volumeBase(v, r.T);
+        assert(Math.abs(top - base - v.size[1]) < 0.06, `${name} ${v.id}: ${top - base} vs ${v.size[1]}`);
+      }
+    }
+  });
+  run();
+}
+</script>

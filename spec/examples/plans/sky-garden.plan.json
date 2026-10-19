@@ -1,0 +1,42 @@
+{
+  "name": "云上花园",
+  "concept": "没有地面：一座大浮岛当中心花园，五座小浮岛环绕，高低错落，用索桥一座座连起来",
+  "key_structures": ["中心浮岛", "云亭", "环绕的小浮岛", "索桥", "花树"],
+  "site": { "size_m": [200, 200], "ground": "sky", "layer_m": 4 },
+  "nodes": [
+    { "id": "hub", "type": "island", "label": "中心浮岛", "role": "landmark", "at": "site.C", "elev_m": 30, "size_m": [46, 14, 46],
+      "children": [
+        { "id": "pavilion", "type": "building", "label": "云亭", "size_m": [14, 10, 14], "roof": "dome", "offset_m": [0, -6] },
+        { "id": "garden", "type": "repeat", "label": "花树", "pattern": "scatter", "count": 7, "area": "hub", "gap_m": 6,
+          "child": { "id": "bloom", "type": "tree", "label": "花树", "size_m": [4, 6], "color": "blossom" } }
+      ] },
+    { "id": "isles", "type": "repeat", "label": "小浮岛", "at": "site.C", "pattern": "radial", "count": 5, "radius_m": 66, "start_deg": 36, "face": "center",
+      "overrides": { "1": { "elev_m": 40 }, "3": { "elev_m": 24 }, "4": { "elev_m": 34 } },
+      "child": { "id": "isle", "type": "island", "label": "小浮岛", "size_m": [22, 9, 22], "elev_m": 28,
+        "children": [
+          { "id": "kiosk", "type": "building", "label": "小亭", "size_m": [7, 6, 7], "roof": "spire" },
+          { "id": "isle_tree", "type": "tree", "label": "树", "size_m": [4, 7], "offset_m": [6, 5] }
+        ] } },
+    { "id": "bridge_0", "type": "link", "style": "rope_bridge", "label": "索桥一", "from": "hub", "to": "isles[0]" },
+    { "id": "bridge_1", "type": "link", "style": "rope_bridge", "label": "索桥二", "from": "hub", "to": "isles[1]" },
+    { "id": "bridge_2", "type": "link", "style": "rope_bridge", "label": "索桥三", "from": "hub", "to": "isles[2]" },
+    { "id": "bridge_3", "type": "link", "style": "rope_bridge", "label": "索桥四", "from": "hub", "to": "isles[3]" },
+    { "id": "bridge_4", "type": "link", "style": "rope_bridge", "label": "索桥五", "from": "isles[3]", "to": "isles[4]" },
+    { "id": "falls", "type": "torus", "label": "光环", "at": "hub.top", "offset_m": [0, 14], "elev_m": 6, "size_m": [10, 1.2], "color": "mist" }
+  ],
+  "spawn": { "at": "hub", "offset_m": [0, 15], "look_at": "pavilion" },
+  "relations": [
+    { "type": "reachable", "a": "isles[2]", "b": "spawn" },
+    { "type": "visible_from", "a": "pavilion", "b": "spawn" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#B5654A", "note": "赭瓦" },
+    { "role": "wall", "hex": "#F1E6D2", "note": "白墙" },
+    { "role": "stone", "hex": "#9C8F7E", "note": "岛岩" },
+    { "role": "foliage", "hex": "#6E9C5A", "note": "草" },
+    { "role": "mist", "hex": "#F4F1FA", "note": "云" },
+    { "role": "blossom", "hex": "#F2A7B8", "note": "花" }
+  ],
+  "lighting": { "time_of_day": "dawn" },
+  "mood": ["轻盈", "梦幻"]
+}

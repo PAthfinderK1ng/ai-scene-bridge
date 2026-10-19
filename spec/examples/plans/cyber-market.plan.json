@@ -1,0 +1,48 @@
+{
+  "name": "霓虹夜市",
+  "concept": "一条八米宽的窄巷，两侧高低错落的楼，招牌一层层叠在墙上伸进巷子，两座天桥横跨头顶，巷子尽头一座霓虹塔",
+  "key_structures": ["窄巷", "两排高楼", "层叠招牌", "天桥", "小吃摊", "霓虹塔"],
+  "site": { "size_m": [110, 110], "ground": "flat", "layer_m": 3.5 },
+  "terrain": [
+    { "id": "puddle", "op": "lower", "label": "积水洼", "at": "site.C", "offset_m": [0, 30], "shape": "ellipse", "size_m": [5, 3], "depth_m": 0.3, "edge_m": 1 }
+  ],
+  "nodes": [
+    { "id": "alley", "type": "group", "label": "窄巷", "at": "site.C", "offset_m": [0, 6], "children": [
+      { "id": "west_row", "type": "repeat", "label": "西侧楼", "pattern": "linear", "axis": "z", "count": 6, "spacing_m": 11, "offset_m": [-9, 0],
+        "overrides": { "1": { "size_m": [10, 27, 10] }, "3": { "size_m": [10, 12, 10] }, "4": { "size_m": [10, 32, 10] } },
+        "child": { "id": "west_block", "type": "building", "label": "楼", "size_m": [10, 18, 10], "roof": "flat", "rotate_deg": 270 } },
+      { "id": "east_row", "type": "repeat", "label": "东侧楼", "pattern": "linear", "axis": "z", "count": 6, "spacing_m": 11, "offset_m": [9, 0],
+        "overrides": { "0": { "size_m": [10, 28, 10] }, "2": { "size_m": [10, 14, 10] }, "5": { "size_m": [10, 24, 10] } },
+        "child": { "id": "east_block", "type": "building", "label": "楼", "size_m": [10, 20, 10], "roof": "flat", "rotate_deg": 90 } },
+      { "id": "signs_w", "type": "repeat", "label": "西墙招牌", "pattern": "linear", "axis": "z", "count": 6, "spacing_m": 11, "offset_m": [-3.6, 2],
+        "child": { "id": "sign_stack_w", "type": "repeat", "label": "叠层招牌", "pattern": "stack", "levels": 4, "spacing_m": 1.1, "elev_m": 4,
+          "child": { "id": "sign_w", "type": "box", "label": "招牌", "size_m": [0.4, 1.6, 3.2], "color": "neon" } } },
+      { "id": "signs_e", "type": "repeat", "label": "东墙招牌", "pattern": "linear", "axis": "z", "count": 6, "spacing_m": 11, "offset_m": [3.6, -2],
+        "child": { "id": "sign_stack_e", "type": "repeat", "label": "叠层招牌", "pattern": "stack", "levels": 3, "spacing_m": 1.4, "elev_m": 5,
+          "child": { "id": "sign_e", "type": "box", "label": "招牌", "size_m": [0.4, 2, 2.6], "color": "neon2" } } },
+      { "id": "stalls", "type": "repeat", "label": "小吃摊", "pattern": "linear", "axis": "z", "count": 5, "spacing_m": 12, "offset_m": [-2.3, 5.5],
+        "child": { "id": "stall", "type": "box", "label": "小吃摊", "size_m": [1.6, 2.4, 3], "color": "roof" } },
+      { "id": "lanterns", "type": "repeat", "label": "灯笼", "pattern": "linear", "axis": "z", "count": 10, "spacing_m": 6, "elev_m": 7.5,
+        "child": { "id": "lantern", "type": "sphere", "label": "灯笼", "size_m": [0.9], "color": "neon" } },
+      { "id": "skybridge_a", "type": "link", "style": "bridge", "label": "天桥", "from": "west_row[1]", "to": "east_row[1]", "width_m": 2.5 },
+      { "id": "skybridge_b", "type": "link", "style": "bridge", "label": "天桥", "from": "west_row[4]", "to": "east_row[4]", "width_m": 2.5 }
+    ]},
+    { "id": "neon_tower", "type": "tower", "label": "霓虹塔", "role": "landmark", "at": "site.N", "size_m": [8, 46], "shape": "prism", "sides": 6, "roof": "spire", "color": "neon2" }
+  ],
+  "spawn": { "at": "site.S", "look_at": "neon_tower" },
+  "relations": [
+    { "type": "visible_from", "a": "neon_tower", "b": "spawn" },
+    { "type": "reachable", "a": "neon_tower", "b": "spawn" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#2A2633", "note": "沥青顶" },
+    { "role": "wall", "hex": "#4A4656", "note": "水泥墙" },
+    { "role": "stone", "hex": "#5C5A63", "note": "湿地面" },
+    { "role": "foliage", "hex": "#2F5A4A", "note": "盆栽" },
+    { "role": "mist", "hex": "#6B5C8C", "note": "雨雾" },
+    { "role": "neon", "hex": "#FF2E88", "note": "粉霓虹" },
+    { "role": "neon2", "hex": "#22E5FF", "note": "青霓虹" }
+  ],
+  "lighting": { "time_of_day": "night" },
+  "mood": ["拥挤", "潮湿", "喧闹"]
+}

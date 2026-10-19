@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-plans.py — 构成图 plan 的 schema 与工具（不联网）
+plans.py — 场景程序 plan v2 的 schema 与工具（不联网）
 
-1. 路径与 plan schema（spec/plan.schema.json 是单一事实来源）+ 小校验器、夹取、清洗
-2. plan 工具：按 id 找元素、ops 合法性检查与应用
+1. 路径与 plan schema（spec/plan.schema.json 是单一事实来源）+ 小校验器、夹取、清洗、给 Claude 的 schema、给模型的语法表（grammar）
+2. 场景程序工具：场景树遍历、按 id / 实例引用找元素、ops（set 嵌套路径 / add 到 nodes·terrain·group / remove）检查与应用、
+   根节点锚点规则、形体计数与上限
 本文件不依赖网络与模型；rules.py 与 ai.py 都用它。
 """
 from __future__ import annotations
 
 import copy
-import datetime as dt
 import json
 import os
 import re
-import socket
 import sys
-import time
-import urllib.error
-import urllib.request
-from typing import Any, Callable
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -323,119 +319,97 @@ def has_key(node: Any, key: str) -> bool:
     return False
 
 
-def brief(root: dict) -> str:
-    """把 plan schema 压成 TypeScript 风格的几行（给没有结构化输出的 DeepSeek 写进系统提示）：
-    定义里被引用的类型只展开一次（At = {...}），各组一行，带范围与 x-ui 中文名。"""
-    defs = _defs(root)
-    used: list[str] = []
-
-    def name_of(ref: str) -> str:
-        return ref.rsplit("/", 1)[-1]
-
-    def r(node: Any, depth: int = 0) -> str:
-        if not isinstance(node, dict):
-            return "any"
-        if "$ref" in node:
-            n = name_of(node["$ref"])
-            if n in defs and n not in used:
-                used.append(n)
-            return n
-        for key in ("anyOf", "oneOf"):
-            if key in node:
-                return " | ".join(r(b, depth) for b in node[key])
-        if "const" in node:
-            return json.dumps(node["const"], ensure_ascii=False)
-        if "enum" in node:
-            return "|".join(str(x) for x in node["enum"])
-        ts = _types(node)
-        t = ts[0] if ts else ("object" if "properties" in node else "")
-        if t == "object":
-            props, req = node.get("properties") or {}, set(node.get("required") or [])
-            parts = []
-            for k, sub in props.items():
-                if k != "id" and isinstance(sub, dict) and (sub.get("x-ui") or {}).get("hidden"):
-                    continue  # 人写的字段（locks / nudge_m / offset_m / layout_seed）不给 AI 看
-                xu = (sub.get("x-ui") or {}) if isinstance(sub, dict) else {}
-                ui = (xu.get("label") or "") + (("：" + xu["ai_hint"]) if xu.get("ai_hint") else "") or None
-                parts.append(f"{k}{'' if k in req else '?'}: {r(sub, depth + 1)}" + (f" /*{ui}*/" if ui else ""))
-            return "{" + ", ".join(parts) + "}"
-        if t == "array":
-            it = node.get("prefixItems") or node.get("items")
-            inner = ("[" + ", ".join(r(x, depth + 1) for x in it) + "]") if isinstance(it, list) else (r(it, depth + 1) + "[]")
-            lo, hi = node.get("minItems"), node.get("maxItems")
-            if isinstance(it, dict) and it.get("type") in ("number", "integer") and lo is not None and lo == hi:
-                inner = "[" + ", ".join([r(it)] * lo) + "]"
-            elif lo is not None and lo == hi:
-                inner += f"(恰好{lo}项)"
-            elif lo or hi:
-                inner += f"({lo or 0}–{hi if hi is not None else ''}项)"
-            return inner
-        if t in ("number", "integer"):
-            rng = f" {node['minimum']}–{node['maximum']}" if "minimum" in node and "maximum" in node else ""
-            return ("int" if t == "integer" else "num") + rng
-        if t == "string":
-            if node.get("pattern", "").startswith("^#"):
-                return "\"#RRGGBB\""
-            if node.get("pattern", "").startswith("^[a-z]"):
-                return "小写英文短名(a-z0-9_)"
-            return "str" + (f"≤{node['maxLength']}字" if "maxLength" in node else "")
-        if t == "boolean":
-            return "bool"
-        return t or "any"
-
-    lines = []
-    req = set(root.get("required") or [])
-    for k, sub in (root.get("properties") or {}).items():
-        if isinstance(sub, dict) and (sub.get("x-ui") or {}).get("hidden"):
-            continue
-        lines.append(f"{k}{'' if k in req else '?'}: {r(sub)}")
-    i = 0
-    deflines = []
-    while i < len(used):  # 展开过程中可能引用更多定义
-        n = used[i]
-        deflines.append(f"{n} = {r(defs[n])}")
-        i += 1
-    return "\n".join(["plan = {"] + ["  " + x for x in lines] + ["}"] + deflines)
-
-
-# ============================================================ 2. plan 工具
-LIST_GROUPS = ("terrain", "buildings", "zones", "landmarks", "paths", "water", "spaces", "relations")
+# ============================================================ 2. 场景程序工具（v2：terrain[] 雕刻 + nodes[] 场景树）
+ROOT_LISTS = ("terrain", "nodes", "relations")
 ONE_GROUPS = ("site", "spawn", "lighting")
-NO_SET_FIELDS = {"id", "locks", "nudge_m", "offset_m", "layout_seed"}  # 人写的（锁、拖过的微调、「换一个」）AI 不碰
+LIST_GROUPS = ROOT_LISTS  # 旧名（外部脚本还在用）
+AI_FORBIDDEN = {"locks", "layout_seed", "one_liner", "skip", "overrides"}  # 人写的（锁、「换一个」的种子）、旧字段、实例改动（ops 写）：不给 AI 看
+NO_SET_FIELDS = {"id", "locks", "layout_seed", "skip", "overrides"}  # set 不能直接碰（实例改动用 id[k]）
+CHILD_LISTS = ("children",)
+CHILD_ONE = ("child",)
+REF_KEYS = ("at", "under", "over", "from", "to", "along", "area", "around", "look_at", "a", "b", "c", "target")
+REF_ONLY = ("under", "over", "around", "along", "area", "look_at", "a", "b", "c")  # 这些字段是 ref（id / id[k] / site / spawn），不能带 .部位
+REF_LIST_KEYS = ("via",)
+ANCHOR = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\[\d+\])?(\.[A-Za-z_]+)?$")
+RESERVED_IDS = {"site", "spawn", "plan", "entry", "root", "terrain", "relations", "lighting"}
+INSTANCE = re.compile(r"^([a-z][a-z0-9_]*)\[(\d{1,3})\]$")
+MAX_SHAPES = 600
 
 
 def plan_props() -> dict:
     return plan_schema().get("properties") or {}
 
 
-def item_schema(group: str) -> dict:
-    """某一组单个元素的 schema（列表组取 items，单例组取本身）"""
+def _pick(s: Any, value: Any, root: dict) -> Any:
+    """anyOf / oneOf 里按 value.type（或 op）挑一支；挑不出来就原样返回"""
+    s = deref(s, root)
+    if not isinstance(s, dict) or not ("anyOf" in s or "oneOf" in s):
+        return s
+    if isinstance(value, dict):
+        for key in ("type", "op"):
+            t = value.get(key)
+            if t is None:
+                continue
+            for b in s.get("anyOf") or s.get("oneOf"):
+                b = deref(b, root)
+                ts = deref(((b or {}).get("properties") or {}).get(key) or {}, root)
+                if isinstance(ts, dict) and (ts.get("const") == t or t in (ts.get("enum") or [])):
+                    return _pick(b, value, root)
+    b = _branch_for(s, value, root)
+    return _pick(b, value, root) if b is not None else s
+
+
+def item_schema(group: str, value: Any = None) -> dict:
+    """某一组单个元素的 schema（列表组取 items，单例组取本身；有分支时按 value.type / op 挑）。group="node" = 场景树节点。"""
     root = plan_schema()
     if group == "plan":
         return {k: v for k, v in root.items() if k not in ("definitions", "$defs")}
-    s = deref(plan_props().get(group) or {}, root)
-    if isinstance(s, dict) and (s.get("type") == "array" or "items" in s):
-        return deref(s.get("items") or {}, root)
+    if group == "node":
+        s = deref((plan_props().get("nodes") or {}), root)
+        s = s.get("items") if isinstance(s, dict) else None
+        s = s or _defs(root).get("node") or {}
+    else:
+        s = deref(plan_props().get(group) or {}, root)
+        if isinstance(s, dict) and (s.get("type") == "array" or "items" in s):
+            s = s.get("items") or {}
+    s = _pick(s, value if value is not None else {}, root)
     return s if isinstance(s, dict) else {}
 
 
-def field_schema(group: str, field: str) -> dict | None:
-    """点路径（place.rel、size_m.0）在某组元素里的 schema；不存在返回 None"""
+def node_types() -> list[str]:
+    """节点 type 的全部取值（从 schema 读：单一 node 定义的 type.enum，或各分支的 const / enum）"""
     root = plan_schema()
-    s: Any = item_schema(group)
+    s = deref((deref(plan_props().get("nodes") or {}, root) or {}).get("items") or _defs(root).get("node") or {}, root)
+    out: list = []
+
+    def take(b):
+        b = deref(b, root)
+        if not isinstance(b, dict):
+            return
+        if "anyOf" in b or "oneOf" in b:
+            for x in b.get("anyOf") or b.get("oneOf"):
+                take(x)
+            return
+        t = deref(((b.get("properties") or {}).get("type")) or {}, root)
+        for v in ([t.get("const")] if "const" in t else []) + list(t.get("enum") or []):
+            if v not in out:
+                out.append(v)
+    take(s)
+    return out
+
+
+def field_schema_in(s: Any, field: str, value: Any = None) -> dict | None:
+    """点路径（size_m.0、connect.via、children.2.label）在某个元素 schema 里的子 schema；不存在返回 None"""
+    root = plan_schema()
+    cur_v = value
     for part in field.split("."):
-        s = deref(s, root)
+        s = _pick(s, cur_v, root)
         if not isinstance(s, dict):
             return None
-        if "anyOf" in s or "oneOf" in s:
-            cand = [deref(b, root) for b in (s.get("anyOf") or s.get("oneOf"))]
-            cand = [b for b in cand if isinstance(b, dict) and part in (b.get("properties") or {})]
-            if not cand:
-                return None
-            s = cand[0]
-        if part.isdigit() and (s.get("type") == "array" or "items" in s or "prefixItems" in s):
+        if part.isdigit():
             seq = s.get("prefixItems") or s.get("items")
             s = seq[int(part)] if isinstance(seq, list) and int(part) < len(seq) else (seq if isinstance(seq, dict) else None)
+            cur_v = cur_v[int(part)] if isinstance(cur_v, list) and int(part) < len(cur_v) else None
             if s is None:
                 return None
             continue
@@ -443,27 +417,153 @@ def field_schema(group: str, field: str) -> dict | None:
         if part not in props:
             return None
         s = props[part]
-    return deref(s, root)
+        cur_v = cur_v.get(part) if isinstance(cur_v, dict) else None
+    return _pick(s, cur_v, root)
+
+
+def field_schema(group: str, field: str, value: Any = None) -> dict | None:
+    return field_schema_in(item_schema(group, value), field, value)
+
+
+def to_ref(v: Any) -> Any:
+    """锚点 → ref：「site.N」→ site，「hall.top」→ hall，「towers[2].S」→ towers[2]"""
+    if not isinstance(v, str):
+        return v
+    m = ANCHOR.match(v.strip())
+    if not m:
+        return v
+    return m.group(1) + (m.group(2) or "")
+
+
+ANCHOR_PARTS = ("top", "bottom", "center", "C", "N", "NE", "E", "SE", "S", "SW", "W", "NW", "inner", "outer", "start", "mid", "end", "left", "right")
+_SUB_RE = re.compile(r"^([a-z][a-z0-9_]{0,31}(?:\[\d{1,3}\])?)\.([A-Za-z][A-Za-z0-9_]{0,31}(?:\[\d{1,3}\])?)(?:\.([A-Za-z]+))?$")
+_ANCHOR_FIELDS = ("at", "from", "to", "under", "over", "around", "along", "area", "look_at", "a", "b", "c")
+
+
+def fix_sub_anchors(plan: dict, fixes: list | None = None) -> list[str]:
+    """「组.子节点」式的锚点（'axis.obelisk'、'core.hall.top'）：子节点的 id 全树唯一，直接写它自己 → 'obelisk' / 'hall.top'。
+    实测 DeepSeek 常这样写（以为要带组名），以前被当成「去掉不认识的部位」改成了组本身，锚错了地方。"""
+    fixes = [] if fixes is None else fixes
+    ids = {t["id"] for t in plan.get("terrain") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)}
+    ids |= {n["id"] for n in all_nodes(plan) if isinstance(n.get("id"), str)}
+
+    def fix(v: str) -> str | None:
+        m = _SUB_RE.match(v)
+        if not m or m.group(2) in ANCHOR_PARTS:
+            return None
+        sub = m.group(2)
+        if re.sub(r"\[\d+\]$", "", sub) not in ids:
+            return None
+        return sub + (f".{m.group(3)}" if m.group(3) and m.group(3) in ANCHOR_PARTS else "")
+
+    def walk(d: Any, path: str) -> None:
+        if isinstance(d, list):
+            for i, x in enumerate(d):
+                if isinstance(x, str) and path.endswith(".via"):
+                    new = fix(x)
+                    if new:
+                        fixes.append(f"{path}[{i}]: {x!r} → {new!r}（子节点直接写自己的 id）")
+                        d[i] = new
+                else:
+                    walk(x, f"{path}[{i}]")
+            return
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if isinstance(v, str) and k in _ANCHOR_FIELDS:
+                new = fix(v)
+                if new:
+                    fixes.append(f"{path}.{k}: {v!r} → {new!r}（子节点直接写自己的 id）")
+                    d[k] = new
+            elif isinstance(v, (dict, list)):
+                walk(v, f"{path}.{k}")
+    for key in ("terrain", "nodes", "relations", "spawn"):
+        walk(plan.get(key), f"$.{key}")
+    return fixes
+
+
+def normalize_refs(plan: dict, fixes: list | None = None) -> list[str]:
+    """只收 ref 的字段（under / over / around / along / area / look_at / 关系的 a b c / connect.from）写成了带部位的锚点 → 去掉部位"""
+    fixes = [] if fixes is None else fixes
+
+    def fix(d: dict, keys, path: str) -> None:
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, str) and to_ref(v) != v:
+                fixes.append(f"{path}.{k}: {v} → {to_ref(v)}")
+                d[k] = to_ref(v)
+    for n, path, *_ in walk_nodes(plan.get("nodes") or []):
+        fix(n, REF_ONLY, path)
+        if isinstance(n.get("connect"), dict):
+            fix(n["connect"], ("from",), path + ".connect")
+    for i, r in enumerate(plan.get("relations") or []):
+        if isinstance(r, dict):
+            fix(r, ("a", "b", "c"), f"relations[{i}]")
+    if isinstance(plan.get("spawn"), dict):
+        fix(plan["spawn"], ("look_at",), "spawn")
+    return fixes
+
+
+def walk_nodes(nodes: Any, path: str = "nodes", parent: dict | None = None):
+    """场景树深度优先：(节点, 路径, 父节点, 所在列表或 None)。children 是列表，child / template 是单个子节点。"""
+    if not isinstance(nodes, list):
+        return
+    for i, n in enumerate(nodes):
+        if not isinstance(n, dict):
+            continue
+        yield n, f"{path}[{i}]", parent, nodes
+        yield from _walk_inner(n, f"{path}[{i}]")
+
+
+def _walk_inner(n: dict, path: str):
+    for k in CHILD_LISTS:
+        if isinstance(n.get(k), list):
+            yield from walk_nodes(n[k], f"{path}.{k}", n)
+    for k in CHILD_ONE:
+        c = n.get(k)
+        if isinstance(c, dict):
+            yield c, f"{path}.{k}", n, None
+            yield from _walk_inner(c, f"{path}.{k}")
+
+
+def all_nodes(plan: dict) -> list[dict]:
+    return [n for n, *_ in walk_nodes(plan.get("nodes") or [])]
+
+
+def anchor_base(ref: Any) -> str | None:
+    """「towers[2].top」→ towers；「site.N」→ site；不是锚点写法返回 None"""
+    if not isinstance(ref, str):
+        return None
+    m = ANCHOR.match(ref.strip())
+    return m.group(1) if m else None
 
 
 def index(plan: dict) -> dict:
-    """id → (组, 元素)。单例组（site / spawn / lighting）用组名当 id；根上的 name / one_liner / mood / palette 用 id "plan"。"""
+    """id → (类, 元素)。类 ∈ plan / site / spawn / lighting / terrain / node。根上的 name / concept / mood / palette 用 id "plan"。"""
     out: dict = {"plan": ("plan", plan)}
     for g in ONE_GROUPS:
         if isinstance(plan.get(g), dict):
             out[g] = (g, plan[g])
-    for g in LIST_GROUPS:
-        for el in plan.get(g) or []:
-            if isinstance(el, dict) and isinstance(el.get("id"), str):
-                out.setdefault(el["id"], (g, el))
+    for t in plan.get("terrain") or []:
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            out.setdefault(t["id"], ("terrain", t))
+    for n, *_ in walk_nodes(plan.get("nodes") or []):
+        if isinstance(n.get("id"), str):
+            out.setdefault(n["id"], ("node", n))
     return out
+
+
+def resolve(plan: dict, ref: Any) -> tuple[str, dict] | None:
+    """按 id 找（含 towers[2] 这种实例引用：落到 repeat 本身）"""
+    base = anchor_base(ref)
+    return index(plan).get(base) if base else None
 
 
 def new_id(plan: dict, base: str, taken: set | None = None) -> str:
     base = re.sub(r"[^a-z0-9_]", "_", (base or "item").lower()).strip("_") or "item"
     if not base[0].isalpha():
         base = "x_" + base
-    used = set(index(plan)) | (taken or set()) | {"site", "spawn", "entry", "plan"}
+    used = set(index(plan)) | (taken or set()) | RESERVED_IDS
     if base not in used:
         return base
     k = 2
@@ -493,34 +593,120 @@ def _set_path(obj: dict, field: str, value: Any) -> None:
         cur[last] = value
 
 
+def _del_path(obj: dict, field: str) -> None:
+    parts = field.split(".")
+    cur: Any = obj
+    for part in parts[:-1]:
+        cur = cur[int(part)] if isinstance(cur, list) else (cur.get(part) if isinstance(cur, dict) else None)
+        if cur is None:
+            return
+    if isinstance(cur, dict):
+        cur.pop(parts[-1], None)
+
+
+def _remove_from(plan: dict, target: dict) -> bool:
+    """从树里摘掉某个元素（按对象身份）"""
+    for g in ("terrain", "nodes"):
+        lst = plan.get(g) or []
+        if any(x is target for x in lst):
+            plan[g] = [x for x in lst if x is not target]
+            return True
+    for n, _, parent, container in walk_nodes(plan.get("nodes") or []):
+        if n is target and parent is not None:
+            if container is not None:
+                for k in CHILD_LISTS:
+                    if parent.get(k) is container:
+                        parent[k] = [x for x in container if x is not target]
+                        return True
+            for k in CHILD_ONE:
+                if parent.get(k) is target:
+                    del parent[k]
+                    return True
+    return False
+
+
+def _add_target(plan: dict, to: Any) -> tuple[str, list] | None:
+    """add 的目的地：root（根节点，也收 nodes）/ terrain / relations，或某个能装子节点的节点 id（加到它的 children；repeat 不行）"""
+    if to in ("root", "nodes"):
+        return "nodes", plan.setdefault("nodes", [])
+    if to in ("terrain", "relations"):
+        return to, plan.setdefault(to, [])
+    hit = index(plan).get(to) if isinstance(to, str) else None
+    if hit and hit[0] == "node" and hit[1].get("type") != "repeat" and "child" not in hit[1]:
+        return "node", hit[1].setdefault("children", [])
+    return None
+
+
+def norm_op(op: Any) -> Any:
+    """模型常见的别名：add 的 to 写成 parent / group / into；set 的 path 写成 field"""
+    if not isinstance(op, dict):
+        return op
+    o = dict(op)
+    if o.get("op") == "add" and "to" not in o:
+        for k in ("parent", "into", "group", "target"):
+            if k in o:
+                o["to"] = o.pop(k)
+                break
+        o.setdefault("to", "root")
+    if o.get("op") == "add" and o.get("to") == "nodes":
+        o["to"] = "root"
+    if o.get("op") == "set" and "field" not in o and "path" in o:
+        o["field"] = o.pop("path")
+    return o
+
+
 def apply_ops(plan: dict, ops: list) -> dict:
-    """ops 应用到 plan 的副本（假定已经过 check_ops）。被删元素的引用不在这里处理：引擎 normalizePlan 会降级。"""
+    """ops 应用到 plan 的副本（假定已经过 check_ops）。被删元素的引用不在这里处理：引擎落地时降级到 site。"""
     p = copy.deepcopy(plan)
     for op in ops:
+        op = norm_op(op)
         kind = op.get("op")
+        inst = INSTANCE.match(str(op.get("id") or ""))
         if kind == "set":
-            hit = index(p).get(op.get("id"))
-            if hit:
-                _set_path(hit[1], op["field"], copy.deepcopy(op.get("value")))
+            hit = resolve(p, op.get("id"))
+            if hit and inst and hit[1].get("type") == "repeat":  # 单个实例：写进 repeat 的 overrides
+                ov = hit[1].setdefault("overrides", {}).setdefault(inst.group(2), {})
+                _set_path(ov, op["field"], copy.deepcopy(op.get("value")))
+            elif hit:
+                if op.get("value") is None:
+                    _del_path(hit[1], op["field"])
+                else:
+                    _set_path(hit[1], op["field"], copy.deepcopy(op.get("value")))
         elif kind == "add":
-            p.setdefault(op["group"], []).append(copy.deepcopy(op["value"]))
+            dest = _add_target(p, op.get("to"))
+            if dest:
+                k = op.get("index")
+                if isinstance(k, int) and 0 <= k <= len(dest[1]):
+                    dest[1].insert(k, copy.deepcopy(op["value"]))
+                else:
+                    dest[1].append(copy.deepcopy(op["value"]))
         elif kind == "remove":
             rid = str(op.get("id") or "")
             if rid.startswith("rel:") and rid[4:].isdigit():  # 关系没有 id，按序号删
                 k = int(rid[4:])
                 p["relations"] = [r for i, r in enumerate(p.get("relations") or []) if i != k]
                 continue
-            hit = index(p).get(rid)
-            if hit and hit[0] in LIST_GROUPS:
-                p[hit[0]] = [e for e in p[hit[0]] if e is not hit[1]]
+            hit = resolve(p, rid)
+            if hit and inst and hit[1].get("type") == "repeat":  # 单个实例：写进 repeat 的 skip
+                sk = hit[1].setdefault("skip", [])
+                if int(inst.group(2)) not in sk:
+                    sk.append(int(inst.group(2)))
+                continue
+            if hit and hit[0] in ("node", "terrain"):
+                _remove_from(p, hit[1])
                 if rid in (p.get("locks") or []):
                     p["locks"] = [x for x in p["locks"] if x != rid]
     return p
 
 
+def _el_schema(kind: str, el: Any) -> dict:
+    return item_schema(kind if kind != "plan" else "plan", el)
+
+
 def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list, list[str], list[str]]:
-    """逐条检查 ops（docs/05 §5）：set 的字段必须是该元素 schema 里的、值要合 schema（越界夹回）；add 的值要合该组 schema、id 不重；
-    remove 的 id 要存在。返回 (合法的 ops, 错误清单, 本地修正清单)。锁住的 id 一律不动。"""
+    """逐条检查 ops（docs/06 §3）：set 的字段必须是该元素 schema 里的（可嵌套路径）、值要合 schema（越界夹回）；
+    add 到 nodes / terrain / relations 或某个 group 的 children，值要合 schema、id 不重；remove 的 id 要存在。
+    返回 (合法的 ops, 错误清单, 本地修正清单)。锁住的 id 一律不动。"""
     root = plan_schema()
     good: list = []
     errs: list[str] = []
@@ -534,47 +720,71 @@ def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list
         if not isinstance(op, dict):
             errs.append(f"{where}: 应为对象")
             continue
+        op = norm_op(op)
         kind = op.get("op")
         idx = index(cur)
-        if kind in ("set", "remove") and op.get("id") in locked_ids:
+        base = anchor_base(op.get("id"))
+        if kind in ("set", "remove") and (op.get("id") in locked_ids or base in locked_ids):
             fixes.append(f"{where}: {op.get('id')} 已锁住，不改")
             continue
         if kind == "set":
             tid, field = op.get("id"), op.get("field")
-            if tid not in idx:
-                errs.append(f"{where}: 没有 id 为 {tid!r} 的元素（可用：{', '.join(list(idx)[:30])}）")
+            if base not in idx:
+                errs.append(f"{where}: 没有 id 为 {tid!r} 的元素（可用：{', '.join(list(idx)[:40])}）")
                 continue
-            group = idx[tid][0]
-            if not isinstance(field, str) or not re.fullmatch(r"[a-z_]+(\.[a-z_]+)*", field) or field.split(".")[-1] in NO_SET_FIELDS:
-                errs.append(f"{where}: field 应为该元素的字段名（点分路径，不能改 id / locks / nudge_m / offset_m / layout_seed）")
+            g, el = idx[base]
+            inst = INSTANCE.match(str(tid))
+            if inst and el.get("type") == "repeat" and isinstance(el.get("child"), dict):
+                el = el["child"]  # 改单个实例：字段按模板节点查，写进 overrides
+            elif tid != base:
+                fixes.append(f"{where}: {tid} 不是重复的实例，按 {base} 改")
+                tid = base
+            if not isinstance(field, str) or not re.fullmatch(r"[a-z_][a-z0-9_]*(\.([a-z_][a-z0-9_]*|\d+))*", field) or field.split(".")[0] in NO_SET_FIELDS:
+                errs.append(f"{where}: field 应为该元素的字段名（点分路径，如 size_m.1、connect.via；不能改 id / locks / skip / overrides）")
                 continue
-            sub = field_schema(group, field)
+            sub = field_schema_in(_el_schema(g, el), field, el)
             if sub is None:
-                allowed = ", ".join((item_schema(group).get("properties") or {}).keys())
-                errs.append(f"{where}: {group} 没有字段 {field!r}（可用：{allowed}）")
+                allowed = ", ".join((_el_schema(g, el).get("properties") or {}).keys())
+                errs.append(f"{where}: {('节点 ' + str(el.get('type'))) if g == 'node' else g} 没有字段 {field!r}（可用：{allowed}）")
                 continue
             f2: list = []
-            val = clamp(sub, copy.deepcopy(op.get("value")), f"{where}.value", root, f2)
-            e = validate(sub, val, f"{where}.value", root)
+            val = copy.deepcopy(op.get("value"))
+            if val is None and g in ("node", "terrain", "site", "spawn", "lighting"):  # null = 删掉这个字段
+                good.append({"op": "set", "id": tid, "field": field, "value": None})
+                cur = apply_ops(cur, [good[-1]])
+                continue
+            if isinstance(val, dict):
+                f2 += strip_extra(sub, val, f"{where}.value", root)
+            val = clamp(sub, val, f"{where}.value", root, f2)
+            if field.split(".")[-1] == "type" and g == "node":  # 换类型：整个节点按新类型再查一遍
+                trial = copy.deepcopy(el)
+                _set_path(trial, field, val)
+                e = validate(_el_schema("node", trial), trial, f"{where}.value", root)
+            else:
+                e = validate(sub, val, f"{where}.value", root)
             if e:
                 errs += e
                 continue
             fixes += f2
-            op = {**op, "value": val}
+            op = {"op": "set", "id": tid, "field": field, "value": val}
         elif kind == "add":
-            group, val = op.get("group"), copy.deepcopy(op.get("value"))
-            if group not in LIST_GROUPS or group not in plan_props():
-                errs.append(f"{where}: group 应为 {'/'.join(g for g in LIST_GROUPS if g in plan_props())} 之一")
+            to, val = op.get("to"), copy.deepcopy(op.get("value"))
+            dest = _add_target(cur, to)
+            if dest is None:
+                errs.append(f"{where}: to 应为 root / terrain / relations，或某个 group 节点的 id（{to!r} 不行；repeat 改它的 child 用 set）")
                 continue
             if not isinstance(val, dict):
                 errs.append(f"{where}: value 应为对象")
                 continue
-            sch = item_schema(group)
-            if "id" in (sch.get("properties") or {}):
-                if not isinstance(val.get("id"), str) or val["id"] in idx:
-                    nid = new_id(cur, val.get("id") or group[:-1] if group.endswith("s") else group)
-                    fixes.append(f"{where}: id {val.get('id')!r} → {nid}")
+            g = "node" if dest[0] in ("node", "nodes") else "terrain" if dest[0] == "terrain" else "relations"
+            sch = item_schema(g, val)
+            if g != "relations":
+                if isinstance(val.get("id"), str) and (val["id"] in idx or val["id"] in RESERVED_IDS):
+                    nid = new_id(cur, val["id"])
+                    fixes.append(f"{where}: id {val['id']!r} → {nid}")
                     val["id"] = nid
+                elif not isinstance(val.get("id"), str) and "id" in (sch.get("properties") or {}):
+                    val["id"] = new_id(cur, str(val.get("type") or val.get("op") or "item"))
             f2 = strip_extra(sch, val, f"{where}.value", root)
             val = clamp(sch, val, f"{where}.value", root, f2)
             e = validate(sch, val, f"{where}.value", root)
@@ -582,7 +792,7 @@ def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list
                 errs += e
                 continue
             fixes += f2
-            op = {"op": "add", "group": group, "value": val}
+            op = {"op": "add", "to": "root" if dest[0] == "nodes" else to, "value": val, **({"index": op["index"]} if isinstance(op.get("index"), int) else {})}
         elif kind == "remove":
             tid = op.get("id")
             if isinstance(tid, str) and tid.startswith("rel:"):
@@ -593,10 +803,16 @@ def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list
                 good.append({"op": "remove", "id": tid})
                 cur = apply_ops(cur, [good[-1]])
                 continue
-            if tid not in idx or idx[tid][0] not in LIST_GROUPS:
+            if base not in idx or idx[base][0] not in ("node", "terrain"):
                 errs.append(f"{where}: 没有可删的 id {tid!r}")
                 continue
-            op = {"op": "remove", "id": tid}
+            inst = INSTANCE.match(str(tid))
+            if inst and idx[base][1].get("type") == "repeat":
+                op = {"op": "remove", "id": tid}
+            else:
+                if tid != base:
+                    fixes.append(f"{where}: {tid} 不是重复的实例，按 {base} 删")
+                op = {"op": "remove", "id": base}
         else:
             errs.append(f"{where}: op 应为 set / add / remove")
             continue
@@ -605,165 +821,280 @@ def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list
     return good, errs, fixes
 
 
-def _ui(group: str, field: str) -> dict:
+def _ui(kind: str, field: str, el: Any = None) -> dict:
     """某字段的 x-ui（中文名、枚举中文）；字段在 $ref 后面时取引用处与定义处合并的提示"""
     root = plan_schema()
-    s: Any = item_schema(group)
+    s: Any = _el_schema(kind, el)
     ui: dict = {}
     for part in field.split("."):
-        s = deref(s, root)
+        s = _pick(s, el, root)
         prop = ((s or {}).get("properties") or {}).get(part) if isinstance(s, dict) else None
         if not isinstance(prop, dict):
             return ui
         ui = {**((deref(prop, root) or {}).get("x-ui") or {}), **(prop.get("x-ui") or {})}
         s = prop
+        el = el.get(part) if isinstance(el, dict) else None
     return ui
 
 
 def describe_ops(plan: dict, ops: list) -> str:
     """ops → 一句中文复述（模型没给复述、或模拟 AI 用）"""
-    idx = index(plan)
     parts = []
     for op in ops:
+        op = norm_op(op)
         if op.get("op") == "add":
             v = op.get("value") or {}
-            parts.append(f"加了{v.get('label') or v.get('id') or ''}")
+            parts.append(f"加了{v.get('label') or v.get('id') or v.get('op') or ''}")
         elif op.get("op") == "remove":
-            el = idx.get(op.get("id"), (None, {}))[1]
+            el = (resolve(plan, op.get("id")) or (None, {}))[1]
             parts.append(f"去掉了{(el or {}).get('label') or op.get('id')}")
-        elif op.get("op") == "set" and op.get("id") in idx:
-            g, el = idx[op["id"]]
-            ui = _ui(g, op.get("field", ""))
+        elif op.get("op") == "set":
+            hit = resolve(plan, op.get("id"))
+            if not hit:
+                continue
+            g, el = hit
+            ui = _ui(g, op.get("field", ""), el)
             val = op.get("value")
             vs = (ui.get("options") or {}).get(val, val) if isinstance(val, str) else val
             if isinstance(vs, (int, float)) and not isinstance(vs, bool):
                 vs = f" {vs} {ui.get('unit') or ''}".rstrip()
+            elif isinstance(vs, list) and all(isinstance(x, (int, float)) for x in vs):
+                vs = " " + "×".join(f"{x:g}" for x in vs) + (" " + ui["unit"] if ui.get("unit") else "")
             who = {"site": "场地", "lighting": "", "spawn": "出生点", "plan": ""}.get(g, el.get("label") or op["id"])
             parts.append(f"{who}{ui.get('label') or op.get('field')}改成{vs if not isinstance(vs, (dict, list)) else '新的'}")
     return "；".join(dict.fromkeys(parts))
 
 
-def ref_warnings(plan: dict) -> list[str]:
-    """引用了不存在的 id（引擎会降级到 site，这里只提一句）"""
-    ids = set(index(plan)) | {"site", "spawn", "entry"}
-    out: list[str] = []
+def _refs(node: Any, path: str, out: list, skip_children: bool = True) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in REF_KEYS and isinstance(v, str):
+                out.append((f"{path}.{k}", v))
+            elif k in REF_LIST_KEYS and isinstance(v, list):
+                out.extend((f"{path}.{k}", x) for x in v if isinstance(x, str))
+            elif isinstance(v, dict) and k not in (CHILD_ONE if skip_children else ()):
+                _refs(v, f"{path}.{k}", out, skip_children)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            _refs(v, f"{path}[{i}]", out, skip_children)
 
-    def walk(node: Any, path: str) -> None:
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if k in ("of", "target", "on", "under", "over", "from", "to", "look_at", "building", "a", "b", "c") and isinstance(v, str) and v not in ids:
-                    out.append(f"{path}.{k} → {v}")
-                elif k in ("via", "target") and isinstance(v, list):
-                    out.extend(f"{path}.{k} → {x}" for x in v if isinstance(x, str) and x not in ids)
-                elif isinstance(v, (dict, list)):
-                    walk(v, f"{path}.{k}")
-        elif isinstance(node, list):
-            for i, v in enumerate(node):
-                walk(v, f"{path}[{i}]")
-    for g in LIST_GROUPS + ONE_GROUPS:
-        if g in plan:
-            walk(plan[g], g)
+
+def all_refs(plan: dict) -> list[tuple[str, str]]:
+    """plan 里所有引用（路径, 锚点串）：节点 / 地形操作 / 关系 / 出生点"""
+    out: list = []
+    for i, t in enumerate(plan.get("terrain") or []):
+        _refs(t, f"terrain[{i}]", out)
+    for n, path, *_ in walk_nodes(plan.get("nodes") or []):
+        _refs({k: v for k, v in n.items() if k not in CHILD_LISTS + CHILD_ONE}, path, out)
+    for i, r in enumerate(plan.get("relations") or []):
+        _refs(r, f"relations[{i}]", out)
+    if isinstance(plan.get("spawn"), dict):
+        _refs(plan["spawn"], "spawn", out)
     return out
 
 
+def ref_warnings(plan: dict) -> list[str]:
+    """引用了不存在的 id（引擎会降级到 site，这里只提一句）"""
+    ids = set(index(plan)) | {"site", "spawn"}
+    return [f"{path} → {ref}" for path, ref in all_refs(plan) if anchor_base(ref) and anchor_base(ref) not in ids and not str(ref).startswith("site")]
+
+
 def dedupe_ids(plan: dict) -> list[str]:
-    """同一张 plan 里重复的 id 改名。建筑类型和别的元素撞名时改建筑类型那个（只有 zones[].building 指向它，跟着改；
-    路的 via、空间的 connect.from、关系、地标的 place.target 都不会指向建筑类型，所以它们原本说的是另一个）。其余撞名改后出现的那个。"""
-    reserved = {"site", "spawn", "entry"}
-    others = reserved | {el["id"] for g in LIST_GROUPS if g != "buildings" for el in plan.get(g) or [] if isinstance(el, dict) and isinstance(el.get("id"), str)}
-    fixes = []
-    taken = set(others)
-    for b in plan.get("buildings") or []:
-        if not (isinstance(b, dict) and isinstance(b.get("id"), str)):
-            continue
-        old = b["id"]
-        if old in taken:
-            k = 2
-            while f"{old}_{k}" in taken or any(isinstance(x, dict) and x.get("id") == f"{old}_{k}" for x in plan.get("buildings") or []):
-                k += 1
-            b["id"] = f"{old}_{k}"
-            moved = 0
-            if old in others:  # 和非建筑撞名：building 字段一定指的是这个建筑类型
-                for z in plan.get("zones") or []:
-                    if isinstance(z, dict) and z.get("building") == old:
-                        z["building"] = b["id"]
-                        moved += 1
-            fixes.append(f"buildings.{old}: id 重复 → {b['id']}" + (f"（{moved} 个区域跟着改）" if moved else ""))
-        taken.add(b["id"])
-    seen: set = set(reserved)
-    for g in LIST_GROUPS:
-        if g == "buildings":
-            continue
-        for el in plan.get(g) or []:
-            if isinstance(el, dict) and isinstance(el.get("id"), str):
-                if el["id"] in seen:
-                    k = 2
-                    while f"{el['id']}_{k}" in seen:
-                        k += 1
-                    fixes.append(f"{g}.{el['id']}: id 重复 → {el['id']}_{k}")
-                    el["id"] = f"{el['id']}_{k}"
-                seen.add(el["id"])
+    """同一张 plan 里重复的 id（节点、地形操作同一个命名空间；保留字 site / spawn / plan 也算）改名，后出现的那个改"""
+    seen: set = set(RESERVED_IDS)
+    fixes: list[str] = []
+    els = [t for t in plan.get("terrain") or [] if isinstance(t, dict)] + all_nodes(plan)
+    for el in els:
+        if isinstance(el.get("id"), str):
+            if el["id"] in seen:
+                k = 2
+                while f"{el['id']}_{k}" in seen:
+                    k += 1
+                fixes.append(f"{el['id']}: id 重复 → {el['id']}_{k}")
+                el["id"] = f"{el['id']}_{k}"
+            seen.add(el["id"])
     return fixes
 
 
-# 放置关系的近义词（模型偶尔写枚举外的词）：本地换成枚举里的，省一次回喂
-REL_SYNONYM = {
-    "on": "top_of", "on_top": "top_of", "atop": "top_of", "top": "top_of", "upon": "top_of", "on_top_of": "top_of", "summit_of": "top_of",
-    "near": "beside", "next_to": "beside", "by": "beside", "adjacent": "beside", "adjacent_to": "beside", "nearby": "beside", "close_to": "beside", "beside_of": "beside", "near_to": "beside",
-    "in": "center_of", "inside": "center_of", "within": "center_of", "middle_of": "center_of", "center": "center_of", "centre_of": "center_of", "centre": "center_of", "in_center_of": "center_of", "at_center_of": "center_of", "on_center_of": "center_of",
-    "edge": "edge_of", "at_edge_of": "edge_of", "on_edge_of": "edge_of", "rim_of": "edge_of", "side_of": "edge_of", "brink_of": "edge_of",
-    "end": "end_of", "at_end_of": "end_of",
-    "below": "under", "beneath": "under", "underneath": "under", "under_of": "under",
-    "over": "above", "above_of": "above",
-    "back_of": "behind", "behind_of": "behind",
-    "alongside": "along", "following": "along", "along_side": "along",
-    "entry": "at_entry", "entrance": "at_entry", "at_entrance": "at_entry", "at_gate": "at_entry",
-}
-REL_ACROSS = {"across", "across_of", "spanning", "span", "spans", "crossing", "cross", "over_water", "bridging"}
+ROOT_ANCHOR_KEYS = ("at", "under", "over", "from", "area", "around", "along")
+GLOBAL_KEYS = ("position", "pos", "x", "y", "z", "coords", "world", "world_m", "xyz", "center_m", "location")
 
 
-def fix_rels(node: Any, path: str = "$", fixes: list | None = None) -> list[str]:
-    """place.rel 不在枚举里时按近义词换掉（across：两个目标 → between，一个 → center_of）。返回改了什么。"""
+def fix_roots(plan: dict, fixes: list | None = None) -> list[str]:
+    """硬规则：根节点不写全局坐标。根节点没有锚点（at / under / from …）→ 锚到 site.center，丢掉它的 offset_m；
+    任何节点上的 position / x / z 之类全局坐标字段一律去掉。返回改了什么。"""
     fixes = [] if fixes is None else fixes
-    ok = set(((_defs(plan_schema()).get("place") or {}).get("properties") or {}).get("rel", {}).get("enum") or [])
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if k == "place" and isinstance(v, dict) and isinstance(v.get("rel"), str) and ok and v["rel"] not in ok:
-                key = re.sub(r"[\s\-]+", "_", v["rel"].strip().lower())
-                new = key if key in ok else ("between" if isinstance(v.get("target"), list) and len(v["target"]) == 2 else "center_of") if key in REL_ACROSS else REL_SYNONYM.get(key)
-                if new == "between" and not (isinstance(v.get("target"), list) and len(v["target"]) == 2):
-                    new = "center_of"
-                if new in ok:
-                    fixes.append(f"{path}.place.rel: {v['rel']} → {new}")
-                    v["rel"] = new
-            if isinstance(v, (dict, list)):
-                fix_rels(v, f"{path}.{k}", fixes)
-    elif isinstance(node, list):
-        for i, v in enumerate(node):
-            fix_rels(v, f"{path}[{i}]", fixes)
+    for n, path, parent, _ in walk_nodes(plan.get("nodes") or []):
+        for k in GLOBAL_KEYS:
+            if k in n:
+                del n[k]
+                fixes.append(f"{path}.{k}: 不写全局坐标，去掉")
+        if parent is None and not any(n.get(k) for k in ROOT_ANCHOR_KEYS):
+            n["at"] = "site.center"
+            if "offset_m" in n:
+                del n["offset_m"]
+                fixes.append(f"{path}: 根节点没有锚点 → at=site.center，去掉 offset_m（根节点只用锚点）")
+            else:
+                fixes.append(f"{path}: 根节点没有锚点 → at=site.center")
     return fixes
 
 
-def signature(plan: dict) -> dict:
-    """构成签名：三张之间比的就是这些（地形组合 / 地标关系 / 空间布局 / 路 / 区域 / 出生方向）"""
-    def place_of(x):
-        pl = x.get("place") or {}
-        return f"{x.get('form')}@{pl.get('rel')}"
-    return {
-        "terrain": tuple(sorted(t.get("type", "?") for t in plan.get("terrain") or [])),
-        "landmarks": tuple(sorted(place_of(x) for x in plan.get("landmarks") or [])),
-        "spaces": tuple(sorted(f"{s.get('stratum')}:{s.get('layout')}" for s in plan.get("spaces") or [])),
-        "paths": tuple(sorted(p.get("style", "?") for p in plan.get("paths") or [])),
-        "zones": tuple(sorted(z.get("use", "?") for z in plan.get("zones") or [])),
-        "spawn": json.dumps(((plan.get("spawn") or {}).get("place") or {}), sort_keys=True),
-    }
+def _count_of(n: dict) -> int:
+    """一个节点展开后的形体数（repeat 乘数量；生成器按粗估）"""
+    t = n.get("type")
+    kids = sum(_count_of(c) for c in n.get("children") or [] if isinstance(c, dict))
+    if t == "repeat":
+        k = n.get("count")
+        if n.get("pattern") == "mirror":
+            k = 2
+        elif n.get("pattern") == "stack":
+            k = n.get("levels") or n.get("count") or 3
+        elif n.get("pattern") == "grid":
+            k = (n.get("rows") or 1) * (n.get("cols") or 1) if n.get("rows") or n.get("cols") else (k or 4)
+        k = int(k or 4)
+        return k * (_count_of(n["child"]) if isinstance(n.get("child"), dict) else 1) + kids
+    if t == "group":
+        return kids
+    if t == "scatter_houses":
+        return int(n.get("count") or round(40 * float(n.get("density") or 1))) + kids
+    if t in ("grove", "field"):
+        return int(n.get("count") or 20) + kids
+    if t in ("link", "space", "terraces"):
+        return kids
+    return 1 + kids
 
 
-def diversity(plans: list) -> dict:
-    """三张两两在几个构成维度上不同；min ≥ 2 算构成上真的不同"""
-    sigs = [signature(p) for p in plans if isinstance(p, dict)]
-    pairs = []
-    for i in range(len(sigs)):
-        for j in range(i + 1, len(sigs)):
-            pairs.append(sum(sigs[i][k] != sigs[j][k] for k in sigs[i]))
-    return {"pairwise": pairs, "min": min(pairs) if pairs else None, "dims": list(sigs[0]) if sigs else []}
+def shape_count(plan: dict) -> int:
+    return sum(_count_of(n) for n in plan.get("nodes") or [] if isinstance(n, dict))
+
+
+def cap_shapes(plan: dict, limit: int = MAX_SHAPES, fixes: list | None = None) -> list[str]:
+    """展开后超过 limit 个形体：从展开最多的 repeat 起把 count 往下压，直到不超"""
+    fixes = [] if fixes is None else fixes
+    for _ in range(40):
+        n_all = shape_count(plan)
+        if n_all <= limit:
+            break
+        reps = [n for n in all_nodes(plan) if n.get("type") in ("repeat", "scatter_houses", "grove", "field") and isinstance(n.get("count"), int) and n["count"] > 2]
+        if not reps:
+            break
+        big = max(reps, key=_count_of)
+        new = max(2, int(big["count"] * max(0.3, limit / n_all)))
+        if new >= big["count"]:
+            new = big["count"] - 1
+        fixes.append(f"{big.get('id') or big.get('label') or big.get('type')}: count {big['count']} → {new}（展开后 {n_all} 个形体 > {limit}）")
+        big["count"] = new
+    return fixes
+
+
+# ---------- 给模型看的语法表（由 schema 生成：通用字段一行，按 type / op 各一行；同字段的类型并成一行）
+def _short(node: Any, root: dict, depth: int = 0) -> str:
+    if not isinstance(node, dict):
+        return "any"
+    if "$ref" in node:
+        name = node["$ref"].rsplit("/", 1)[-1]
+        if name in ("anchor", "ref", "id", "node", "terrain_op", "relation", "palette_entry", "room", "site", "spawn", "lighting"):
+            return name
+        if name in ("offset", "pair", "local_pts"):
+            return {"offset": "[dx,dz] | [dx,dy,dz]", "pair": "[num,num]", "local_pts": "[[x,z], …]"}[name]
+        return _short(deref(node, root), root, depth)
+    for key in ("anyOf", "oneOf"):
+        if key in node:
+            return " | ".join(_short(b, root, depth) for b in node[key])
+    if "const" in node:
+        return json.dumps(node["const"], ensure_ascii=False)
+    if "enum" in node:
+        return "|".join(str(x) for x in node["enum"])
+    ts = _types(node)
+    t = ts[0] if ts else ("object" if "properties" in node else "")
+    if t in ("number", "integer"):
+        rng = f" {node['minimum']:g}–{node['maximum']:g}" if "minimum" in node and "maximum" in node else ""
+        return ("int" if t == "integer" else "num") + rng
+    if t == "string":
+        if str(node.get("pattern", "")).startswith("^#"):
+            return '"#RRGGBB"'
+        return "str" + (f"≤{node['maxLength']}" if "maxLength" in node else "")
+    if t == "boolean":
+        return "bool"
+    if t == "array":
+        it = node.get("items")
+        lo, hi = node.get("minItems"), node.get("maxItems")
+        if isinstance(it, dict):
+            inner = deref(it, root)
+            if inner.get("type") in ("number", "integer") and lo == hi and lo:
+                return "[" + ", ".join(["num"] * lo) + "]"
+            if inner.get("type") == "array":
+                return "[[ref,ref], …]" if "$ref" in json.dumps(inner.get("items")) else "[[x,z], …]"
+            return _short(it, root, depth + 1) + "[]" + (f"≤{hi}" if hi else "")
+        return "[]"
+    if t == "object":
+        if depth > 1:
+            return "{…}"
+        props = node.get("properties") or {}
+        return "{" + ", ".join(f"{k}?: {_short(v, root, depth + 1)}" for k, v in props.items() if k not in AI_FORBIDDEN) + "}"
+    return t or "any"
+
+
+def _when_of(prop: Any) -> dict:
+    return ((prop.get("x-ui") or {}).get("when") or {}) if isinstance(prop, dict) else {}
+
+
+def grammar() -> str:
+    """场景程序的精简语法表（DeepSeek 的系统提示与 Claude 的提示共用）：根、site、terrain_op 按 op、node 按 type、spawn / relation / palette"""
+    root = plan_schema()
+    defs = _defs(root)
+    req = set(root.get("required") or [])
+    lines = ["plan = {" + ", ".join(f"{k}{'' if k in req else '?'}: {_short(v, root)}" for k, v in (root.get("properties") or {}).items() if k not in AI_FORBIDDEN) + "}"]
+    for name in ("site", "spawn", "relation", "palette_entry", "lighting", "room"):
+        if name in defs:
+            d = defs[name]
+            rq = set(d.get("required") or [])
+            lines.append(f"{name} = {{" + ", ".join(f"{k}{'' if k in rq else '?'}: {_short(v, root, 1)}" for k, v in (d.get("properties") or {}).items() if k not in AI_FORBIDDEN) + "}")
+    if "anchor" in defs:
+        lines.append("anchor（at / from / to / via）= " + str(defs["anchor"].get("description") or "")[:200])
+    if "ref" in defs:
+        lines.append("ref（under / over / around / along / area / look_at / connect.from / 关系的 a b c）= " + str(defs["ref"].get("description") or "") + "（不带 .部位）")
+    xsize = root.get("x-size") or {}
+
+    def per_kind(d: dict, key: str, kinds: list) -> list[str]:
+        props = d.get("properties") or {}
+        common: list = []
+        by: dict = {k: [] for k in kinds}
+        for f, sub in props.items():
+            if f in AI_FORBIDDEN or f == key:
+                continue
+            w = _when_of(sub)
+            note = ""
+            if key in w:
+                targets = [k for k in kinds if k in w[key]]
+            elif w:
+                (wk, wv), = list(w.items())[:1]
+                note = f"({wk}={'/'.join(map(str, wv))} 时)"
+                dep = _when_of(props.get(wk)).get(key) if wk in props else None
+                targets = [k for k in kinds if k in dep] if dep else []
+            else:
+                common.append(f)
+                continue
+            for k in targets:
+                by[k].append(f + note)
+        out = [f"{d.get('title') or ''}通用 = {{" + ", ".join(f"{f}?: {_short(props[f], root, 1)}" for f in common) + "}"]
+        groups: dict = {}
+        for k in kinds:
+            sig = (tuple(by[k]), tuple(xsize.get(k) or []) if key == "type" else ())
+            groups.setdefault(sig, []).append(k)
+        for (fs, size), ks in groups.items():
+            bits = []
+            if size:
+                bits.append("size_m=[" + ",".join(size) + "]")
+            for f in fs:
+                base = f.split("(")[0]
+                bits.append(f"{f}: {_short(props[base], root, 1)}" if base != "size_m" else f)
+            out.append("  " + " / ".join(ks) + "：" + ("；".join(bits) if bits else "只有通用字段"))
+        return out
+    if "terrain_op" in defs:
+        ops = list((defs["terrain_op"]["properties"].get("op") or {}).get("enum") or [])
+        lines += [x.replace("通用", "terrain_op 通用", 1) if i == 0 else x for i, x in enumerate(per_kind(defs["terrain_op"], "op", ops))]
+    if "node" in defs:
+        types = list((defs["node"]["properties"].get("type") or {}).get("enum") or [])
+        lines += [x.replace("通用", "node 通用", 1) if i == 0 else x for i, x in enumerate(per_kind(defs["node"], "type", types))]
+    return "\n".join(lines)

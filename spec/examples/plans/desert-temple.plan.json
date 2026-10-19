@@ -1,0 +1,44 @@
+{
+  "name": "沙海神殿",
+  "concept": "沿南北轴线展开：大道两旁一列狮身像，尽头是五级阶梯金字塔，顶上圣所，东侧柱厅，西南有一汪绿洲",
+  "key_structures": ["中轴大道", "狮身像列", "阶梯金字塔", "顶上圣所", "柱厅", "绿洲"],
+  "site": { "size_m": [220, 220], "ground": "desert", "relief_m": 3, "layer_m": 3 },
+  "terrain": [
+    { "id": "plaza", "op": "flatten", "label": "神殿广场", "at": "site.C", "offset_m": [0, -10], "shape": "rect", "size_m": [110, 150], "edge_m": 8 },
+    { "id": "oasis", "op": "lake", "label": "绿洲", "at": "site.SW", "offset_m": [16, -16], "shape": "ellipse", "size_m": [34, 26], "depth_m": 2 }
+  ],
+  "nodes": [
+    { "id": "pyramid", "type": "repeat", "label": "阶梯金字塔", "role": "landmark", "at": "plaza", "offset_m": [0, -34], "pattern": "stack", "levels": 5, "taper": 0.16,
+      "child": { "id": "tier", "type": "box", "label": "台级", "size_m": [64, 6, 64], "color": "stone" } },
+    { "id": "shrine", "type": "building", "label": "圣所", "at": "pyramid.top", "size_m": [16, 8, 16], "roof": "flat", "color": "gold" },
+    { "id": "grand_stairs", "type": "stairs", "label": "正面大台阶", "at": "pyramid.S", "size_m": [10, 22, 24] },
+    { "id": "avenue", "type": "link", "style": "road", "label": "中轴大道", "from": "spawn", "to": "grand_stairs", "width_m": 8 },
+    { "id": "sphinx_e", "type": "repeat", "label": "狮身像（东）", "pattern": "along", "along": "avenue", "count": 6, "face": "path",
+      "child": { "id": "sphinx", "type": "statue", "label": "狮身像", "size_m": [3, 4, 7], "offset_m": [8, 0] } },
+    { "id": "sphinx_w", "type": "repeat", "label": "狮身像（西）", "pattern": "along", "along": "avenue", "count": 6, "face": "path",
+      "child": { "id": "sphinx_l", "type": "statue", "label": "狮身像", "size_m": [3, 4, 7], "offset_m": [-8, 0] } },
+    { "id": "obelisks", "type": "repeat", "label": "方尖碑", "at": "grand_stairs.S", "offset_m": [0, 10], "pattern": "mirror", "axis": "x",
+      "child": { "id": "obelisk", "type": "prism", "label": "方尖碑", "sides": 4, "size_m": [3, 20], "offset_m": [14, 0], "color": "gold" } },
+    { "id": "hypostyle", "type": "platform", "label": "柱厅", "at": "pyramid.E", "offset_m": [6, 0], "size_m": [26, 1.2, 40], "children": [
+      { "id": "columns", "type": "repeat", "label": "柱列", "pattern": "grid", "rows": 6, "cols": 3, "spacing_m": [7, 6.5],
+        "child": { "id": "column", "type": "column", "label": "柱", "size_m": [1.8, 10] } }
+    ]},
+    { "id": "palms", "type": "repeat", "label": "棕榈", "at": "oasis", "pattern": "radial", "count": 8, "radius_m": 22,
+      "child": { "id": "palm", "type": "tree", "label": "棕榈", "size_m": [5, 10] } }
+  ],
+  "spawn": { "at": "site.S", "look_at": "pyramid" },
+  "relations": [
+    { "type": "visible_from", "a": "pyramid", "b": "spawn" },
+    { "type": "reachable", "a": "shrine", "b": "spawn" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#B88A4A", "note": "赭石" },
+    { "role": "wall", "hex": "#E3CFA3", "note": "砂岩" },
+    { "role": "stone", "hex": "#CDB27C", "note": "石灰岩" },
+    { "role": "foliage", "hex": "#5C7A3A", "note": "棕榈" },
+    { "role": "mist", "hex": "#F3E3C3", "note": "沙尘" },
+    { "role": "gold", "hex": "#D9A94A", "note": "金饰" }
+  ],
+  "lighting": { "time_of_day": "noon" },
+  "mood": ["肃穆", "灼热"]
+}

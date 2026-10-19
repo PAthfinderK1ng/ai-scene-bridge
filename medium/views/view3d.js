@@ -1,9 +1,10 @@
 // views/view3d.js — 3D 预览（只看，不编辑；原 preview3d.js）。three.js 走 importmap（jsdelivr），离线 / 没有 WebGL 时给一行字而不是报错。
 // 两种用法：中栏「3D」整页，和俯视图 / 剖面右下角的「3D 小窗」（inset：不出提示文字，仍可转视角）。
-// 画：地形（可调透明度，地下层自动 35%）、房子与全部地标（按 form 出体块）、路与溪、桥、出生点、
+// 画：地形（可调透明度，地下层自动 35%）、全部体块（v5：按 shape 出 Box / Cylinder / Cone / 半球 / Sphere / Torus / n 边柱 / 四棱锥 / 楔 / 拱，
+// 屋顶按 roof 叠上，浮岛 = 倒锥 + 草顶，悬空按 elev；同几何 ≥ 3 件合成 InstancedMesh）、路（按 style：带子 / 台阶 / 桥面 + 桥墩 / 索桥 / 隧道 / 运河 / 传送门）、水面、出生点、
 // 空间内部实体（通道 = 沿折线的盒子、房间 = 多边形挤出、层间连接 = 竖梯；当前内部层实、其它层半透明）、连接点、剖切面。
 // 纯函数式挂载：数据进（ctx），回调没有；不调 AI。
-import { paletteOf, sublevelOf, SELECT_COLOR, ROOM_FILL } from "./map.js";
+import { paletteOf, spawnY, sublevelOf, SELECT_COLOR, ROOM_FILL, shapeOf, volDims, roofOf, volumeBase, volumeTop, volumeColor, volumeType, ROUND_SHAPES, prismSides, archThickness, torusTube, pathStyleOf, pierPoints, ringOf } from "./map.js";
 import { sectionPath } from "../engine/section.js";
 import { CLEARANCE, levelsOf } from "../engine/interior.js";
 import { pathCrossings } from "../engine/routing.js";
@@ -16,8 +17,18 @@ async function lib() {
 }
 /** 地下层时地面自动透明度 */
 export const UNDERGROUND_OPACITY = 0.35;
+const SKY_OPACITY = 0.28;
+/** 地面渐变两端色 [低处, 高处]：色板的 ground / 地面 / 沙 / 土 角色优先，否则按 site.ground */
+const GROUND_TINT = { desert: ["#f0dcae", "#c79f62"], lake: ["#dccfa8", "#8fae7a"], coast: ["#e8dab2", "#93ae7c"], island: ["#e8dab2", "#8fae7a"], canyon: ["#d6b38a", "#94694a"], mountain: ["#d2cab6", "#857f6e"], cavern: ["#706759", "#47413a"], sky: ["#f6f9fd", "#e2eaf4"], hills: ["#e6dfc8", "#93ad80"], rolling: ["#e8e1cc", "#9fb38a"] };
+export function groundTint(sid) {
+  const g = (sid.meta && sid.meta.ground) || "flat", pal = (sid.style && sid.style.palette) || [];
+  const own = g === "sky" ? null : pal.find((q) => q && /^(ground|地面|地|沙|沙地|土|草地)$/.test(String(q.role || "")) && /^#[0-9a-f]{6}$/i.test(q.hex || ""));
+  if (own) { const c = new THREE.Color(own.hex), l = c.clone().lerp(new THREE.Color("#ffffff"), 0.35); return ["#" + l.getHexString(), "#" + c.getHexString()]; }
+  return GROUND_TINT[g] || ["#e9e2cf", "#9fb38a"];
+}
 /** 重建节流（毫秒） */
 export const THROTTLE_MS = 150;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const UG_COLOR = "#3b3a52", WAY_COLOR = "#cdb894", SKY_WAY = "#a0784a", SLAB_COLOR = "#a39a88", CONN_COLOR = "#6b4f2a", SEC_COLOR = "#7a4fc9";
 
 /**
@@ -26,6 +37,7 @@ const UG_COLOR = "#3b3a52", WAY_COLOR = "#cdb894", SKY_WAY = "#a0784a", SLAB_COL
  * @param {object} ctx { sid, T, stratum?, interiorLevel?: 0|1|2, section?: {mode, line, width_m}, selected?: {plan_id?, sid_id?} }
  * @param {{inset?: boolean}} [o] inset = 3D 小窗（不出提示文字）
  * @returns {{ ready: Promise<boolean>, offline: boolean, update(ctx), setGroundOpacity(o: number|null), setSection(section|null), snapshot(): string|null, debug(): object, dispose() }}
+ *   debug() = { names, groundOpacity, section, builds, volumes: { volumes, shapes: {shape: 个数}, meshes, instanced, instances }, calls }
  *   update 节流 150 ms；setGroundOpacity(null) 回到自动（地下层 35%，其它 100%）；setSection 接受 {mode, line, width_m} 或有 path 的采样结果，null 收起；
  *   ctx.section 在 update 时也会同步剖切面（显式 setSection 优先）。
  */
@@ -71,21 +83,22 @@ function create(container, ctx, inset) {
   sun.position.set(-60, 80, 40); scene.add(sun);
   if (!inset) { const n = document.createElement("div"); n.className = "three-note"; n.textContent = "拖动旋转 · 滚轮缩放 · 右键平移"; container.append(n); }
 
-  let group = new THREE.Group(), secMesh = null, groundMat = null, nBuilds = 0, alive = true, dirty = true, cur = ctx, secCfg, secExplicit = false, manualOpacity = null, lastBuild = 0, timer = null, pending = null, placed = false;
+  let volStats = null, group = new THREE.Group(), secMesh = null, groundMat = null, nBuilds = 0, alive = true, dirty = true, cur = ctx, secCfg, secExplicit = false, manualOpacity = null, lastBuild = 0, timer = null, pending = null, placed = false;
   scene.add(group);
   const resize = () => { const w = container.clientWidth || (inset ? 320 : 600), h = container.clientHeight || (inset ? 220 : 400); renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); dirty = true; };
   const ro = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
   if (ro) ro.observe(container);
   controls.addEventListener("change", () => { dirty = true; });
-  const disposeTree = (obj) => obj.traverse((x) => { if (x.geometry) x.geometry.dispose(); if (x.material) (Array.isArray(x.material) ? x.material : [x.material]).forEach((m) => m.dispose()); });
-  const opacityFor = (c) => (manualOpacity != null ? manualOpacity : c.stratum === "underground" ? UNDERGROUND_OPACITY : 1);
+  const disposeTree = (obj) => obj.traverse((x) => { if (x.geometry && !x.geometry.userData.shared) x.geometry.dispose(); if (x.material) (Array.isArray(x.material) ? x.material : [x.material]).forEach((m) => m.dispose()); });
+  const skyGround = (c) => !!(c && c.sid && c.sid.meta && c.sid.meta.ground === "sky");
+  const opacityFor = (c) => (manualOpacity != null ? manualOpacity : c.stratum === "underground" ? UNDERGROUND_OPACITY : skyGround(c) ? SKY_OPACITY : 1);
   function applyOpacity() { if (!groundMat) return; const op = opacityFor(cur); groundMat.opacity = op; groundMat.transparent = op < 1; groundMat.depthWrite = op >= 1; groundMat.needsUpdate = true; dirty = true; }
   const mat = (color, extra = {}) => new THREE.MeshLambertMaterial(Object.assign({ color }, extra));
 
   /** 镜头对准村子（房子 / 地标 / 空间 / 入口的包围球），不对整块地形 */
   function fitCamera(sid) {
     const pts = [];
-    for (const v of sid.volumes || []) if (v.position && v.size) { const r = Math.max(v.size[0], v.size[2]) / 2; for (const [dx, dz] of [[-r, -r], [r, r]]) pts.push([v.position[0] + dx, v.position[1] + v.size[1], v.position[2] + dz]); }
+    for (const v of sid.volumes || []) if (v.position && v.size) { const [w, , d] = volDims(v), r = Math.max(w, d) / 2, y0 = volumeBase(v, cur.T), y1 = volumeTop(v, cur.T); for (const [dx, dz] of [[-r, -r], [r, r]]) pts.push([v.position[0] + dx, y0, v.position[2] + dz], [v.position[0] + dx, y1, v.position[2] + dz]); }
     for (const sp of sid.spaces || []) if (sp.polygon) for (const q of sp.polygon) pts.push([q[0], sp.floor_y || 0, q[1]]);
     for (const m of sid.markers || []) if (m.kind === "player_spawn" && m.position) pts.push(m.position);
     const b = sid.bounds;
@@ -109,55 +122,35 @@ function create(container, ctx, inset) {
     const geo = new THREE.PlaneGeometry(W, D, seg, seg);
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position, colors = new Float32Array(pos.count * 3), layer = (sid.meta && sid.meta.layer_height_m) || 3;
-    const maxLevel = Math.max(1, ...(T.terraces || []).map((t) => t.level)), lo = new THREE.Color("#e9e2cf"), hi = new THREE.Color("#9fb38a"), tmp = new THREE.Color();
+    // 地面色按题材：色板里有 ground / 地面 角色就用它，否则按 site.ground 选一组（沙漠沙色、湖海岸色、峡谷岩色、云上半透明云层）；低处 → 高处渐变
+    const tint = groundTint(sid), lo = new THREE.Color(tint[0]), hi = new THREE.Color(tint[1]), tmp = new THREE.Color(), hs = new Float32Array(pos.count);
+    let h0 = Infinity, h1 = -Infinity;
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i) + (b.min[0] + b.max[0]) / 2, z = pos.getZ(i) + (b.min[2] + b.max[2]) / 2, h = T.heightAt(x, z);
-      pos.setX(i, x); pos.setZ(i, z); pos.setY(i, h);
-      tmp.copy(lo).lerp(hi, Math.min(1, Math.max(0, h / (layer * maxLevel))));
+      pos.setX(i, x); pos.setZ(i, z); pos.setY(i, h); hs[i] = h; h0 = Math.min(h0, h); h1 = Math.max(h1, h);
+    }
+    const span = Math.max(layer * 2, h1 - h0);
+    for (let i = 0; i < pos.count; i++) {
+      tmp.copy(lo).lerp(hi, Math.min(1, Math.max(0, (hs[i] - h0) / span)));
       colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
     }
     geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
     groundMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    if (skyGround(c)) { const op = opacityFor(c); groundMat.transparent = op < 1; groundMat.opacity = op; groundMat.depthWrite = op >= 1; } // 没有地面：只是一层薄云
     const ground = new THREE.Mesh(geo, groundMat);
     ground.name = "ground"; ground.renderOrder = 2;
     group.add(ground);
 
-    // 房子与地标：按 form 出体块（圆楼 / 井 / 树 = 圆柱，塔 = 高盒子加尖顶，吊脚楼 = 抬高的盒子加柱脚）
-    const M = { wall: mat(pal.wall), roof: mat(pal.roof), lm: mat("#b8452b"), tree: mat(pal.foliage), stone: mat(pal.stone), wood: mat("#8a6a44"), sel: mat(SELECT_COLOR) };
-    for (const v of sid.volumes || []) {
-      if (!v.position || !v.size) continue;
-      const [w, h, d] = v.size, lm = v.importance === "landmark", hot = isSel(v);
-      let mesh;
-      if (v.shape === "cylinder") mesh = new THREE.Mesh(new THREE.CylinderGeometry(w / 2, (w / 2) * (v.kind === "prop" ? 0.7 : 1), h, 12), hot ? M.sel : v.kind === "prop" && v.form !== "well" ? M.tree : lm ? M.lm : M.wall);
-      else {
-        mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), hot ? M.sel : lm ? (v.form === "wall" || v.form === "statue" ? M.stone : M.lm) : M.wall);
-        if (v.form === "tower") { const r = new THREE.Mesh(new THREE.ConeGeometry(Math.max(w, d) * 0.75, Math.min(4, h * 0.25), 4), M.roof); r.position.y = h / 2 + Math.min(4, h * 0.25) / 2; r.rotation.y = Math.PI / 4; mesh.add(r); }
-        else if (!lm || ["hall", "pavilion", "gate", "stage", "custom", "house"].includes(v.form)) { const roof = new THREE.Mesh(new THREE.BoxGeometry(w * 1.1, Math.min(0.6, h * 0.15), d * 1.1), M.roof); roof.position.y = h / 2; mesh.add(roof); }
-      }
-      mesh.position.set(v.position[0], v.position[1] + h / 2, v.position[2]);
-      mesh.rotation.y = ((v.rotation_y || 0) * Math.PI) / 180;
-      mesh.name = (lm ? "landmark:" : v.kind === "building" ? "house:" : "prop:") + v.id;
-      if (v.stilt_m > 0.2) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { const post = new THREE.Mesh(new THREE.BoxGeometry(0.3, v.stilt_m, 0.3), M.wood); post.position.set((sx * w) / 2.3, -h / 2 - v.stilt_m / 2, (sz * d) / 2.3); mesh.add(post); }
-      group.add(mesh);
-    }
-    // 路与溪
-    for (const p of sid.paths || []) {
-      if (!p.points || p.points.length < 2) continue;
-      const vs = [];
-      for (let i = 1; i < p.points.length; i++) {
-        const a = p.points[i - 1], q = p.points[i], n = Math.max(2, Math.ceil(Math.hypot(q[0] - a[0], q[1] - a[1]) / 2));
-        for (let k = 0; k <= n; k++) { const t = k / n, x = a[0] + (q[0] - a[0]) * t, z = a[1] + (q[1] - a[1]) * t; vs.push(new THREE.Vector3(x, T.heightAt(x, z) + 0.25, z)); }
-      }
-      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(vs), new THREE.LineBasicMaterial({ color: isSel(p) ? SELECT_COLOR : p.kind === "river" ? "#4f86c6" : p.id === "main_trail" ? "#6b5a3a" : "#8b7d5b" }));
-      line.name = "path:" + p.id; group.add(line);
-    }
+    // 体块（按形体）、路（按 style）、水面
+    const vm = volumeMeshes(c, pal, isSel);
+    volStats = vm.stats; group.add(vm.group, pathMeshes(c, isSel), waterMeshes(c));
     const matBridge = mat("#cfc6ae");
     for (const br of pathCrossings(sid.paths || [])) { const L = (br.width || 4) + 2, m = new THREE.Mesh(new THREE.BoxGeometry(L, 0.5, 3), matBridge); m.position.set(br.at[0], T.heightAt(br.at[0], br.at[1]) + 0.6, br.at[1]); m.rotation.y = -Math.atan2(br.dir[1], br.dir[0]); group.add(m); }
     const sp = (sid.markers || []).find((m) => m.kind === "player_spawn");
     if (sp) {
       const cone = new THREE.Mesh(new THREE.ConeGeometry(1, 2.2, 8), mat("#1f6feb"));
-      cone.position.set(sp.position[0], T.heightAt(sp.position[0], sp.position[2]) + 1.1, sp.position[2]); cone.name = "spawn";
+      cone.position.set(sp.position[0], spawnY(sp, T) + 1.1, sp.position[2]); cone.name = "spawn";
       group.add(cone);
       const th = ((sp.rotation_y || 0) * Math.PI) / 180;
       group.add(new THREE.ArrowHelper(new THREE.Vector3(-Math.sin(th), 0, -Math.cos(th)), cone.position.clone(), 8, 0x1f6feb, 2, 1));
@@ -303,7 +296,254 @@ function create(container, ctx, inset) {
     setGroundOpacity(op) { manualOpacity = op; applyOpacity(); },
     setSection(sec) { secCfg = sec || null; secExplicit = true; drawSection(); },
     snapshot() { renderer.render(scene, camera); return renderer.domElement.toDataURL("image/png"); },
-    debug() { const names = []; scene.traverse((x) => { if (x.name) names.push(x.name); }); return { names, groundOpacity: groundMat ? groundMat.opacity : null, section: !!secMesh, builds: nBuilds }; },
+    debug() { const names = []; scene.traverse((x) => { if (x.name) names.push(x.name); }); return { names, groundOpacity: groundMat ? groundMat.opacity : null, section: !!secMesh, builds: nBuilds, volumes: volStats, calls: renderer.info.render.calls }; },
     dispose() { alive = false; if (timer) clearTimeout(timer); if (ro) ro.disconnect(); controls.dispose(); if (secMesh) disposeTree(secMesh); disposeTree(group); renderer.dispose(); container.replaceChildren(); },
   };
+}
+
+// ============================================================ 形体（v5）：单位几何 + 实例矩阵（缩放在矩阵里），同几何的件合进一个 InstancedMesh
+/** 同一几何的件 ≥ 这个数就合批（InstancedMesh）；地标与选中的不合批（保留名字、单独着色） */
+export const INSTANCE_MIN = 3;
+const GEO = new Map();
+/** 三角面几何（每面独立顶点 → 平面法线）；verts [[x,y,z]]，tris [[a,b,c]] 外侧逆时针 */
+function triGeo(verts, tris) {
+  const pos = [];
+  for (const t of tris) for (const k of t) pos.push(...verts[k]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+/**
+ * 单位几何（底面在 y = 0，占地 1 × 1，高 1；按 key 缓存、不随重建释放）。
+ * box · cyl:n（圆柱 / n 边柱）· cone:n · pyr（四棱锥）· dome（半球）· sphere · wedge（高边在 −z）· gable（屋脊沿 x）· icone:n（倒锥）·
+ * torus:tr（平放的环，外径 1、管半径 tr，高 2·tr）· utorus:tr（立起来的环，环面在 xy 面，外径 1）· ring:k（空心圆柱：外径 1、带宽 k、高 1）· arch:t:h（宽 1、腿厚 t、高 h、深 1）
+ */
+function unitGeo(key) {
+  if (GEO.has(key)) return GEO.get(key);
+  const [kind, a1, a2] = key.split(":"), n1 = Number(a1), n2 = Number(a2);
+  let g;
+  if (kind === "box") { g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, 0.5, 0); }
+  else if (kind === "cyl") { g = new THREE.CylinderGeometry(0.5, 0.5, 1, n1 || 20); g.translate(0, 0.5, 0); }
+  else if (kind === "cone") { g = new THREE.ConeGeometry(0.5, 1, n1 || 20); g.translate(0, 0.5, 0); }
+  else if (kind === "icone") { g = new THREE.ConeGeometry(0.5, 1, n1 || 7); g.rotateX(Math.PI); g.translate(0, 0.5, 0); }
+  else if (kind === "pyr") { g = new THREE.ConeGeometry(Math.SQRT1_2, 1, 4); g.rotateY(Math.PI / 4); g.translate(0, 0.5, 0); }
+  else if (kind === "dome") { g = new THREE.SphereGeometry(0.5, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2); g.scale(1, 2, 1); }
+  else if (kind === "sphere") { g = new THREE.SphereGeometry(0.5, 20, 14); g.translate(0, 0.5, 0); }
+  else if (kind === "wedge") g = triGeo([[-0.5, 0, 0.5], [0.5, 0, 0.5], [0.5, 0, -0.5], [-0.5, 0, -0.5], [-0.5, 1, -0.5], [0.5, 1, -0.5]], [[0, 3, 2], [0, 2, 1], [3, 4, 5], [3, 5, 2], [0, 1, 5], [0, 5, 4], [0, 4, 3], [1, 2, 5]]);
+  else if (kind === "gable") g = triGeo([[-0.5, 0, 0.5], [0.5, 0, 0.5], [0.5, 0, -0.5], [-0.5, 0, -0.5], [-0.5, 1, 0], [0.5, 1, 0]], [[0, 3, 2], [0, 2, 1], [0, 1, 5], [0, 5, 4], [3, 4, 5], [3, 5, 2], [0, 4, 3], [1, 2, 5]]);
+  else if (kind === "torus") { const tr = n1 || 0.1; g = new THREE.TorusGeometry(0.5 - tr, tr, 10, 28); g.rotateX(Math.PI / 2); g.translate(0, tr, 0); }
+  else if (kind === "utorus") { const tr = n1 || 0.1; g = new THREE.TorusGeometry(0.5 - tr, tr, 10, 28); g.translate(0, 0.5, 0); }
+  else if (kind === "ring") { // 环形截面拉伸（中间是空的）：外圆 0.5，内圆 0.5 − k
+    const k = Math.min(0.49, n1 || 0.08), s = new THREE.Shape(), hole = new THREE.Path();
+    s.absarc(0, 0, 0.5, 0, Math.PI * 2, false); hole.absarc(0, 0, 0.5 - k, 0, Math.PI * 2, true); s.holes.push(hole);
+    g = new THREE.ExtrudeGeometry(s, { depth: 1, bevelEnabled: false, curveSegments: 40 }); g.rotateX(-Math.PI / 2);
+  }
+  else if (kind === "arch") {
+    const t = n1 || 0.18, H = n2 || 1, yc = Math.max(0, H - 0.5), s = new THREE.Shape();
+    s.moveTo(-0.5, 0); s.lineTo(-0.5, yc); s.absarc(0, yc, 0.5, Math.PI, 0, true); s.lineTo(0.5, 0); s.lineTo(0.5 - t, 0); s.lineTo(0.5 - t, yc);
+    s.absarc(0, yc, 0.5 - t, 0, Math.PI, false); s.lineTo(-0.5 + t, 0); s.lineTo(-0.5, 0);
+    g = new THREE.ExtrudeGeometry(s, { depth: 1, bevelEnabled: false, curveSegments: 14 }); g.translate(0, 0, -0.5);
+  } else { g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, 0.5, 0); }
+  g.userData.shared = true;
+  GEO.set(key, g);
+  return g;
+}
+const q2 = (v) => Math.round(v * 50) / 50;
+/** 形体的主体件：{geo, s: [sx, sy, sz], p?: [lx, ly, lz], ry?} */
+function bodyPart(v) {
+  const sh = shapeOf(v), [w, h, d] = volDims(v);
+  if (sh === "cylinder") { const R = ringOf(v); return R && !R.torus && R.ix > 0.05 ? { geo: `ring:${q2(Math.max(0.02, R.wall / w))}`, s: [w, h, d] } : { geo: "cyl:20", s: [w, h, d] }; }
+  if (sh === "prism") return { geo: `cyl:${prismSides(v)}`, s: [w, h, w] };
+  if (sh === "cone") return { geo: "cone:20", s: [w, h, d] };
+  if (sh === "pyramid") return { geo: "pyr", s: [w, h, d] };
+  if (sh === "dome") return { geo: "dome", s: [w, h, d] };
+  if (sh === "sphere") return { geo: "sphere", s: [w, h, d] };
+  if (sh === "wedge") return { geo: "wedge", s: [w, h, d] };
+  if (sh === "torus" && v.orient === "upright") return { geo: `utorus:${q2(Math.min(0.24, torusTube(v) / (2 * w)))}`, s: [w, w, w] };
+  if (sh === "torus") return { geo: `torus:${q2(Math.min(0.24, torusTube(v) / (2 * w)))}`, s: [w, w, d] };
+  if (sh === "arch") return { geo: `arch:${q2(archThickness(v) / w)}:${q2(h / w)}`, s: [w, w, d] };
+  return { geo: "box", s: [w, h, d] };
+}
+/** 屋顶件（叠在墙身顶 y = h） */
+function roofPart(v, r) {
+  if (!r || r.type === "none" || !(r.h > 0.05)) return null;
+  const sh = shapeOf(v), [w, h, d] = volDims(v), round = ROUND_SHAPES.has(sh), rh = r.h;
+  const cone = sh === "prism" ? `cone:${prismSides(v)}` : "cone:20";
+  if (r.type === "flat") return { geo: round ? "cyl:20" : "box", s: [w * 1.04, rh, d * 1.04], p: [0, h, 0] };
+  if (r.type === "dome") return { geo: "dome", s: round ? [w, rh, d] : [Math.min(w, d), rh, Math.min(w, d)], p: [0, h, 0] };
+  if (round) return { geo: cone, s: [w * 1.08, rh, d * 1.08], p: [0, h, 0] };
+  if (r.type === "gable") return w >= d ? { geo: "gable", s: [w * 1.04, rh, d * 1.1], p: [0, h, 0] } : { geo: "gable", s: [d * 1.04, rh, w * 1.1], p: [0, h, 0], ry: Math.PI / 2 };
+  return { geo: "pyr", s: [w * (r.type === "spire" ? 1.02 : 1.08), rh, d * (r.type === "spire" ? 1.02 : 1.08)], p: [0, h, 0] };
+}
+
+/**
+ * 体块 → 网格。每个体块拆成件（主体 / 屋顶 / 浮岛草顶 / 树干 / 吊脚柱），件的世界矩阵 = 平移(底面中心) · 转 rotation_y · 件偏移 · 缩放。
+ * 同一单位几何的件 ≥ INSTANCE_MIN 个就合成一个 InstancedMesh（每实例自带颜色）；地标与选中的单独出网格（名字 landmark:id / house:id / shape:id）。
+ * @returns {{ group, stats: { volumes, shapes: {shape: n}, meshes, instanced, instances } }}
+ */
+function volumeMeshes(c, pal, isSel) {
+  const { sid, T } = c, out = new THREE.Group(), stats = { volumes: 0, shapes: {}, meshes: 0, instanced: 0, instances: 0 };
+  out.name = "volumes";
+  const buckets = new Map(), singles = [], m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  const matOf = new Map(), lam = (color, alpha = 1) => { const k = color + "|" + alpha; if (!matOf.has(k)) matOf.set(k, new THREE.MeshLambertMaterial(Object.assign({ color }, alpha < 1 ? { transparent: true, opacity: alpha, depthWrite: false } : {}))); return matOf.get(k); };
+  for (const v of sid.volumes || []) {
+    if (!v || !Array.isArray(v.position) || !Array.isArray(v.size)) continue;
+    const sh = shapeOf(v), [w, h, d] = volDims(v), base = volumeBase(v, T), r = roofOf(v), lm = v.importance === "landmark", hot = isSel(v), type = volumeType(v);
+    stats.volumes++; stats.shapes[sh] = (stats.shapes[sh] || 0) + 1;
+    const body = hot ? SELECT_COLOR : lm ? "#b8452b" : v.kind === "tree" ? pal.foliage : volumeColor(v, pal, "side");
+    const alpha = v.kind === "water" ? 0.6 : 1;
+    const parts = [];
+    if (v.kind === "island") {
+      const top = Math.min(0.8, h * 0.15);
+      parts.push({ geo: "icone:7", s: [w, h - top, d], color: hot ? SELECT_COLOR : "#8a7a5c" }, { geo: ROUND_SHAPES.has(sh) ? "cyl:20" : "box", s: [w * 1.02, top, d * 1.02], p: [0, h - top, 0], color: hot ? SELECT_COLOR : "#7d9a5f" });
+    } else if (v.kind === "tree" && (sh === "cone" || sh === "sphere" || sh === "dome")) {
+      const trunk = h * 0.28, b = bodyPart(v);
+      parts.push(Object.assign(b, { s: [w, h - trunk, d], p: [0, trunk, 0], color: body }), { geo: "cyl:8", s: [Math.max(0.25, w * 0.12), trunk, Math.max(0.25, w * 0.12)], color: "#6b4f2a" });
+    } else {
+      parts.push(Object.assign(bodyPart(v), { color: body, alpha }));
+      const rp = roofPart(v, r);
+      if (rp) parts.push(Object.assign(rp, { color: hot ? SELECT_COLOR : lm ? pal.roof : pal.roof }));
+    }
+    if (v.stilt_m > 0.2) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) parts.push({ geo: "box", s: [0.3, v.stilt_m, 0.3], p: [(sx * w) / 2.3, -v.stilt_m, (sz * d) / 2.3], color: "#8a6a44" });
+    const rot = ((v.rotation_y || 0) * Math.PI) / 180, origin = new THREE.Matrix4().compose(new THREE.Vector3(v.position[0], base, v.position[2]), q.setFromAxisAngle(Y, rot).clone(), new THREE.Vector3(1, 1, 1));
+    const name = `${lm ? "landmark" : type === "house" ? "house" : v.kind === "prop" ? "prop" : "shape"}:${v.id}`;
+    parts.forEach((p, i) => {
+      const local = new THREE.Matrix4().compose(new THREE.Vector3(...(p.p || [0, 0, 0])), new THREE.Quaternion().setFromAxisAngle(Y, p.ry || 0), new THREE.Vector3(...p.s.map((x) => Math.max(0.01, x))));
+      const M = origin.clone().multiply(local), a = p.alpha || 1;
+      if (lm || hot) { singles.push({ geo: p.geo, M, color: p.color, a, name: i === 0 ? name : `${name}#${i}` }); return; }
+      const k = p.geo + "|" + a;
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push({ geo: p.geo, M, color: p.color, a, name: i === 0 ? name : `${name}#${i}` });
+    });
+  }
+  for (const [k, list] of buckets) {
+    if (list.length < INSTANCE_MIN) { singles.push(...list); continue; }
+    const a = list[0].a, mesh = new THREE.InstancedMesh(unitGeo(list[0].geo), lam("#ffffff", a), list.length), col = new THREE.Color();
+    list.forEach((it, i) => { mesh.setMatrixAt(i, it.M); mesh.setColorAt(i, col.set(it.color)); });
+    mesh.instanceMatrix.needsUpdate = true; if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    mesh.computeBoundingSphere();
+    mesh.name = `inst:${k.split("|")[0]}`; mesh.userData.ids = list.map((it) => it.name);
+    out.add(mesh); stats.meshes++; stats.instanced++; stats.instances += list.length;
+  }
+  for (const it of singles) {
+    const mesh = new THREE.Mesh(unitGeo(it.geo), lam(it.color, it.a));
+    mesh.matrixAutoUpdate = false; mesh.matrix.copy(it.M); mesh.name = it.name;
+    out.add(mesh); stats.meshes++;
+  }
+  return { group: out, stats };
+}
+
+/** 折线按地形采样（每 step 米一点，含端点）：[{x, z, dx, dz, t}]，t = 累计长度 */
+function sampleLine(points, step) {
+  const out = [];
+  let acc = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1e-6) continue;
+    const dx = (b[0] - a[0]) / L, dz = (b[1] - a[1]) / L, n = Math.max(1, Math.ceil(L / step));
+    for (let k = out.length ? 1 : 0; k <= n; k++) out.push({ x: a[0] + dx * (L * k) / n, z: a[1] + dz * (L * k) / n, dx, dz, t: acc + (L * k) / n });
+    acc += L;
+  }
+  return out;
+}
+/** 贴地（或给定高度函数）的带子：宽 W，高度 yOf(s) */
+function ribbon(S, W, yOf, material) {
+  const pos = [], idx = [];
+  S.forEach((s, i) => {
+    const y = yOf(s);
+    pos.push(s.x - s.dz * (W / 2), y, s.z + s.dx * (W / 2), s.x + s.dz * (W / 2), y, s.z - s.dx * (W / 2));
+    if (i) { const a = (i - 1) * 2; idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
+  return new THREE.Mesh(g, material);
+}
+/** 沿 S 每个采样点放一个盒子（InstancedMesh）：台阶 / 木板 */
+function boxesAlong(S, size, yOf, material) {
+  const m = new THREE.InstancedMesh(unitGeo("box"), material, Math.max(1, S.length)), M = new THREE.Matrix4(), Y = new THREE.Vector3(0, 1, 0), q = new THREE.Quaternion();
+  S.forEach((s, i) => { M.compose(new THREE.Vector3(s.x, yOf(s), s.z), q.setFromAxisAngle(Y, -Math.atan2(s.dz, s.dx)), new THREE.Vector3(...size)); m.setMatrixAt(i, M); });
+  m.count = S.length; m.instanceMatrix.needsUpdate = true; m.computeBoundingSphere();
+  return m;
+}
+/** 传送门：竖立的发光环 */
+function portalMesh(at, y, name) {
+  const m = new THREE.Mesh(new THREE.TorusGeometry(1.6, 0.25, 8, 28), new THREE.MeshLambertMaterial({ color: "#7a4fc9", emissive: "#3a1f80" }));
+  m.position.set(at[0], y + 2, at[1]); m.name = name;
+  return m;
+}
+/**
+ * 路 / 桥 / 隧道 / 运河 / 传送门（按 style）。path（v4 的路）与 river 仍画贴地线；road / stairs / ramp / canal 画贴地带（stairs 加台阶块）；
+ * bridge = 每段一块桥面（deck_y，缺省两端地面较高者 + 0.5）+ 桥墩（piers，地面到桥面的圆柱）；rope_bridge = 下垂的木板 + 两根索；
+ * tunnel = 地面上的虚线 + 两端洞口；portal = 两端竖环。
+ */
+function pathMeshes(c, isSel) {
+  const { sid, T } = c, out = new THREE.Group();
+  out.name = "paths";
+  const lam = (color, extra = {}) => new THREE.MeshLambertMaterial(Object.assign({ color, side: THREE.DoubleSide }, extra));
+  for (const p of sid.paths || []) {
+    if (!p.points || p.points.length < 2) continue;
+    const st = p.kind === "river" ? "river" : pathStyleOf(p), hot = isSel(p), W = Math.max(0.8, Number(p.width) || (st === "road" ? 4 : 2)), P = p.points;
+    const gy = (s) => T.heightAt(s.x, s.z);
+    if (p.unrouted) { // 走不通的连接：两端小柱 + 一条虚线，不做路面
+      const a = P[0], b = P[P.length - 1], ya = T.heightAt(a[0], a[1]) + 1, yb = T.heightAt(b[0], b[1]) + 1;
+      const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(a[0], ya, a[1]), new THREE.Vector3(b[0], yb, b[1])]), new THREE.LineDashedMaterial({ color: hot ? SELECT_COLOR : "#b5523b", dashSize: 2, gapSize: 1.5 }));
+      ln.computeLineDistances(); ln.name = "unrouted:" + p.id; out.add(ln);
+      for (const [q, y] of [[a, ya], [b, yb]]) { const m = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 2, 8), lam("#b5523b")); m.position.set(q[0], y, q[1]); out.add(m); }
+      continue;
+    }
+    if (st === "river" || st === "path") {
+      const vs = sampleLine(P, 2).map((s) => new THREE.Vector3(s.x, gy(s) + 0.25, s.z));
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(vs), new THREE.LineBasicMaterial({ color: hot ? SELECT_COLOR : st === "river" ? "#4f86c6" : p.id === "main_trail" ? "#6b5a3a" : "#8b7d5b" }));
+      line.name = "path:" + p.id; out.add(line); continue;
+    }
+    const g = new THREE.Group(); g.name = `${st}:${p.id}`; out.add(g);
+    if (st === "bridge" || st === "rope_bridge") {
+      const S = sampleLine(P, st === "rope_bridge" ? 0.8 : 2), total = S.length ? S[S.length - 1].t : 0;
+      const deck = Number.isFinite(Number(p.deck_y)) && p.deck_y != null ? Number(p.deck_y) : Math.max(T.heightAt(P[0][0], P[0][1]), T.heightAt(P[P.length - 1][0], P[P.length - 1][1])) + 0.5;
+      const sag = st === "rope_bridge" ? Math.min(3, total * 0.05) : 0, yOf = (s) => deck - (total > 0 ? sag * 4 * (s.t / total) * (1 - s.t / total) : 0);
+      const wood = lam(hot ? SELECT_COLOR : st === "bridge" ? "#cfc6ae" : "#8a6a44");
+      if (st === "bridge") {
+        for (let i = 1; i < P.length; i++) {
+          const a = P[i - 1], b = P[i], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+          if (L < 0.05) continue;
+          const m = new THREE.Mesh(new THREE.BoxGeometry(L + 0.2, 0.6, W), wood);
+          m.position.set((a[0] + b[0]) / 2, deck - 0.3, (a[1] + b[1]) / 2); m.rotation.y = -Math.atan2(b[1] - a[1], b[0] - a[0]); m.name = `deck:${p.id}`; g.add(m);
+        }
+        const piers = pierPoints(p), pm = lam("#8d867a"), r = clamp(W * 0.15, 0.3, 1.2);
+        for (const q of piers) { const y0 = T.heightAt(q[0], q[1]) - 1, H = Math.max(0.5, deck - 0.6 - y0), m = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 1.15, H, 10), pm); m.position.set(q[0], y0 + H / 2, q[1]); m.name = `pier:${p.id}`; g.add(m); }
+      } else {
+        const planks = boxesAlong(S, [0.5, 0.12, W], yOf, wood); planks.name = `planks:${p.id}`; g.add(planks);
+        for (const o of [-W / 2, W / 2]) g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(S.map((s) => new THREE.Vector3(s.x - s.dz * o, yOf(s) + 1, s.z + s.dx * o))), new THREE.LineBasicMaterial({ color: "#5a4a2a" })));
+      }
+      continue;
+    }
+    if (st === "portal") { for (const [k, q] of [[0, P[0]], [1, P[P.length - 1]]]) g.add(portalMesh(q, T.heightAt(q[0], q[1]), `portal:${p.id}:${k}`)); continue; }
+    if (st === "tunnel") {
+      const vs = sampleLine(P, 2).map((s) => new THREE.Vector3(s.x, gy(s) + 0.3, s.z)), line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(vs), new THREE.LineDashedMaterial({ color: hot ? SELECT_COLOR : "#3b342d", dashSize: 1, gapSize: 1.2 }));
+      line.computeLineDistances(); g.add(line);
+      for (let k = 0; k < 2; k++) { const a = k ? P[P.length - 1] : P[0], b = k ? P[P.length - 2] : P[1], m = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.6, W + 1), lam("#3b342d")); m.position.set(a[0], T.heightAt(a[0], a[1]) + 1.3, a[1]); m.rotation.y = -Math.atan2(b[1] - a[1], b[0] - a[0]); m.name = `tunnel_mouth:${p.id}`; g.add(m); }
+      continue;
+    }
+    const S = sampleLine(P, 1.5);
+    if (st === "canal") { g.add(ribbon(S, W, (s) => gy(s) + 0.08, lam(hot ? SELECT_COLOR : "#4f86c6", { transparent: true, opacity: 0.7, depthWrite: false }))); continue; }
+    g.add(ribbon(S, W, (s) => gy(s) + 0.12, lam(hot ? SELECT_COLOR : st === "road" ? "#b5ab98" : st === "stairs" ? "#a8a090" : "#b8a77a")));
+    if (st === "stairs") { const steps = boxesAlong(sampleLine(P, 1), [0.45, 0.3, W], (s) => gy(s) + 0.15, lam("#8d867a")); steps.name = `steps:${p.id}`; g.add(steps); }
+  }
+  for (const m of sid.markers || []) if (m && m.kind === "portal" && Array.isArray(m.position)) out.add(portalMesh([m.position[0], m.position[2]], Number.isFinite(m.position[1]) ? m.position[1] : T.heightAt(m.position[0], m.position[2]), "portal:" + m.id));
+  return out;
+}
+/** 水面：regions kind water（surface_y，缺省多边形顶点地面最低处 + 0.3）→ 半透明平面 */
+function waterMeshes(c) {
+  const { sid, T } = c, out = new THREE.Group();
+  out.name = "water";
+  for (const r of sid.regions || []) {
+    if (!r || r.kind !== "water" || !Array.isArray(r.polygon) || r.polygon.length < 3) continue;
+    const y = Number.isFinite(Number(r.surface_y)) && r.surface_y != null ? Number(r.surface_y) : Math.min(...r.polygon.map((q) => T.heightAt(q[0], q[1]))) + 0.3;
+    const g = new THREE.ShapeGeometry(new THREE.Shape(r.polygon.map(([x, z]) => new THREE.Vector2(x, -z))));
+    g.rotateX(-Math.PI / 2);
+    const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: "#4f86c6", transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide }));
+    m.position.y = y; m.name = "water:" + r.id; m.renderOrder = 3; out.add(m);
+  }
+  return out;
 }

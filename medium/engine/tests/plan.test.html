@@ -1,457 +1,837 @@
 <!doctype html><meta charset="utf-8"><pre id="out">running</pre>
 <script type="module">
+// plan.test.html — 场景程序（plan v2，docs/06）解释器：示例、展开、锚点、落地、避让、连接、雕刻、生成器、ops、拖动反算、旋钮、差异、性能。
 import { test, run, assert, close, between } from "./harness.js";
-import { pointInPolygon, distToPolygon, distToPolyline, polygonCentroid } from "../terrain.js";
+import { pointInPolygon, distToPolyline } from "../terrain.js";
 import { boxCorners } from "../layout.js";
-import { resolve, snapshot, restore } from "../sid.js";
-import { PLAN_SCHEMA, PLAN_GROUPS, DIRV, normalizePlan, compilePlan, applyOps, resolveTarget, atFromPoint, knobsFor, summarize, newElement, planDistance, distinctPlans } from "../plan.js";
+import { obbOverlap } from "../validate.js";
+import { resolve, snapshot } from "../sid.js";
+import { sampleSection } from "../section.js";
+import { PLAN_SCHEMA, PLAN_GROUPS, canonRef, normalizePlan, compilePlan, applyOps, resolveTarget, atFromPoint, offsetFromPoint, expand, knobsFor, summarize, newElement, planDistance, distinctPlans, findNode } from "../plan.js";
 
-const NAMES = ["mountain-town", "ring-stilt", "mine-maze", "temple-crypt", "valley-bridge", "ridge-town"];
+const NAMES = ["magic-academy", "sky-garden", "pirate-harbor", "desert-temple", "cyber-market", "mountain-village", "mine-maze"];
 const EX = {};
 for (const n of NAMES) EX[n] = await fetch(`../../../spec/examples/plans/${n}.plan.json`, { cache: "no-store" }).then((r) => r.json());
-const C = {}; // 编译缓存（seed 1）
+const C = {};
 const comp = (n) => (C[n] = C[n] || compilePlan(EX[n], { seed: 1 }));
 const xz = (p) => [p[0], p[2]];
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
-const lmOf = (sid, id) => sid.volumes.find((v) => v.plan_id === id && v.importance === "landmark");
 const chk = (r, id) => r.checks.find((c) => c.id === id);
-/** 一块平台 + 一个地标的最小 plan */
-const mini = (extra = {}) => Object.assign({
-  name: "测试", site: { size_m: 140, relief_layers: 6, layer_m: 3 },
-  terrain: [{ id: "pad", type: "plateau", label: "台", at: { of: "site", dir: "C" }, size_m: [40, 30], layer: 2 }],
-  spawn: { place: { rel: "edge_of", target: "site", side: "S" } },
-}, extra);
+const vol = (r, id) => r.sid.volumes.find((v) => v.id === id);
+const vols = (r, pid) => r.sid.volumes.filter((v) => v.plan_id === pid || (v.plan_path || []).includes(pid));
+const foot = (v) => boxCorners(v.position, v.size, v.rotation_y || 0);
+const facing = (v) => { const t = (v.rotation_y * Math.PI) / 180; return [-Math.sin(t), -Math.cos(t)]; };
+const errs = (r) => r.facts.validation.filter((m) => m.level === "error");
+/** 最小 plan：平地 140 m 见方 + 给的节点 */
+const mini = (nodes, extra = {}) => Object.assign({ name: "测试", site: { size_m: [140, 140], ground: "flat", layer_m: 3 }, nodes, spawn: { at: "site.S" } }, extra);
 const walkSchema = (s, f, seen = new Set()) => { if (!s || typeof s !== "object" || seen.has(s)) return; seen.add(s); f(s); for (const v of Object.values(s)) walkSchema(v, f, seen); };
 
-test("schema：9 个分组；每种 type / form / use / style / layout 都有 x-defaults；schema 里没有坐标字段", () => {
-  assert(PLAN_GROUPS.length === 9 && PLAN_GROUPS.map((g) => g.key).join() === "terrain,zones,buildings,landmarks,paths,water,spaces,relations,look", "分组 " + PLAN_GROUPS.map((g) => g.key));
+// ============================================================ schema 与示例
+test("schema v2：分组 terrain / nodes / relations / look；每种 op / type 都有 x-defaults 与 x-size；schema 里没有全局坐标字段", () => {
+  assert(PLAN_SCHEMA["x-version"] === 2, "x-version 2");
+  assert(PLAN_GROUPS.map((g) => g.key).join() === "terrain,nodes,relations,look", "分组 " + PLAN_GROUPS.map((g) => g.key));
   const D = PLAN_SCHEMA.definitions, XD = PLAN_SCHEMA["x-defaults"];
-  for (const [g, def, tf] of [["terrain", "terrain", "type"], ["buildings", "building", "form"], ["zones", "zone", "use"], ["paths", "path", "style"], ["water", "water", "type"], ["spaces", "space", "layout"]]) {
-    const p = D[def].properties[tf], en = p.enum || D[p.$ref.split("/").pop()].enum;
-    for (const v of en) assert(XD[g][v], `x-defaults.${g}.${v}`);
-  }
-  for (const v of D.form.enum) assert(XD.landmarks[v], "地标默认 " + v);
-  const bad = ["position", "x", "z", "points", "polygon", "center", "coords"];
-  walkSchema(PLAN_SCHEMA.definitions, (s) => { if (s.properties) for (const k of Object.keys(s.properties)) assert(!bad.includes(k) || s === D.relation, "schema 有坐标字段 " + k); });
+  for (const op of D.terrain_op.properties.op.enum) assert(XD.terrain[op], "x-defaults.terrain." + op);
+  for (const t of D.node.properties.type.enum) { assert(XD.nodes[t], "x-defaults.nodes." + t); assert(Array.isArray(PLAN_SCHEMA["x-size"][t]), "x-size." + t); }
+  const cls = PLAN_SCHEMA["x-node-classes"].flatMap((c) => c.types);
+  assert(cls.length === D.node.properties.type.enum.length && D.node.properties.type.enum.every((t) => cls.includes(t)), "x-node-classes 覆盖全部类型");
+  const bad = ["position", "x", "z", "points", "polygon", "center", "coords", "floor_y", "top_y"];
+  walkSchema(PLAN_SCHEMA, (s) => { if (s.properties) for (const k of Object.keys(s.properties)) assert(!bad.includes(k), "schema 有坐标字段 " + k); });
+  assert(D.ops && D.op_set && D.op_add && D.op_remove && D.revise, "ops 定义");
 });
 
-test("6 个示例都能编译：validate 0 error、检查无 error 级失败（主路 / 房子）、SID id 唯一", () => {
+test("7 个示例都能编译：validate 0 error、SID id 唯一、plan_version 2、检查全部通过（形体不重叠 / 不悬空 / 走得到 / 关系）", () => {
   for (const n of NAMES) {
     const r = comp(n);
-    const errs = r.facts.validation.filter((m) => m.level === "error");
-    assert(errs.length === 0, `${n} validate error：${errs.map((e) => e.msg).join("；")}`);
-    assert(r.facts.houses >= 6, `${n} 房子 ${r.facts.houses}`);
+    assert(errs(r).length === 0, `${n} validate error：${errs(r).map((e) => e.msg).join("；")}`);
     const ids = [...r.sid.terrain.features, ...r.sid.volumes, ...r.sid.regions, ...r.sid.paths, ...r.sid.markers, ...r.sid.spaces].map((o) => o.id);
     assert(new Set(ids).size === ids.length, `${n} id 重复`);
-    for (const id of ["houses_no_overlap", "trail_reaches_landmark"]) { const c = chk(r, id); assert(c && c.ok, `${n} ${id}：${c && c.detail}`); }
-    assert(r.sid.paths.some((p) => p.id === "main_trail" && p.plan_id === EX[n].paths[0].id), n + " 主路 = 第一条路");
-    assert(r.sid.meta.plan_mode && r.sid.meta.plan.name === EX[n].name, n + " meta.plan");
+    assert(r.sid.meta.plan_version === 2 && r.sid.meta.plan.name === EX[n].name, n + " meta");
+    const bad = r.checks.filter((c) => !c.ok && !c.ignored);
+    assert(bad.length === 0, `${n} 检查没过：${bad.map((c) => c.text + "：" + c.detail).join("；")}`);
+    assert(r.sid.markers.some((m) => m.kind === "player_spawn"), n + " 出生点");
   }
 });
 
-test("索引：每个 plan 元素（地形 / 区域 / 地标 / 路 / 空间 / 入口）都对得上它生成的 SID 对象；SID 里的 plan_id 都指回 plan", () => {
-  for (const n of NAMES) {
-    const r = comp(n), p = r.plan;
-    for (const g of ["terrain", "zones", "landmarks", "paths", "spaces", "water"]) for (const el of p[g]) assert(r.index[el.id] && r.index[el.id].group === g && r.index[el.id].sid_ids.length, `${n} 索引缺 ${g}.${el.id}`);
-    assert(r.index.spawn && r.index.spawn.sid_ids.includes("spawn"), n + " 入口");
-    const known = new Set(["spawn", ...["terrain", "zones", "buildings", "landmarks", "paths", "water", "spaces"].flatMap((g) => p[g].map((e) => e.id))]);
-    for (const coll of [r.sid.terrain.features, r.sid.volumes, r.sid.regions, r.sid.paths, r.sid.markers, r.sid.spaces]) for (const o of coll) if (o.plan_id) assert(known.has(o.plan_id), `${n} ${o.id} 的 plan_id ${o.plan_id} 不在 plan 里`);
+test("示例的空间组织各不相同：魔法学院不是台地 + 撒房子；只有山城用台地生成器；7 个示例两两 planDistance ≥ 1", () => {
+  const gens = (p) => expand(p).map((e) => e.type);
+  assert(!gens(EX["magic-academy"]).includes("terraces") && !gens(EX["magic-academy"]).includes("scatter_houses"), "学院没有台地 / 撒房子");
+  for (const n of NAMES) if (n !== "mountain-village") assert(!gens(EX[n]).includes("terraces"), n + " 不该用台地生成器");
+  assert(gens(EX["mountain-village"]).includes("terraces") && gens(EX["mountain-village"]).includes("scatter_houses"), "山城用台地 + 撒房子");
+  for (let i = 0; i < NAMES.length; i++) for (let j = i + 1; j < NAMES.length; j++) { const d = planDistance(EX[NAMES[i]], EX[NAMES[j]]); assert(d >= 1, `${NAMES[i]} vs ${NAMES[j]} 只差 ${d}`); }
+  assert(planDistance(EX["sky-garden"], EX["sky-garden"]) === 0 && distinctPlans([EX["magic-academy"], EX["sky-garden"], EX["pirate-harbor"]]), "自己与自己 0，三张够不同");
+});
+
+test("确定性：同 plan + seed 两次逐字节相同；换 seed 只有散布 / 布房变，形体不变", () => {
+  for (const n of ["magic-academy", "pirate-harbor"]) {
+    const a = compilePlan(EX[n], { seed: 5 }), b = compilePlan(EX[n], { seed: 5 }), c = compilePlan(EX[n], { seed: 6 });
+    assert(snapshot(a.sid) === snapshot(b.sid), n + " sid 相同");
+    assert(JSON.stringify(a.checks.map((k) => [k.id, k.ok, k.detail])) === JSON.stringify(b.checks.map((k) => [k.id, k.ok, k.detail])), n + " checks 相同");
+    assert(JSON.stringify(a.index) === JSON.stringify(b.index) && JSON.stringify(a.facts) === JSON.stringify(b.facts), n + " index / facts 相同");
+    const fixed = (r) => JSON.stringify(r.sid.volumes.filter((v) => v.land && !v.instance_of).map((v) => [v.id, v.position]));
+    assert(fixed(a) === fixed(c), n + " 非散布的形体不随 seed 变");
+    assert(snapshot(a.sid) !== snapshot(c.sid), n + " 散布随 seed 变");
   }
 });
 
-test("确定性：同 plan + seed 两次逐字节相同（含检查与事实）；换 seed 房子不同、地标位置不变", () => {
-  for (const n of ["ring-stilt", "valley-bridge", "mine-maze"]) {
-    const a = compilePlan(EX[n], { seed: 3 }), b = compilePlan(EX[n], { seed: 3 });
-    assert(snapshot(a.sid) === snapshot(b.sid), n + " sid 不同");
-    assert(JSON.stringify(a.checks.map((c) => [c.id, c.ok, c.detail])) === JSON.stringify(b.checks.map((c) => [c.id, c.ok, c.detail])), n + " checks 不同");
-    const c = compilePlan(EX[n], { seed: 4 });
-    assert(snapshot(a.sid) !== snapshot(c.sid), n + " 换 seed 应不同");
-  }
+test("索引：节点 / 组 / 重复 / 实例 id[k] / 地形操作 / spawn 都对得上 SID 对象；SID 的 plan_id 都指回 plan", () => {
+  const r = comp("magic-academy");
+  for (const id of ["academy", "hall", "towers", "towers[2]", "court", "library", "stacks", "rock", "light_bridge", "vault", "spawn"]) assert(r.index[id] && r.index[id].sid_ids.length, "索引缺 " + id);
+  assert(r.index.towers.sid_ids.length === 6 && r.index["towers[2]"].sid_ids.length === 1, "重复 6 个、实例 1 个");
+  assert(r.index.academy.sid_ids.includes("hall") && r.index.academy.sid_ids.includes("towers_3") && r.index.academy.group === "nodes", "组收子孙");
+  assert(r.index.library.sid_ids.includes("stacks"), "浮岛收岛上的楼");
+  assert(r.index.rock.group === "terrain" && r.index.rock.type === "raise", "地形操作的组与类型");
+  for (const v of r.sid.volumes) if (v.plan_id) assert(r.index[v.plan_id], `${v.id} 的 plan_id ${v.plan_id} 不在索引里`);
 });
 
-test("plan 里没有坐标：normalizePlan 丢掉 position / x / points 并提一句；非法枚举回退、数值夹到 schema 范围", () => {
-  const { plan, warnings } = normalizePlan(mini({ terrain: [{ id: "pad", type: "plateau", position: [3, 4, 5], at: { of: "site", dir: "C", x: 9 }, layer: 99, size_m: [1, 999] }], landmarks: [{ id: "t", form: "spaceship", place: { rel: "top_of", target: "pad" }, points: [[0, 0]] }] }));
-  const t = plan.terrain[0];
-  assert(!("position" in t) && !("x" in t.at) && !("points" in plan.landmarks[0]), "坐标字段应被丢掉");
-  assert(warnings.some((w) => w.includes("坐标")), "提一句坐标：" + warnings.join("|"));
-  assert(t.layer === 12 && t.size_m[0] === 4 && t.size_m[1] === 240, "夹到 schema 范围 " + JSON.stringify(t));
-  assert(plan.landmarks[0].form === "custom", "非法 form 回退 custom");
-  assert(plan.site.size_m === 140 && plan.spawn.place.side === "S", "默认值");
+// ============================================================ 形体与尺寸
+test("每种形体都出体块：shape 对、size 都是 [x, 高, z] 三个数；圆的类直径写两遍；建筑件的 kind / 屋顶 / 边数", () => {
+  const SH = ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"];
+  const nodes = SH.map((t, i) => ({ id: "s_" + t, type: t, at: "site.C", offset_m: [((i % 5) - 2) * 22, (Math.floor(i / 5) - 0.5) * 30], size_m: t === "dome" ? [10] : t === "torus" ? [10, 2] : [8, 6, 8] }));
+  const parts = [["tower", [6, 20]], ["column", [1, 6]], ["tree", [4, 8]], ["crystal", [2, 6]], ["statue", [2, 4, 2]], ["gate", [6, 7, 2]], ["platform", [10, 1, 10]], ["stairs", [4, 3, 8]]];
+  parts.forEach(([t, s], i) => nodes.push({ id: "p_" + t, type: t, at: "site.N", offset_m: [(i - 3.5) * 14, 0], size_m: s }));
+  nodes.push({ id: "p_building", type: "building", at: "site.S", offset_m: [-30, -10], size_m: [12, 8, 10], roof: "pyramid" }, { id: "p_prism_tower", type: "tower", shape: "prism", sides: 8, at: "site.S", offset_m: [20, -10], size_m: [8, 18] });
+  const r = compilePlan(mini(nodes), { seed: 1 });
+  assert(errs(r).length === 0, "validate " + errs(r).map((e) => e.msg));
+  for (const t of SH) { const v = vol(r, "s_" + t); assert(v && v.shape === t && v.size.length === 3, "形体 " + t); }
+  const cyl = vol(r, "s_cylinder"); assert(cyl.size[0] === 8 && cyl.size[2] === 8 && cyl.size[1] === 6, "圆柱 [8,6,8] " + cyl.size);
+  const dome = vol(r, "s_dome"); assert(dome.size[0] === 10 && dome.size[1] === 5, "穹顶只给直径：高 = 半径 " + dome.size);
+  assert(vol(r, "s_prism").sides === 6, "棱柱默认 6 边");
+  const K = { tower: "cylinder", column: "cylinder", tree: "cone", crystal: "prism", statue: "box", gate: "arch", platform: "box", stairs: "wedge" };
+  for (const [t, sh] of Object.entries(K)) { const v = vol(r, "p_" + t); assert(v && v.kind === t && v.shape === sh, `建筑件 ${t}：${v && v.kind}/${v && v.shape}`); }
+  const b = vol(r, "p_building"); assert(b.kind === "building" && b.roof === "spire" && b.roof_h > 0 && b.roof_h < b.size[1], "房子屋顶 pyramid → spire " + b.roof);
+  const pt = vol(r, "p_prism_tower"); assert(pt.shape === "prism" && pt.sides === 8 && pt.roof === "spire", "塔换成八棱柱");
 });
 
-test("每种地形原语：山 / 山脊 / 坡上台地 / 环台 / 平台 / 崖 / 谷 / 盆地 / 坑 / 高台 的高度形状对", () => {
-  const L = 3, at = { of: "site", dir: "C" };
-  const H = (terrain) => compilePlan(mini({ terrain, landmarks: [] }), { seed: 1 }).T;
-  let T = H([{ id: "h", type: "hill", at, size_m: [80, 80], top_layer: 5 }]);
-  close(T.heightAt(0, 0), 15, 0.3, "山顶 = 5 层"); assert(T.heightAt(30, 0) < T.heightAt(10, 0), "山往外降");
-  T = H([{ id: "r", type: "ridge", at, size_m: [120, 30], orient: "E", top_layer: 4 }]);
-  assert(T.heightAt(40, 0) > 4 && T.heightAt(0, 14) < T.heightAt(40, 0), "山脊沿东西长：" + T.heightAt(40, 0) + " / " + T.heightAt(0, 14));
-  T = H([{ id: "s", type: "slope_terraces", at, size_m: [80, 80], orient: "N", steps: 4, from_layer: 1 }]);
-  close(T.heightAt(0, 30), 3, 0.01, "南边第 1 级"); close(T.heightAt(0, -30), 12, 0.01, "北边第 4 级（上坡朝北）");
-  T = H([{ id: "p", type: "plateau", at, size_m: [30, 20], layer: 2 }]);
-  close(T.heightAt(0, 0), 6, 1e-6, "平台高 2 层"); close(T.heightAt(5, 5), 6, 1e-6, "平台是平的");
-  T = H([{ id: "c", type: "cliff", at, size_m: [40, 8], orient: "E", layer: 3 }]);
-  close(T.heightAt(0, 0), 9, 1e-6, "崖顶"); assert(T.heightAt(0, 6.5) < 1, "崖边 2.5 m 外就落到底：" + T.heightAt(0, 6.5));
-  T = H([{ id: "v", type: "valley", at, size_m: [140, 16], orient: "N", depth_layers: 2 }]);
-  close(T.heightAt(0, 0), -6, 1e-6, "谷底 −2 层"); close(T.heightAt(0, 40), -6, 1e-6, "谷沿南北长"); close(T.heightAt(40, 0), 0, 1e-6, "谷外是平地");
-  T = H([{ id: "b", type: "basin", at, size_m: [50, 40], depth_layers: 1 }]);
-  close(T.heightAt(0, 0), -3, 1e-6, "盆地");
-  T = H([{ id: "k", type: "pit", at, size_m: [10, 10], depth_layers: 2 }]);
-  close(T.heightAt(0, 0), -6, 1e-6, "坑"); close(T.heightAt(10, 0), 0, 1e-6, "坑很陡、小");
-  T = H([{ id: "i", type: "island", at, size_m: [20, 20], layer: 2 }]);
-  close(T.heightAt(0, 0), 6, 1e-6, "高台顶"); assert(T.heightAt(14, 0) < 0, "高台四周低：" + T.heightAt(14, 0));
+test("院与墙：院出 4 面墙（门那面断开）+ 门 + 院内铺地；沿折线的墙按段出；围着某个节点的墙绕它一圈", () => {
+  const r = compilePlan(mini([
+    { id: "hall", type: "building", at: "site.C", size_m: [16, 8, 12] },
+    { id: "yard", type: "courtyard", at: "hall.S", size_m: [20, 14], gate: "S" },
+    { id: "fence", type: "wall", at: "site.W", path_m: [[0, -20], [0, 0], [10, 10]], size_m: [1, 3, 0.6] },
+    { id: "ring_wall", type: "wall", at: "site.N", around: "hall" },
+  ]), { seed: 1 });
+  const yard = vols(r, "yard");
+  assert(yard.filter((v) => v.kind === "wall").length === 5 && yard.some((v) => v.kind === "gate" && v.shape === "arch"), "院：5 段墙（南面断开）+ 门 " + yard.map((v) => v.id));
+  assert(r.sid.regions.some((g) => g.plan_id === "yard" && g.kind === "plaza"), "院内铺地");
+  assert(vols(r, "fence").length === 2, "折线墙 2 段");
+  const rw = vols(r, "ring_wall"), hall = vol(r, "hall");
+  assert(rw.length >= 3 && rw.every((v) => !obbOverlap(foot(v), foot(hall))), "围墙绕一圈且不压楼 " + rw.length);
 });
 
-test("环台的层号：5 级从 1 层起，外低内高、每圈是一个台地、层号 1..5；inverse 反过来；区域 low / high 选对层", () => {
-  const plan = mini({ terrain: [{ id: "ring", type: "ring_terraces", label: "环台", at: { of: "site", dir: "C" }, size_m: [100, 100], steps: 5, from_layer: 1 }], zones: [{ id: "lo", use: "housing", on: "ring", levels: "low" }, { id: "hi", use: "housing", on: "ring", levels: "high" }], landmarks: [] });
-  const r = compilePlan(plan, { seed: 1 });
-  const fs = r.sid.terrain.features.filter((f) => f.plan_id === "ring");
-  assert(fs.length === 5 && fs.map((f) => f.level).join() === "1,2,3,4,5", "层号 " + fs.map((f) => f.level));
-  const T = r.T;
-  assert(T.terraceAt(0, 0).level === 5, "中心最高");
-  const outer = T.terraceAt(46, 0), mid = T.terraceAt(25, 0);
-  assert(outer && outer.level === 1 && mid && mid.level === 3, `外圈 1、中间 3：${outer && outer.level} / ${mid && mid.level}`);
-  close(T.heightAt(0, 0), 15, 1e-6, "中心高 5 层");
-  const lo = r.sid.regions.filter((g) => g.plan_id === "lo").map((g) => g.terrace_level), hi = r.sid.regions.filter((g) => g.plan_id === "hi").map((g) => g.terrace_level);
-  assert(lo.join() === "1,2" && hi.join() === "4,5", `low ${lo} / high ${hi}`);
-  const inv = compilePlan(Object.assign({}, plan, { terrain: [Object.assign({}, plan.terrain[0], { inverse: true })], zones: [] }), { seed: 1 });
-  assert(inv.T.terraceAt(0, 0).level === 1 && inv.T.terraceAt(46, 0).level === 5, "inverse：内低外高");
+// ============================================================ 重复
+test("重复 linear / grid：个数、间距、以锚点为中心排开", () => {
+  const r = compilePlan(mini([
+    { id: "row", type: "repeat", at: "site.C", offset_m: [0, -30], pattern: "linear", count: 5, spacing_m: 10, child: { type: "box", size_m: [4, 4, 4] } },
+    { id: "blk", type: "repeat", at: "site.C", offset_m: [0, 20], pattern: "grid", rows: 2, cols: 3, spacing_m: [8, 6], child: { type: "box", size_m: [3, 3, 3] } },
+  ]), { seed: 1 });
+  const xs = vols(r, "row").map((v) => v.position[0]).sort((a, b) => a - b);
+  assert(xs.length === 5 && xs.join() === "-20,-10,0,10,20", "一排 " + xs);
+  const g = vols(r, "blk");
+  assert(g.length === 6, "网格 6 个");
+  assert([...new Set(g.map((v) => v.position[0]))].sort((a, b) => a - b).join() === "-8,0,8" && [...new Set(g.map((v) => v.position[2]))].sort((a, b) => a - b).join() === "17,23", "网格坐标 " + g.map((v) => v.position));
 });
 
-test("place.rel 每一种：顶上 / 中央 / 边上 / 尽头 / 旁边 / 后面 / 之间 / 下面 / 上面 / 沿线 / 入口处 都落在该落的地方", () => {
-  const plan = mini({
-    terrain: [
-      { id: "pad", type: "plateau", label: "台", at: { of: "site", dir: "C" }, size_m: [40, 30], layer: 2 },
-      { id: "hill", type: "slope_terraces", label: "坡", at: { of: "site", dir: "N", dist: 0.6 }, size_m: [30, 50], orient: "N", steps: 3, from_layer: 1 },
-    ],
-    landmarks: [
-      { id: "a_top", form: "pavilion", size_m: [4, 4, 4], place: { rel: "top_of", target: "hill" } },
-      { id: "a_center", form: "well", size_m: [2, 1, 2], place: { rel: "center_of", target: "pad" } },
-      { id: "a_edge", form: "gate", size_m: [6, 5, 2], place: { rel: "edge_of", target: "pad", side: "E" } },
-      { id: "a_beside", form: "statue", size_m: [3, 5, 3], place: { rel: "beside", target: "a_center", side: "W", gap_m: 3 } },
-      { id: "a_behind", form: "tower", size_m: [5, 10, 5], place: { rel: "behind", target: "pad" } },
-      { id: "a_between", form: "pavilion", size_m: [4, 4, 4], place: { rel: "between", target: ["a_top", "a_center"] } },
-    ],
-  });
-  // 一个 plan 最多 6 个地标：后五种放在第二个 plan 里（同样的地形，路从入口到坡顶）
-  const planB = Object.assign({}, plan, { landmarks: [
-      { id: "a_under", form: "statue", size_m: [2, 3, 2], place: { rel: "under", target: "hill" } },
-      { id: "a_above", form: "statue", size_m: [2, 3, 2], place: { rel: "above", target: "pad" } },
-      { id: "a_entry", form: "gate", size_m: [6, 5, 2], place: { rel: "at_entry", target: "site" } },
-      { id: "a_end", form: "tree", size_m: [5, 9, 5], place: { rel: "end_of", target: "lane" } },
-      { id: "a_along", form: "house", size_m: [5, 4, 4], place: { rel: "along", target: "lane", gap_m: 2 } },
-    ], paths: [{ id: "lane", from: "spawn", to: "hill", style: "winding" }] });
-  const r = compilePlan(plan, { seed: 1 }), rb = compilePlan(planB, { seed: 1 }), sid = r.sid, T = r.T;
-  const P = (id) => xz((lmOf(sid, id) || lmOf(rb.sid, id)).position);
-  const pad = sid.terrain.features.find((f) => f.plan_id === "pad"), hillTop = sid.terrain.features.filter((f) => f.plan_id === "hill").sort((a, b) => b.level - a.level)[0];
-  const sp = xz(sid.markers.find((m) => m.kind === "player_spawn").position), lane = rb.sid.paths.find((p) => p.plan_id === "lane").points;
-  assert(T.terraceAt(...P("a_top")).id === hillTop.id, "顶上 = 坡的最高一级");
-  assert(dist(P("a_center"), polygonCentroid(pad.polygon)) < 4, "中央 " + P("a_center"));
-  assert(distToPolygon(P("a_edge"), pad.polygon) < 5 && pointInPolygon(P("a_edge"), pad.polygon) && P("a_edge")[0] > 12, "边上（东）" + P("a_edge"));
-  assert(P("a_beside")[0] < P("a_center")[0] - 3 && dist(P("a_beside"), P("a_center")) < 12, "旁边（西）" + P("a_beside"));
-  const u = [polygonCentroid(pad.polygon)[0] - sp[0], polygonCentroid(pad.polygon)[1] - sp[1]], v = [P("a_behind")[0] - polygonCentroid(pad.polygon)[0], P("a_behind")[1] - polygonCentroid(pad.polygon)[1]];
-  assert((u[0] * v[0] + u[1] * v[1]) / Math.hypot(...u) / Math.hypot(...v) > 0.5 && !pointInPolygon(P("a_behind"), pad.polygon), "后面（从入口看）" + P("a_behind"));
-  const A = P("a_top"), B = P("a_center"), X = P("a_between"), t = ((X[0] - A[0]) * (B[0] - A[0]) + (X[1] - A[1]) * (B[1] - A[1])) / ((B[0] - A[0]) ** 2 + (B[1] - A[1]) ** 2);
-  between(t, 0.15, 0.85, "之间 t");
-  assert(dist(P("a_under"), resolveTarget(sid, T, "hill").point) < 15 && dist(P("a_above"), polygonCentroid(pad.polygon)) < 10, "下面 / 上面 ≈ 目标的投影");
-  assert(dist(P("a_entry"), sp) < 30 && dist(P("a_entry"), sp) > 5, "入口处：离入口 5–30 m " + dist(P("a_entry"), sp));
-  assert(dist(P("a_end"), lane[lane.length - 1]) < 15 || dist(P("a_end"), lane[0]) < 15, "尽头：路的一端附近");
-  const dl = distToPolyline(P("a_along"), lane);
-  assert(dl > 2 && dl < 12, "沿线：在路边 " + dl);
-  const pc = r.checks.filter((c) => c.id.startsWith("place_")), pb = rb.checks.filter((c) => c.id.startsWith("place_"));
-  assert(pc.length === 7 && pb.length === 6, "每个地标 + 入口一条放置检查：" + pc.length + " / " + pb.length);
-  assert([...pc, ...pb].every((c) => c.ok), "放置都成立：" + [...pc, ...pb].filter((c) => !c.ok).map((c) => c.text + " " + c.detail).join("；"));
+test("重复 radial：等角分布在半径上，face center 时门朝圆心，start_deg 0 = 北", () => {
+  const r = compilePlan(mini([{ id: "ring", type: "repeat", at: "site.C", pattern: "radial", count: 6, radius_m: 30, face: "center", child: { type: "building", size_m: [6, 8, 6] } }]), { seed: 1 });
+  const vs = vols(r, "ring");
+  assert(vs.length === 6, "6 个");
+  for (const v of vs) { close(dist(xz(v.position), [0, 0]), 30, 0.05, v.id + " 半径"); const f = facing(v), u = [-v.position[0] / 30, -v.position[2] / 30]; assert(f[0] * u[0] + f[1] * u[1] > 0.99, v.id + " 朝圆心"); }
+  const first = vs.find((v) => v.instance === 0); close(first.position[0], 0, 0.01, "第 0 个在北"); close(first.position[2], -30, 0.01, "第 0 个在北");
 });
 
-test("吊脚楼在坡上：环台寨的吊脚木楼有柱脚（底面取上坡角、四角高差 > 0.5 m），不报「不在台地上」", () => {
-  const r = comp("ring-stilt");
-  const stilts = r.sid.volumes.filter((v) => v.form === "stilt_house" && v.generated);
-  assert(stilts.length >= 6, "吊脚楼数 " + stilts.length);
-  const hanging = stilts.filter((v) => v.stilt_m > 0.5);
-  assert(hanging.length >= 3 && r.facts.stilt_houses === hanging.length, `悬在坡上的 ${hanging.length} / facts ${r.facts.stilt_houses}`);
-  for (const v of hanging) {
-    const hs = boxCorners(v.position, v.size, v.rotation_y).map(([x, z]) => r.T.heightAt(x, z));
-    close(v.position[1], Math.max(...hs), 0.02, v.id + " 底面 = 上坡角");
-    assert(v.label === "吊脚木楼" && v.plan_id === "stilt" && v.zone_id === "z_ring", "带 plan 信息");
-  }
-  assert(chk(r, "houses_on_terraces").ok, "houses_on_terraces：" + chk(r, "houses_on_terraces").detail);
+test("重复 along：沿连接等距排，模板偏移 [8, 0] 在路右侧 8 m；face path 朝路", () => {
+  const r = compilePlan(mini([
+    { id: "road", type: "link", style: "road", from: "site.W", to: "site.E" },
+    { id: "lamps", type: "repeat", pattern: "along", along: "road", count: 6, face: "path", child: { type: "statue", size_m: [1, 3, 1], offset_m: [8, 0] } },
+  ]), { seed: 1 });
+  const line = r.sid.paths.find((p) => p.plan_id === "road").points, vs = vols(r, "lamps");
+  assert(vs.length === 6, "6 个");
+  for (const v of vs) { between(distToPolyline(xz(v.position), line), 7, 9, v.id + " 离路"); assert(v.position[2] > 0, v.id + " 在路右侧（向东走，右手是南）"); const f = facing(v); assert(f[1] < -0.9, v.id + " 朝路"); }
 });
 
-test("风雨桥跨溪：桥体横跨溪线（长轴与溪夹角 > 60°）、桥两头在岸上、主路从桥上过", () => {
-  const r = comp("valley-bridge"), sid = r.sid;
-  const br = lmOf(sid, "bridge"), stream = sid.paths.find((p) => p.plan_id === "stream");
-  assert(br && stream && br.form === "bridge", "有桥有溪");
-  const rect = boxCorners(br.position, br.size, br.rotation_y);
-  assert(distToPolyline(xz(br.position), stream.points) < 1, "桥中心在溪上");
-  const t = (br.rotation_y * Math.PI) / 180, axis = [Math.cos(t), -Math.sin(t)];
-  let best = { d: 1e9 }; for (let i = 0; i < stream.points.length - 1; i++) { const a = stream.points[i], b = stream.points[i + 1], m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], d = dist(m, xz(br.position)); if (d < best.d) best = { d, tan: [b[0] - a[0], b[1] - a[1]] }; }
-  const cos = Math.abs(axis[0] * best.tan[0] + axis[1] * best.tan[1]) / Math.hypot(...best.tan);
-  assert(cos < 0.5, "桥长轴与溪夹角 > 60°，cos=" + cos);
-  for (const e of br.span_ends) assert(distToPolyline(e, stream.points) > stream.width / 2 + 2, "桥头在岸上 " + e);
-  const main = sid.paths.find((p) => p.id === "main_trail").points;
-  for (const e of br.span_ends) assert(main.some((q) => dist(q, e) < 0.6), "主路经过桥头 " + e);
-  assert(r.facts.bridges.some((b) => dist(b.at, xz(br.position)) < 8), "facts.bridges 有这座桥");
-  close(r.sid.style.lighting.sun_elevation_deg, 12, 1e-9, "傍晚");
+test("重复 scatter：在 area 里撒 count 个、互相间隔 ≥ gap、避开已有形体；散在湖里只取水面下的点", () => {
+  const r = compilePlan(mini([
+    { id: "keep", type: "building", at: "site.C", size_m: [20, 8, 20] },
+    { id: "stones", type: "repeat", pattern: "scatter", count: 12, area: "site", gap_m: 8, child: { type: "rock", size_m: [3, 2, 3] } },
+  ]), { seed: 3 });
+  const vs = vols(r, "stones");
+  assert(vs.length === 12, "12 个 " + vs.length);
+  for (let i = 0; i < vs.length; i++) { assert(!obbOverlap(foot(vs[i]), foot(vol(r, "keep"))), "不压楼"); for (let j = i + 1; j < vs.length; j++) assert(dist(xz(vs[i].position), xz(vs[j].position)) >= 8 - 1e-6, "间隔"); }
+  const L = compilePlan({ name: "湖", site: { size_m: [160, 160], ground: "lake" }, terrain: [{ id: "isle", op: "raise", at: "site.C", size_m: [30, 30], height_m: 8, edge: "cliff" }], nodes: [{ id: "reefs", type: "repeat", pattern: "scatter", count: 8, area: "lake", child: { type: "rock", size_m: [4, 6, 4] } }] }, { seed: 2 });
+  const T = L.T;
+  for (const v of vols(L, "reefs")) assert(T.heightAt(v.position[0], v.position[2]) < -0.5, v.id + " 在水里 " + T.heightAt(v.position[0], v.position[2]));
 });
 
-test("溪谷两岸 + 风雨桥 between 两岸：两岸不叠、溪从两岸之间穿过、桥垂直于溪且两头搭在岸上、主路到得了桥", () => {
-  const p = { name: "溪口风雨桥", site: { size_m: 150, relief_layers: 5, layer_m: 3 },
-    terrain: [{ id: "valley", type: "valley", label: "主溪谷", at: { of: "site", dir: "C", dist: 0 }, size_m: [150, 80], depth_layers: 3 },
-      { id: "bluff_w", type: "plateau", label: "西岸台", at: { of: "valley", dir: "W", dist: 0.7 }, size_m: [40, 60], layer: 3 },
-      { id: "bluff_e", type: "plateau", label: "东岸台", at: { of: "valley", dir: "E", dist: 0.7 }, size_m: [40, 60], layer: 3 }],
-    water: [{ id: "creek", label: "溪水", type: "stream", from: { of: "site", dir: "N", dist: 0.8 }, to: { of: "site", dir: "S", dist: 0.8 }, width_m: 6 }],
-    landmarks: [{ id: "windrain", label: "风雨桥", form: "bridge", size_m: [36, 7, 6], place: { rel: "between", target: ["bluff_w", "bluff_e"] } }],
-    spawn: { place: { rel: "edge_of", target: "site", side: "W" }, look_at: "windrain" }, paths: [{ id: "main", from: "spawn", to: "windrain", style: "winding" }] };
-  const r = compilePlan(p, { seed: 1 }), sid = r.sid;
-  const W = sid.terrain.features.find((f) => f.plan_id === "bluff_w").polygon, E = sid.terrain.features.find((f) => f.plan_id === "bluff_e").polygon;
-  assert(!W.some((q) => pointInPolygon(q, E)) && !E.some((q) => pointInPolygon(q, W)), "两岸不叠");
-  const creek = sid.paths.find((x) => x.plan_id === "creek").points, cw = polygonCentroid(W), ce = polygonCentroid(E);
-  assert(distToPolyline([(cw[0] + ce[0]) / 2, (cw[1] + ce[1]) / 2], creek) < 4, "溪从两岸之间穿过");
-  assert(creek.every((q) => !pointInPolygon(q, W) && !pointInPolygon(q, E)), "溪不压岸台");
-  const br = lmOf(sid, "windrain");
-  for (const e of br.span_ends) assert([W, E].some((poly) => pointInPolygon(e, poly) || distToPolygon(e, poly) < 1.2), "桥头搭在岸上 " + e);
-  assert(pointInPolygon(br.span_ends[0], W) !== pointInPolygon(br.span_ends[1], W) || pointInPolygon(br.span_ends[0], E) !== pointInPolygon(br.span_ends[1], E), "两头各在一岸");
-  assert(r.facts.bridges.some((b) => b.landmark === br.id), "facts.bridges 有这座地标桥");
-  assert(chk(r, "trail_reaches_landmark").ok, chk(r, "trail_reaches_landmark").detail);
-  const s = summarize("landmarks", r.plan.landmarks[0], r.plan);
-  assert(/西岸台 和 东岸台/.test(s) && !/bluff_/.test(s), "摘要显示名字不显示 id：" + s);
+test("重复 mirror / stack：镜像得两个对称实例；叠层每层立在上一层顶上、按 taper 收分", () => {
+  const r = compilePlan(mini([
+    { id: "pair", type: "repeat", at: "site.C", offset_m: [0, 30], pattern: "mirror", axis: "x", child: { type: "prism", sides: 4, size_m: [2, 12], offset_m: [10, 0] } },
+    { id: "zig", type: "repeat", at: "site.C", offset_m: [0, -20], pattern: "stack", levels: 4, taper: 0.1, child: { type: "box", size_m: [20, 3, 20] } },
+  ]), { seed: 1 });
+  const p = vols(r, "pair").map((v) => v.position[0]).sort((a, b) => a - b);
+  assert(p.join() === "-10,10", "镜像 " + p);
+  const z = vols(r, "zig").sort((a, b) => a.instance - b.instance);
+  assert(z.length === 4, "4 层");
+  for (let k = 1; k < 4; k++) { close(z[k].position[1], z[k - 1].position[1] + z[k - 1].size[1], 0.01, `第 ${k} 层立在上一层上`); close(z[k].size[0], 20 * Math.pow(0.9, k), 0.02, `第 ${k} 层收分`); assert(z[k].rests_on === z[k - 1].id, "rests_on"); }
 });
 
-test("桥心楼阁 above 风雨桥：立在桥面上、xz 在桥中心，不报重叠 / 放置 / 关系失败；资料 y 跟着桥面走", () => {
-  const p = JSON.parse(JSON.stringify(EX["valley-bridge"]));
-  const br0 = p.landmarks.find((l) => l.form === "bridge");
-  p.landmarks.push({ id: "pav", label: "桥心楼阁", form: "pavilion", size_m: [6, 8, 6], place: { rel: "above", target: br0.id } });
-  p.relations = (p.relations || []).concat([{ type: "above", a: "pav", b: br0.id }]);
-  const r = compilePlan(p, { seed: 3 }), sid = r.sid, br = lmOf(sid, br0.id), pav = lmOf(sid, "pav");
-  assert(pav.rests_on === br.id, "rests_on 指向桥");
-  close(pav.position[1], br.position[1], 0.01, "y = 桥面");
-  assert(dist(xz(pav.position), xz(br.position)) < 0.5, "在桥中心");
-  assert(chk(r, "houses_no_overlap").ok, chk(r, "houses_no_overlap").detail);
-  assert(chk(r, "place_pav").ok, chk(r, "place_pav").detail);
-  const rel = r.checks.find((c) => c.id === `rel_${p.relations.length - 1}`);
-  assert(rel && rel.ok, rel && rel.detail);
-  assert(!r.facts.validation.some((m) => m.level !== "info" && m.id === pav.id && /贴地/.test(m.msg)), "不报未贴地");
-  const again = restore(snapshot(sid)); resolve(again, { seed: 3 });
-  const pav2 = again.volumes.find((v) => v.id === pav.id);
-  close(pav2.position[1], br.position[1], 0.01, "resolve 后仍在桥面");
-});
-
-test("崖：size_m 是 [长, 厚]，前小后大时对调、厚夹在 4–12 m；在别人某一侧且没给朝向时长边顺着那条边", () => {
-  const p = { name: "崖", site: { size_m: 160, relief_layers: 6, layer_m: 3 },
-    terrain: [{ id: "cw", type: "cliff", label: "西崖", at: { of: "site", dir: "W", dist: 0.55 }, size_m: [30, 150], layer: 6 }] };
-  const f = compilePlan(p, { seed: 1 }).sid.terrain.features.find((x) => x.plan_id === "cw").polygon;
-  const xs = f.map((q) => q[0]), zs = f.map((q) => q[1]), dx = Math.max(...xs) - Math.min(...xs), dz = Math.max(...zs) - Math.min(...zs);
-  assert(dz > 120 && dx <= 12.5, `南北长 ${dz.toFixed(0)}、东西厚 ${dx.toFixed(1)}`);
-});
-
-test("溪顺着谷走：没给源头 / 流向时沿第一条谷的轴线，溪线几乎都在谷里", () => {
-  const r = comp("valley-bridge"), valley = r.sid.terrain.features.find((f) => f.plan_id === "valley"), s = r.sid.paths.find((p) => p.kind === "river");
-  const inside = s.points.filter((q) => pointInPolygon(q, valley.polygon) || distToPolygon(q, valley.polygon) < 2).length;
-  assert(inside >= s.points.length - 2, `谷里 ${inside}/${s.points.length}`);
-});
-
-test("引用缺失降级：目标 / 建筑 / 关系 / 路的终点不存在时本地降级并提一句，照样能编译", () => {
-  const plan = mini({
-    zones: [{ id: "z", use: "housing", on: "nowhere", building: "ghost" }],
-    landmarks: [{ id: "t", form: "tower", place: { rel: "top_of", target: "moon" } }],
-    paths: [{ id: "p1", from: "spawn", to: "nothing" }, { id: "p2", from: "ghost", to: "t", via: ["ufo"] }],
-    relations: [{ type: "faces", a: "t", b: "mars" }, { type: "visible_from", a: "t", b: "spawn" }],
-  });
-  const { plan: n, warnings } = normalizePlan(plan);
-  assert(n.zones[0].on === "site" && !("building" in n.zones[0]), "区域 on → site、building 去掉");
-  assert(n.landmarks[0].place.target === "site", "地标目标 → site");
-  assert(n.paths.length === 1 && n.paths[0].from === "spawn" && n.paths[0].via.length === 0, "没终点的路去掉、起点 → 入口、经过点去掉");
-  assert(n.relations.length === 1, "坏关系去掉");
-  for (const w of ["moon", "ghost", "nothing", "mars", "ufo"]) assert(warnings.some((x) => x.includes(w)), "提一句 " + w);
-  const r = compilePlan(plan, { seed: 1 });
-  assert(r.facts.errors === 0 && r.warnings.length >= 5, "照样编译");
-});
-
-test("引用成环：地标互相 beside、地形 at 互指 → 断开并提一句，编译不卡死", () => {
-  const plan = mini({
-    terrain: [{ id: "a", type: "plateau", at: { of: "b", dir: "N", dist: 0.5 } }, { id: "b", type: "plateau", at: { of: "a", dir: "S", dist: 0.5 } }],
-    landmarks: [{ id: "x", form: "tower", place: { rel: "beside", target: "y" } }, { id: "y", form: "tower", place: { rel: "beside", target: "x" } }],
-  });
-  const { plan: n, warnings } = normalizePlan(plan);
-  assert(warnings.filter((w) => w.includes("成环") || w.includes("互相引用")).length >= 2, warnings.join("|"));
-  assert(n.terrain.some((t) => t.at.of === "site") && n.landmarks.some((l) => l.place.target === "site"), "断开处改指 site");
-  const r = compilePlan(plan, { seed: 1 });
-  assert(r.sid.volumes.filter((v) => v.importance === "landmark").length === 2, "两个地标都在");
-});
-
-test("applyOps：set（嵌套字段）/ add / remove（引用降级）/ 非法字段跳过；不改入参", () => {
-  const base = EX["ring-stilt"], before = JSON.stringify(base);
-  const { plan, warnings } = applyOps(base, [
-    { op: "set", id: "ring", field: "steps", value: 4 },
-    { op: "set", id: "gate", field: "place.rel", value: "center_of" },
-    { op: "set", id: "lighting", field: "time_of_day", value: "night" },
-    { op: "add", group: "landmarks", value: { id: "stage", label: "戏台", form: "stage", size_m: [10, 6, 8], place: { rel: "edge_of", target: "plaza", side: "N" } } },
-    { op: "remove", id: "cliff_w" },
-    { op: "set", id: "ring", field: "position", value: [1, 2] },
-    { op: "set", id: "nope", field: "steps", value: 2 },
+test("skip / overrides：删掉的实例不出，改过的实例尺寸不同；嵌套重复（模板本身是重复）也展开", () => {
+  const plan = mini([
+    { id: "row", type: "repeat", at: "site.C", pattern: "linear", count: 4, spacing_m: 12, skip: [1], overrides: { "2": { size_m: [6, 20, 6] } }, child: { type: "building", size_m: [6, 6, 6] } },
+    { id: "posts", type: "repeat", at: "site.N", pattern: "linear", count: 3, spacing_m: 10, child: { id: "post", type: "repeat", pattern: "stack", levels: 3, child: { type: "box", size_m: [2, 2, 2] } } },
   ]);
-  assert(JSON.stringify(base) === before, "不改入参");
-  assert(plan.terrain.find((t) => t.id === "ring").steps === 4 && plan.landmarks.find((l) => l.id === "gate").place.rel === "center_of", "set 生效");
-  assert(plan.lighting.time_of_day === "night" && plan.landmarks.some((l) => l.id === "stage" && l.label === "戏台"), "set lighting / add");
-  assert(!plan.terrain.some((t) => t.id === "cliff_w") && plan.landmarks.find((l) => l.id === "gate").place.target === "site", "remove 后引用它的降级到 site");
-  assert(warnings.some((w) => w.includes("position")) && warnings.some((w) => w.includes("nope")) && warnings.some((w) => w.includes("cliff_w")), warnings.join("|"));
   const r = compilePlan(plan, { seed: 1 });
-  assert(r.sid.terrain.features.filter((f) => f.plan_id === "ring").length === 4 && lmOf(r.sid, "stage"), "改完能编译");
-  const t2 = applyOps(plan, [{ op: "set", id: "ring", field: "type", value: "slope_terraces" }]).plan.terrain.find((t) => t.id === "ring");
-  assert(t2.type === "slope_terraces" && t2.size_m, "换种类补默认值");
-  const t3 = applyOps(plan, [{ op: "remove", id: "rel:0" }]).plan;
-  assert(t3.relations.length === plan.relations.length - 1, "remove rel:0");
+  const rv = vols(r, "row");
+  assert(rv.length === 3 && !rv.some((v) => v.instance === 1), "skip 1");
+  assert(rv.find((v) => v.instance === 2).size[1] === 20 && rv.find((v) => v.instance === 0).size[1] === 6, "override 2 的高度");
+  assert(vols(r, "posts").length === 9, "3 × 3 嵌套 " + vols(r, "posts").length);
+  const ex = expand(plan);
+  assert(ex.filter((e) => e.instance_of === "row").length === 3 && ex.some((e) => e.id === "row[2]") && !ex.some((e) => e.id === "row[1]"), "expand 扣掉 skip");
 });
 
-test("nudge_m：人挪过的地标按 [dx, dz] 平移（相对 AI 位置），检查里说一句，修法「回到原位」把它清掉", () => {
-  const base = EX["ring-stilt"], r0 = comp("ring-stilt");
-  const p = applyOps(base, [{ op: "set", id: "drum", field: "place.nudge_m", value: [3, -2] }]).plan;
-  const r1 = compilePlan(p, { seed: 1 });
-  const a = xz(lmOf(r0.sid, "drum").position), b = xz(lmOf(r1.sid, "drum").position);
-  close(b[0] - a[0], 3, 0.02, "dx"); close(b[1] - a[1], -2, 0.02, "dz");
-  assert(lmOf(r1.sid, "drum").user_moved === true, "user_moved");
-  const c = chk(r1, "place_drum");
-  assert(c.detail.includes("人挪过"), c.detail);
-  const fix = c.fixes.find((f) => f.ops);
-  const r2 = compilePlan(applyOps(p, fix.ops).plan, { seed: 1 });
-  assert(JSON.stringify(xz(lmOf(r2.sid, "drum").position)) === JSON.stringify(a), "回到原位");
+// ============================================================ 锚点
+test("锚点：site.N 在北边（往里收）；X.top 立在 X 顶上（rests_on）；X.S 贴在 X 南外侧不重叠；id[k] 指第 k 个实例", () => {
+  const r = compilePlan(mini([
+    { id: "hall", type: "building", at: "site.C", size_m: [20, 10, 14] },
+    { id: "spire", type: "cone", at: "hall.top", size_m: [4, 8] },
+    { id: "porch", type: "box", at: "hall.S", size_m: [8, 3, 6] },
+    { id: "north", type: "box", at: "site.N", size_m: [4, 4, 4] },
+    { id: "ring", type: "repeat", at: "site.C", offset_m: [0, 40], pattern: "radial", count: 4, radius_m: 12, child: { type: "column", size_m: [2, 6] } },
+    { id: "cap", type: "sphere", at: "ring[2].top", size_m: [2] },
+  ]), { seed: 1 });
+  const hall = vol(r, "hall"), spire = vol(r, "spire"), porch = vol(r, "porch"), north = vol(r, "north");
+  close(north.position[0], 0, 0.01, "北 x"); between(north.position[2], -60, -50, "北 z");
+  close(spire.position[1], hall.position[1] + hall.size[1], 0.01, "尖顶在殿顶"); assert(spire.rests_on === "hall", "rests_on hall");
+  assert(porch.position[2] > hall.position[2] + 7 && !obbOverlap(foot(porch), foot(hall)), "门廊在南外侧不重叠 " + porch.position);
+  const c2 = vols(r, "ring").find((v) => v.instance === 2), cap = vol(r, "cap");
+  close(cap.position[0], c2.position[0], 0.01, "立在第 2 根柱子上"); close(cap.position[2], c2.position[2], 0.01, "z"); close(cap.position[1], c2.position[1] + c2.size[1], 0.01, "柱顶");
 });
 
-test("atFromPoint：地形块拖到新位置 → 反算 at（8 方位 + 比例），写回 plan 再编译，中心就在拖到的地方附近", () => {
-  const r = comp("ring-stilt"), plan = r.plan;
-  const at = atFromPoint(r.sid, r.T, plan, "plaza", [-30, 20]);
-  assert(at.of === "hill" && at.dir === "SW" && at.dist > 0 && at.dist <= 1.5, JSON.stringify(at));
-  const r2 = compilePlan(applyOps(plan, [{ op: "set", id: "plaza", field: "at", value: at }]).plan, { seed: 1 });
-  const c = resolveTarget(r2.sid, r2.T, "plaza").point;
-  const hc = resolveTarget(r.sid, r.T, "hill").point;
-  assert(dist(c, [-30, 20]) < 0.45 * dist(hc, [-30, 20]), "新中心（方向吸附到 8 方位）" + c);
-  assert(atFromPoint(r.sid, r.T, plan, "hill", [9, 1]).dir === "E" || atFromPoint(r.sid, r.T, plan, "hill", [1, 1]).dir === "C", "离中心很近算「中」");
+test("锚点出错：不存在 → 提示并放到场地中心；互相锚成环 → 断开、提示、照样编译；全局坐标字段被丢掉", () => {
+  const r = compilePlan(mini([
+    { id: "a", type: "box", at: "b", size_m: [4, 4, 4] },
+    { id: "b", type: "box", at: "a", size_m: [4, 4, 4] },
+    { id: "lost", type: "box", at: "nope.top", size_m: [3, 3, 3] },
+    { id: "cheat", type: "box", at: "site.C", position: [30, 0, 30], x: 30, size_m: [3, 3, 3] },
+  ]), { seed: 1 });
+  assert(r.warnings.some((w) => w.includes("成环")), "成环提示：" + r.warnings);
+  assert(r.warnings.some((w) => w.includes("nope")) && vol(r, "lost"), "不存在的锚点：" + r.warnings);
+  assert(r.warnings.some((w) => w.includes("坐标")) && !("position" in findNode(r.plan, "cheat").node), "坐标被丢：" + r.warnings);
+  assert(errs(r).length === 0 && vol(r, "a") && vol(r, "b"), "照样编译");
 });
 
-test("关系检查：每条 plan.relations 一条 rel_<i>；不成立的给 ops 修法，应用后成立", () => {
-  for (const n of NAMES) { const r = comp(n); for (let i = 0; i < r.plan.relations.length; i++) assert(chk(r, "rel_" + i), `${n} 缺 rel_${i}`); }
-  const plan = mini({
-    landmarks: [{ id: "g", form: "gate", size_m: [6, 5, 2], place: { rel: "center_of", target: "pad", facing: "N" } }, { id: "t", form: "tower", size_m: [5, 10, 5], place: { rel: "edge_of", target: "site", side: "N" } }],
-    relations: [{ type: "faces", a: "g", b: "spawn" }, { type: "adjacent", a: "t", b: "g" }],
-  });
-  const r = compilePlan(plan, { seed: 1 });
-  const f = chk(r, "rel_0"), a = chk(r, "rel_1");
-  assert(!f.ok && !a.ok, "两条都不成立：" + f.detail + " / " + a.detail);
-  const ops = [...f.fixes.find((x) => x.ops).ops, ...a.fixes.find((x) => x.ops).ops];
-  const r2 = compilePlan(applyOps(plan, ops).plan, { seed: 1 });
-  assert(chk(r2, "rel_0").ok && chk(r2, "rel_1").ok, "修完成立：" + chk(r2, "rel_0").detail + " / " + chk(r2, "rel_1").detail);
-  const ig = compilePlan(plan, { seed: 1, ignored: ["rel_0"] });
-  assert(chk(ig, "rel_0").ignored === true, "标不重要");
+test("地形操作只能锚到场地与前面的地形操作：锚到节点 / 后面的操作 → 改到场地中心并提示", () => {
+  const { plan, warnings } = normalizePlan({ name: "t", site: { size_m: 140 }, terrain: [{ id: "a", op: "raise", at: "b" }, { id: "b", op: "lower", at: "keep" }], nodes: [{ id: "keep", type: "box", at: "site.C" }] });
+  assert(plan.terrain[0].at === "site.C" && plan.terrain[1].at === "site.C", "改到中心 " + plan.terrain.map((t) => t.at));
+  assert(warnings.filter((w) => w.includes("前面的地形操作")).length === 2, "两条提示 " + warnings);
+  assert(Array.isArray(plan.site.size_m) && plan.site.size_m[0] === 140, "场地尺寸写一个数也行");
 });
 
-test("建筑形制：院落一组四栋围合、土楼是圆柱、塔楼 / 殿堂按尺寸；体块带 form / roof / floors / label", () => {
-  const r = comp("ridge-town");
-  const wings = r.sid.volumes.filter((v) => v.form === "courtyard");
-  assert(wings.length >= 4 && wings.length % 4 === 0, "院落按组 " + wings.length);
-  const groups = new Set(wings.map((v) => v.courtyard));
-  for (const g of groups) { const w = wings.filter((v) => v.courtyard === g); assert(w.length === 4 && new Set(w.map((v) => v.wing)).size === 4, "一组四个方向"); }
-  const round = r.sid.volumes.filter((v) => v.form === "round_house");
-  assert(round.length >= 1 && round.every((v) => v.shape === "cylinder" && v.label === "土楼" && v.floors === 3), "土楼 " + round.length);
-  const pav = lmOf(r.sid, "pavilion");
-  assert(pav.roof === "pyramid" && pav.form === "pavilion", "地标带形制");
-  assert(r.facts.forms.courtyard === wings.length, "facts.forms");
+// ============================================================ 落地 / 避让
+test("落地：贴地取覆盖范围最高点、跨崖时补基座并记进事实；悬空用 elev_m；岩 / 堆默认嵌进地里", () => {
+  const r = compilePlan(mini([
+    { id: "big", type: "building", at: "site.C", offset_m: [20, 0], size_m: [20, 6, 16] },
+    { id: "isle", type: "island", at: "site.W", size_m: [16, 6, 16], elev_m: 20 },
+    { id: "boulder", type: "rock", at: "site.C", offset_m: [-30, 0], size_m: [8, 5, 8] },
+  ], { terrain: [{ id: "mesa", op: "cliff", at: "site.C", shape: "rect", size_m: [40, 40], height_m: 6 }] }), { seed: 1 });
+  const big = vol(r, "big"), T = r.T;
+  close(big.position[1], 6, 0.3, "取最高点（崖顶 6 m）");
+  const base = vol(r, "big_base");
+  assert(base && base.plinth_of === "big" && base.size[1] > 4 && r.facts.plan.plinths.some((p) => p.id === "big"), "补基座 " + JSON.stringify(r.facts.plan.plinths));
+  close(base.position[1] + base.size[1], big.position[1], 0.01, "基座顶 = 楼底");
+  const isle = vol(r, "isle");
+  close(isle.position[1], T.heightAt(isle.position[0], isle.position[2]) + 20, 0.05, "悬空 20 m"); assert(isle.elev >= 19.9 && isle.inverted, "elev / 倒锥");
+  const b = vol(r, "boulder"); assert(b.land.mode === "carve" && b.position[1] <= T.heightAt(b.position[0], b.position[2]) + 0.01, "岩嵌进地里");
 });
 
-test("空间：每个 plan 空间都编译出 SID 空间（带 plan_id）和连接点；矿洞迷宫有通道、两层；地宫有 5 个房间", () => {
-  const m = comp("mine-maze"), sp = m.sid.spaces.find((s) => s.plan_id === "mine");
-  assert(sp && sp.stratum === "underground" && sp.layout === "maze", "矿洞");
-  assert(m.sid.markers.some((k) => k.kind === "connector" && k.to === sp.id), "有连接点");
-  const head = lmOf(m.sid, "headframe"), conn = m.sid.markers.find((k) => k.kind === "connector" && k.to === sp.id);
-  const spc = polygonCentroid(sp.polygon);
-  assert(dist(xz(conn.position), xz(head.position)) < dist(spc, xz(head.position)), "连接点在靠井架那一侧 " + dist(xz(conn.position), xz(head.position)));
-  assert(sp.sublevels === 2 && Array.isArray(sp.passages) && sp.passages.length > 5 && sp.passages.some((q) => q.sublevel === 1), "迷宫两层有通道");
-  const c = comp("temple-crypt").sid.spaces.find((s) => s.plan_id === "crypt");
-  for (const lab of ["前厅", "甬道", "主墓室", "左耳室", "右耳室"]) assert(c.rooms.some((q) => q.label === lab), "地宫房间 " + lab);
-  const w = comp("ridge-town").sid.spaces.find((s) => s.plan_id === "walkway");
-  assert(w && w.stratum === "sky", "空中栈道");
+test("避让：后来者让（推开并记事实），推不开（> 半个尺寸）就报告「形体不重叠」并给修法 ops；出场地的夹回来", () => {
+  const r = compilePlan(mini([
+    { id: "a", type: "building", at: "site.C", size_m: [12, 6, 12] },
+    { id: "b", type: "building", at: "site.C", offset_m: [8, 0], size_m: [12, 6, 12] },
+    { id: "edge", type: "building", at: "site.E", size_m: [30, 6, 30] },
+  ]), { seed: 1 });
+  assert(!obbOverlap(foot(vol(r, "a")), foot(vol(r, "b"))), "推开了");
+  assert(r.facts.plan.pushed.some((p) => p.id === "b") && !r.facts.plan.pushed.some((p) => p.id === "a"), "后来者让 " + JSON.stringify(r.facts.plan.pushed));
+  assert(chk(r, "shapes_no_overlap").ok, "推开后不重叠");
+  assert(r.facts.plan.clamped.some((c) => c.id === "edge") && foot(vol(r, "edge")).every(([x]) => x <= 70), "夹回场地");
+  const s = compilePlan(mini([{ id: "big", type: "building", at: "site.C", size_m: [40, 10, 40] }, { id: "small", type: "box", at: "site.C", size_m: [6, 6, 6] }]), { seed: 1 });
+  const c = chk(s, "shapes_no_overlap");
+  assert(!c.ok && c.detail.includes("重叠") && c.fixes.some((f) => f.ops && f.ops[0].field === "offset_m"), "推不开就报告：" + c.detail);
+  const fixed = compilePlan(applyOps(s.plan, c.fixes.find((f) => f.ops).ops).plan, { seed: 1 });
+  assert(chk(fixed, "shapes_no_overlap").ok, "按修法改了以后不重叠：" + chk(fixed, "shapes_no_overlap").detail);
 });
 
-test("空间接 interior.js：内部检查进 checks、facts.spaces 是汇总对象、index 带空间与连接点；layout_seed（换一个）/ height_m 走 applyOps", () => {
-  const m = comp("mine-maze"), sp = m.sid.spaces.find((s) => s.plan_id === "mine");
-  for (const id of ["spaces_connected", "interior_connected", "spaces_clear_of_terrain"]) assert(chk(m, id) && chk(m, id).ok, id + " " + (chk(m, id) || {}).detail);
-  const f = m.facts.spaces;
-  assert(!Array.isArray(f) && f.total === 1 && f.underground === 1 && f.passage_m > 50 && f.items[0].plan_id === "mine" && f.items[0].dead_ends >= 1 && f.items[0].longest_route_m > 0, "facts.spaces " + JSON.stringify(f).slice(0, 200));
-  assert(m.index.mine.group === "spaces" && m.index.mine.sid_ids.includes(sp.id) && m.index.mine.sid_ids.includes("conn_" + sp.id), "index " + JSON.stringify(m.index.mine));
-  const sig = (s) => JSON.stringify(s.passages.map((q) => q.points));
-  const again = applyOps(m.plan, [{ op: "set", id: "mine", field: "layout_seed", value: 12345 }]);
-  assert(!again.warnings.length && again.plan.spaces[0].layout_seed === 12345, "layout_seed 能 set " + again.warnings);
-  const a = compilePlan(again.plan, { seed: 1 }).sid.spaces[0], b = compilePlan(again.plan, { seed: 1 }).sid.spaces[0];
-  assert(sig(a) === sig(b) && sig(a) !== sig(sp), "换一个：内部变了、同种子不变");
-  const tall = compilePlan(applyOps(m.plan, [{ op: "set", id: "mine", field: "height_m", value: 5 }]).plan, { seed: 1 }).sid.spaces[0];
-  assert(tall.height === 5 && tall.floor_y < sp.floor_y, "净高 5 m、底面跟着下沉 " + tall.height + " " + tall.floor_y);
-  const crypt = comp("temple-crypt").plan.spaces.find((s) => s.id === "crypt");
-  assert(!knobsFor("spaces", crypt).some((k) => k.path === "sublevels") && knobsFor("spaces", m.plan.spaces[0]).some((k) => k.path === "sublevels"), "房间图不出内部层数旋钮");
-  assert(!knobsFor("spaces", m.plan.spaces[0]).some((k) => k.path === "layout_seed"), "layout_seed 不出旋钮");
+// ============================================================ 连接
+test("连接 path / road / stairs：A* 路由，起点在出生点；碰到出生点的第一条 = main_trail；路宽按样式", () => {
+  const r = compilePlan(mini([{ id: "keep", type: "tower", role: "landmark", at: "site.N", size_m: [8, 16] }, { id: "way", type: "link", style: "road", from: "spawn", to: "keep" }], { spawn: { at: "site.S", look_at: "keep" } }), { seed: 1 });
+  const p = r.sid.paths.find((q) => q.plan_id === "way");
+  assert(p && p.id === "main_trail" && p.kind === "road" && p.style === "road" && p.width === 5, "主路 " + JSON.stringify(p && [p.id, p.kind, p.width]));
+  const sp = r.sid.markers.find((m) => m.id === "spawn");
+  assert(dist(p.points[0], xz(sp.position)) < 1 && p.points.length >= 2, "从出生点出发");
+  assert(chk(r, "trail_reaches_landmark").ok && chk(r, "reach_keep").ok, "走得到塔");
+  const auto = compilePlan(mini([{ id: "keep", type: "tower", at: "site.N", size_m: [8, 16] }], { spawn: { at: "site.S", look_at: "keep" } }), { seed: 1 });
+  assert(auto.sid.paths.some((q) => q.id === "main_trail" && q.auto) && auto.facts.plan.auto_trail, "没有连接碰出生点：自动补主路");
 });
 
-test("区域：use → SID kind；side 只取一侧；没有台地的地形用外轮廓；forest 出树", () => {
-  const r = comp("temple-crypt");
-  const pines = r.sid.regions.filter((g) => g.plan_id === "z_pines");
-  assert(pines.length === 1 && pines[0].kind === "forest", "松林");
-  const ridge = r.sid.terrain.features.find((f) => f.plan_id === "ridge");
-  assert(pines[0].polygon.every((q) => q[1] <= ridge.center[2] + 0.5), "side N：只取北半");
-  assert(r.facts.trees > 5, "出树 " + r.facts.trees);
-  const monks = r.sid.regions.filter((g) => g.plan_id === "z_monks");
-  assert(monks.length >= 1 && monks.every((g) => g.use === "temple" && g.building && g.building.label === "僧房"), "僧房区域带建筑");
+test("连接 bridge / rope_bridge：直线跨越，两端高度 ends_y、deck_y，高处的桥有桥墩；悬空两岛之间可达", () => {
+  const r = compilePlan(mini([
+    { id: "west", type: "island", at: "site.W", size_m: [16, 6, 16], elev_m: 18 },
+    { id: "east", type: "island", at: "site.E", size_m: [16, 6, 16], elev_m: 18 },
+    { id: "span", type: "link", style: "bridge", from: "west", to: "east" },
+    { id: "rope", type: "link", style: "rope_bridge", from: "west", to: "site.N" },
+  ], { spawn: { at: "west" } }), { seed: 1 });
+  const b = r.sid.paths.find((q) => q.plan_id === "span"), w = vol(r, "west");
+  assert(b.kind === "bridge" && b.points.length === 2, "直线");
+  close(b.ends_y[0], w.position[1] + w.size[1], 0.01, "桥头在岛顶"); assert(b.elevated[0] && b.elevated[1] && b.deck_y >= b.ends_y[0], "两头都在高处");
+  assert(Array.isArray(b.piers) && b.piers.length >= 2, "桥墩 " + JSON.stringify(b.piers));
+  const rp = r.sid.paths.find((q) => q.plan_id === "rope"); assert(rp.width < 2 && !rp.piers, "索桥窄、没桥墩");
+  const sp = r.sid.markers.find((m) => m.id === "spawn"); close(sp.position[1], w.position[1] + w.size[1], 0.01, "出生点站在岛上");
+  const R = compilePlan(applyOps(r.plan, [{ op: "add", to: "relations", value: { type: "reachable", a: "east", b: "spawn" } }]).plan, { seed: 1 });
+  assert(chk(R, "rel_0").ok, "经桥到东岛：" + chk(R, "rel_0").detail);
+  const N = compilePlan(applyOps(R.plan, [{ op: "remove", id: "span" }]).plan, { seed: 1 });
+  assert(!chk(N, "rel_0").ok && chk(N, "rel_0").fixes.some((f) => f.ops), "拆了桥就到不了，修法补连接：" + chk(N, "rel_0").detail);
 });
 
-test("resolve 在编译结果上再跑一遍：plan 的路保留、房子一样（幂等）", () => {
-  const r = compilePlan(EX["mountain-town"], { seed: 2 });
-  const before = snapshot(r.sid);
-  const again = resolve(restore(before), { seed: 2 });
-  assert(snapshot(again.sid) === before, "resolve 幂等");
-  assert(again.sid.paths.find((p) => p.id === "main_trail").plan_id === "main", "主路还是 plan 的");
+test("连接 tunnel / canal / portal：隧道直线带 tunnel；水渠是 river 并在地形上开沟；传送门只出两端标记", () => {
+  const r = compilePlan(mini([
+    { id: "t1", type: "link", style: "tunnel", from: "site.W", to: "site.E" },
+    { id: "ditch", type: "link", style: "canal", from: "site.N", to: "site.C" },
+    { id: "gate_a", type: "arch", at: "site.SW", size_m: [6, 6, 1] },
+    { id: "gate_b", type: "arch", at: "site.NE", size_m: [6, 6, 1] },
+    { id: "warp", type: "link", style: "portal", from: "gate_a", to: "gate_b" },
+  ], { terrain: [{ id: "hill", op: "raise", at: "site.C", size_m: [60, 60], height_m: 15, edge: "round" }] }), { seed: 1 });
+  const t = r.sid.paths.find((q) => q.plan_id === "t1"); assert(t.tunnel && t.points.length === 2 && t.style === "tunnel", "隧道");
+  const c = r.sid.paths.find((q) => q.plan_id === "ditch"); assert(c.kind === "river" && c.style === "canal", "水渠");
+  assert(r.sid.terrain.features.some((f) => f.plan_id === "ditch" && f.op === "carve"), "开沟特征");
+  const pm = r.sid.markers.filter((m) => m.kind === "portal"); assert(pm.length === 2 && pm.every((m) => m.plan_id === "warp" && m.pair), "两端标记");
+  assert(errs(r).length === 0, "validate");
 });
 
-test("knobsFor：环台出 级数 / 起始层 / 每级宽 / 内低外高 + 位置（at.of / at.dir / at.dist），不出山顶高；引用下拉列出 plan 里的元素；summarize 一行", () => {
-  const p = EX["ring-stilt"], ring = p.terrain.find((t) => t.id === "ring");
-  const ks = knobsFor("terrain", ring, PLAN_SCHEMA, p), paths = ks.map((k) => k.path);
-  for (const want of ["label", "type", "steps", "from_layer", "width_m", "inverse", "at.of", "at.dir", "at.dist"]) assert(paths.includes(want), "缺 " + want + "：" + paths);
-  assert(!paths.includes("top_layer") && !paths.includes("depth_layers") && !paths.includes("id"), "不该出 " + paths);
-  const steps = ks.find((k) => k.path === "steps");
-  assert(steps.kind === "number" && steps.min === 2 && steps.max === 10 && steps.step === 1 && steps.unit === "级" && steps.value === 5, JSON.stringify(steps));
-  const of = ks.find((k) => k.path === "at.of");
-  assert(of.kind === "ref" && of.options.some((o) => o.value === "hill" && o.label === "主山") && of.options.some((o) => o.value === "site"), "引用下拉");
-  const typ = ks.find((k) => k.path === "type");
-  assert(typ.options.length === 10 && typ.options.find((o) => o.value === "ring_terraces").label === "环台", "枚举中文");
-  const lk = knobsFor("landmarks", p.landmarks[0], PLAN_SCHEMA, p).map((k) => k.path);
-  for (const want of ["form", "size_m", "place.rel", "place.target", "place.facing", "place.side"]) assert(lk.includes(want), "地标缺 " + want);
-  assert(!lk.includes("place.nudge_m"), "nudge 不出旋钮");
-  const sk = knobsFor("spaces", EX["mine-maze"].spaces[0], PLAN_SCHEMA, EX["mine-maze"]).map((k) => k.path);
-  assert(sk.includes("branching") && sk.includes("sublevels") && !sk.includes("rooms") && !sk.includes("over"), "空间旋钮按 layout / stratum 过滤 " + sk);
-  assert(summarize("terrain", ring, p) === "环台 · 5 级 · 从 1 层起", summarize("terrain", ring, p));
-  assert(knobsFor("look", p).some((k) => k.path === "lighting.time_of_day"), "外观组有时段");
+// ============================================================ 雕刻
+test("雕刻 raise / lower / flatten / cliff：抬到 / 压到锚点处原高度 ± h，削平到锚点高度；平顶登记成台地", () => {
+  const r = compilePlan(mini([], { site: { size_m: [200, 200], ground: "flat" }, terrain: [
+    { id: "up", op: "raise", at: "site.W", size_m: [40, 40], height_m: 12, edge: "cliff" },
+    { id: "pit", op: "lower", at: "site.E", size_m: [30, 30], depth_m: 5 },
+    { id: "wall", op: "cliff", at: "site.N", size_m: [60, 16], height_m: 9 },
+    { id: "pad", op: "flatten", at: "up.top", size_m: [20, 20] },
+  ] }), { seed: 1 });
+  const T = r.T, w = [-80, 0];
+  close(T.heightAt(w[0], w[1]), 12, 0.05, "抬起 12"); close(T.heightAt(w[0] + 30, w[1]), 0, 0.05, "崖外平地");
+  close(T.heightAt(80, 0), -5, 0.05, "压低 5"); close(T.heightAt(0, -80), 9, 0.05, "立崖 9");
+  assert(T.terraces.some((t) => t.plan_id === "up" && Math.abs(t.height - 12) < 0.01), "平顶登记成台地");
+  assert(T.terraces.some((t) => t.plan_id === "pad"), "削平的面也登记");
+  assert(r.index.up && r.index.up.sid_ids.includes("up"), "索引");
 });
 
-test("newElement：每组「＋ 加一个」都能生成合法项，加进去照样编译", () => {
-  let plan = EX["valley-bridge"];
+test("雕刻 terrace / raise 的 terraced 边：台阶化后高度是级高的整数倍，各级登记成台地", () => {
+  const r = compilePlan({ name: "梯", site: { size_m: [180, 180], ground: "mountain", relief_m: 24 }, terrain: [{ id: "steps", op: "terrace", at: "site.C", size_m: [120, 120], step_h_m: 4 }], nodes: [] }, { seed: 1 });
+  const T = r.T;
+  const G = T.grid; let n = 0, ok = 0;
+  for (let j = 0; j < G.nz; j++) for (let i = 0; i < G.nx; i++) { const x = G.xmin + i * G.res, z = G.zmin + j * G.res; if (Math.hypot(x, z) > 55) continue; const h = G.h[j * G.nx + i]; n++; if (Math.abs(h / 4 - Math.round(h / 4)) < 0.05) ok++; }
+  assert(ok === n && n > 1000, `格点里 ${ok} / ${n} 是 4 的倍数`);
+  assert(T.terraces.filter((t) => t.plan_id === "steps").length >= 4, "登记了 ≥ 4 级 " + T.terraces.filter((t) => t.plan_id === "steps").length);
+  const z = compilePlan(mini([], { terrain: [{ id: "zig", op: "raise", at: "site.C", size_m: [30, 30], height_m: 12, edge: "terraced", steps: 3 }] }), { seed: 1 });
+  assert(z.T.terraces.filter((t) => t.plan_id === "zig").length >= 3, "台阶边登记 ≥ 3 级 " + z.T.terraces.filter((t) => t.plan_id === "zig").map((t) => t.height));
+});
+
+test("raise edge terraced + 地标锚在 X.top + 石阶上去：关系只引用 SID 里有的东西（台阶面归到 rise），validate 0 error", () => {
+  const r = compilePlan(mini([
+    { id: "hall", type: "building", label: "主殿", at: "rise.top", size_m: [20, 12, 16], roof: "dome", role: "landmark" },
+    { id: "stair", type: "link", style: "stairs", label: "石阶", from: "spawn", to: "hall", width_m: 4 },
+  ], { terrain: [{ id: "rise", op: "raise", at: "site.center", shape: "circle", size_m: [70, 70], height_m: 15, edge: "terraced", steps: 3 }] }), { seed: 1 });
+  assert(r.T.terraces.some((t) => t.id !== "rise" && t.plan_id === "rise"), "台阶面登记成台地 " + r.T.terraces.map((t) => t.id));
+  const bad = r.sid.relations.filter((x) => !r.sid.volumes.concat(r.sid.terrain.features, r.sid.paths, r.sid.markers, r.sid.regions, r.sid.spaces || []).some((o) => o.id === x.a) || !r.sid.volumes.concat(r.sid.terrain.features, r.sid.paths, r.sid.markers, r.sid.regions, r.sid.spaces || []).some((o) => o.id === x.b));
+  assert(bad.length === 0, "关系引用了不存在的 id：" + JSON.stringify(bad));
+  assert(r.sid.relations.some((x) => x.type === "on_top_of" && x.b === "rise"), "地标 on_top_of rise " + JSON.stringify(r.sid.relations.filter((x) => x.type === "on_top_of")));
+  assert(errs(r).length === 0, "validate " + errs(r).map((e) => e.msg).join("；"));
+});
+
+test("雕刻 ramp / carve / lake / river / dune / noise：坡道单调、沟比两边低、湖有水面且湖底在水下、河出水线、起伏有界", () => {
+  const r = compilePlan(mini([], { site: { size_m: [200, 200], ground: "flat" }, terrain: [
+    { id: "mesa", op: "raise", at: "site.E", size_m: [30, 60], shape: "rect", height_m: 10, edge: "cliff" },
+    { id: "slope", op: "ramp", from: "site.C", to: "mesa.W", width_m: 8 },
+    { id: "ditch", op: "carve", from: "site.NW", to: "site.N", width_m: 6, depth_m: 3 },
+    { id: "pond", op: "lake", at: "site.SW", size_m: [40, 30], depth_m: 3 },
+    { id: "brook", op: "river", from: "site.S", to: "site.SE", width_m: 6, depth_m: 2 },
+  ] }), { seed: 1 });
+  const T = r.T, ramp = r.sid.terrain.features.find((f) => f.id === "slope");
+  const a = ramp.ramp.a, b = ramp.ramp.b; let prev = -Infinity;
+  for (let k = 1; k <= 9; k++) { const t = k / 10, h = T.heightAt(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t); assert(h >= prev - 0.05, "坡道单调"); prev = h; }
+  assert(prev > 6, "坡道上到台 " + prev);
+  const mid = [(-80 + 0) / 2, -80]; assert(T.heightAt(mid[0], mid[1]) < -2.5, "沟底 " + T.heightAt(mid[0], mid[1]));
+  const lake = r.sid.regions.find((g) => g.plan_id === "pond" && g.kind === "water"); assert(lake && Number.isFinite(lake.surface_y), "湖有水面");
+  const lc = [-80, 80]; assert(T.heightAt(lc[0], lc[1]) < lake.surface_y - 2, "湖底在水下");
+  assert(r.sid.paths.some((p) => p.plan_id === "brook" && p.kind === "river" && p.points.length >= 4), "河的水线");
+  const d = compilePlan(mini([], { terrain: [{ id: "dunes", op: "dune", amplitude_m: 3, scale_m: 25 }, { id: "bumps", op: "noise", amplitude_m: 1, scale_m: 20 }] }), { seed: 1 });
+  let lo = Infinity, hi = -Infinity; for (const h of d.T.grid.h) { lo = Math.min(lo, h); hi = Math.max(hi, h); }
+  assert(lo >= -1.1 && hi <= 4.1 && hi - lo > 1.5, `起伏 ${lo}..${hi}`);
+});
+
+test("基础形态 ground：每种都能编译；山中间高、湖中间低带湖水（可当 area）、海岛 / 海岸有海、天空没有地面", () => {
+  for (const g of ["flat", "rolling", "hills", "mountain", "canyon", "lake", "island", "coast", "desert", "cavern", "sky"]) {
+    const r = compilePlan({ name: g, site: { size_m: [160, 160], ground: g }, nodes: [{ id: "x", type: "tower", at: "site.C", size_m: [6, 12], elev_m: g === "sky" ? 20 : 0 }] }, { seed: 1 });
+    assert(errs(r).length === 0, g + " validate");
+    const T = r.T, c = T.heightAt(0, 0), e = T.heightAt(70, 0);
+    if (g === "mountain") assert(c > e + 15, "山中间高");
+    if (g === "lake") assert(c < -3 && r.sid.regions.some((q) => q.kind === "water" && q.plan_id === "lake"), "湖");
+    if (g === "island" || g === "coast") assert(r.sid.regions.some((q) => q.kind === "water" && q.surface_y === 0), g + " 海");
+    if (g === "canyon") assert(c < T.heightAt(60, 0) - 10, "峡谷中间低");
+    if (g === "cavern") assert(T.heightAt(78, 0) > c + 10, "洞壁");
+    if (g === "sky") assert(r.sid.terrain.base === "none" && c < -20, "没有地面");
+  }
+});
+
+// ============================================================ 生成器
+test("生成器：terraces + scatter_houses 在台地上布房；grove 出树；field 出田；space 出地下空间与连接点", () => {
+  const r = comp("mountain-village");
+  assert(r.facts.terraces >= 5 && r.facts.houses >= 15 && chk(r, "houses_on_terraces").ok, `台地 ${r.facts.terraces} 房 ${r.facts.houses}`);
+  assert(r.sid.regions.filter((g) => g.plan_id === "village").every((g) => g.terrace_id && g.building && g.building.plan_id === "village"), "按台地分区、带房子模板");
+  assert(r.sid.volumes.some((v) => v.generated && v.zone_id === "village") && r.index.village.sid_ids.length > 10, "房子挂回生成器");
+  assert(r.facts.trees > 20 && r.sid.regions.some((g) => g.plan_id === "bamboo" && g.kind === "forest"), "竹林");
+  assert(r.sid.regions.some((g) => g.plan_id === "paddies" && g.kind === "farmland"), "稻田");
+  const m = comp("mine-maze"), s = m.sid.spaces.find((q) => q.plan_id === "mine");
+  assert(s && s.layout === "maze" && s.sublevels === 2 && m.sid.markers.some((q) => q.kind === "connector" && q.to === s.id), "矿洞迷宫 + 连接点");
+  assert(m.sid.volumes.filter((v) => v.generated && v.zone_id === "camp").length >= 4, "矿工房");
+});
+
+// ============================================================ ops / 拖动
+test("applyOps set：树里任何深度按 id 改、嵌套字段、改实例写进 overrides、value null 删字段；不存在的 id 跳过并提示", () => {
+  const p = EX["magic-academy"];
+  let r = applyOps(p, [{ op: "set", id: "hall", field: "size_m", value: [40, 30, 30] }, { op: "set", id: "towers[2]", field: "size_m", value: [9, 40] }, { op: "set", id: "vault", field: "connect.via", value: "ladder" }, { op: "set", id: "spire", field: "color", value: null }, { op: "set", id: "nope", field: "label", value: "x" }, { op: "set", id: "site", field: "ground", value: "island" }]);
+  const f = (id) => findNode(r.plan, id).node;
+  assert(f("hall").size_m[1] === 30 && f("towers").overrides["2"].size_m[1] === 40 && f("vault").connect.via === "ladder" && !("color" in f("spire")), "改到了");
+  assert(r.plan.site.ground === "island" && r.warnings.some((w) => w.includes("nope")), "site 与提示");
+  const c = compilePlan(r.plan, { seed: 1 });
+  assert(vols(c, "towers[2]")[0].size[1] === 40 && vols(c, "towers[0]")[0].size[1] === 28, "只改了第 2 座塔");
+  assert(p.nodes[0].children[0].size_m[1] === 24, "不改入参");
+});
+
+test("applyOps add / remove：加到根 / 地形 / 组的子节点 / 重复的模板；删节点连子树、删实例写 skip、删关系；引用被删的降级", () => {
+  let r = applyOps(EX["magic-academy"], [
+    { op: "add", to: "academy", value: { id: "obelisk", type: "prism", sides: 4, size_m: [2, 12], offset_m: [0, -20] } },
+    { op: "add", to: "root", value: { id: "pier", type: "platform", at: "site.SE", size_m: [10, 1, 20] } },
+    { op: "add", to: "terrain", value: { id: "bump", op: "raise", at: "site.NE", height_m: 4 } },
+    { op: "remove", id: "towers[1]" }, { op: "remove", id: "rel:0" },
+  ]);
+  const P = r.plan;
+  assert(findNode(P, "obelisk").parent.id === "academy" && findNode(P, "pier") && P.terrain.some((t) => t.id === "bump"), "加到了");
+  assert(findNode(P, "towers").node.skip.join() === "1" && P.relations.length === 1, "删实例 / 关系");
+  r = applyOps(P, [{ op: "remove", id: "library" }]);
+  assert(!findNode(r.plan, "library") && !findNode(r.plan, "stacks") && !findNode(r.plan, "light_bridge"), "删掉书库连同子节点；光桥没了终点也去掉");
+  assert(r.warnings.some((w) => w.includes("library")), "提示 " + r.warnings);
+  const t = applyOps(P, [{ op: "add", to: "towers", value: { type: "tower", size_m: [5, 18], roof: "dome" } }]);
+  assert(findNode(t.plan, "towers").node.child.roof === "dome", "加到重复 = 换模板");
+  assert(errs(compilePlan(P, { seed: 1 })).length === 0, "改完能编译");
+});
+
+test("offsetFromPoint / atFromPoint 往返：旋转过的组里的子节点、根节点、地形操作、实例、出生点——拖到哪就在哪", () => {
+  const plan = mini([
+    { id: "g", type: "group", at: "site.C", offset_m: [10, -10], rotate_deg: 90, children: [{ id: "kid", type: "box", size_m: [4, 4, 4], offset_m: [8, 0] }] },
+    { id: "lone", type: "box", at: "site.W", size_m: [4, 4, 4] },
+    { id: "row", type: "repeat", at: "site.N", pattern: "linear", count: 3, spacing_m: 12, child: { type: "box", size_m: [3, 3, 3] } },
+  ], { terrain: [{ id: "hump", op: "raise", at: "site.E", size_m: [20, 20], height_m: 4 }] });
+  let c = compilePlan(plan, { seed: 1 });
+  const targets = { kid: [-20, 25], lone: [-40, -30], "row[1]": [30, -40], hump: [35, 20], spawn: [5, 50] };
+  let p = c.plan;
+  for (const [id, pt] of Object.entries(targets)) { const off = offsetFromPoint(p, id, pt); assert(off, id + " 有偏移"); p = applyOps(p, [{ op: "set", id, field: "offset_m", value: off }]).plan; }
+  c = compilePlan(p, { seed: 1 });
+  close(dist(xz(vol(c, "kid").position), targets.kid), 0, 0.2, "kid");
+  close(dist(xz(vol(c, "lone").position), targets.lone), 0, 0.2, "lone");
+  close(dist(xz(vols(c, "row[1]")[0].position), targets["row[1]"]), 0, 0.2, "row[1]");
+  const hf = c.sid.terrain.features.find((f) => f.id === "hump"); close(dist([hf.center[0], hf.center[2]], targets.hump), 0, 0.5, "hump");
+  close(dist(xz(c.sid.markers.find((m) => m.id === "spawn").position), targets.spawn), 0, 0.2, "spawn");
+  const a = atFromPoint(c.sid, c.T, c.plan, "lone", [0, 0]);
+  assert(a && a.at === "site.W" && a.offset_m.length === 2, "atFromPoint 保留锚点给偏移 " + JSON.stringify(a));
+});
+
+// ============================================================ 旋钮 / 摘要 / 新建 / 展开
+test("knobsFor：按 type / pattern 出旋钮（size 带分量名、anchor 带可选基准与后缀、枚举带中文），hidden 不出", () => {
+  const plan = EX["magic-academy"];
+  const kb = knobsFor("node", findNode(plan, "hall").node, PLAN_SCHEMA, plan), keys = kb.map((k) => k.path);
+  assert(keys.includes("size_m") && keys.includes("roof") && keys.includes("at") && !keys.includes("pattern") && !keys.includes("id") && !keys.includes("overrides"), "房子 " + keys);
+  assert(kb.find((k) => k.key === "size_m").parts.join() === "宽,高,深" && kb.find((k) => k.key === "roof").options.some((o) => o.label === "穹顶"), "分量名 / 中文");
+  const at = kb.find((k) => k.key === "at");
+  assert(at.kind === "anchor" && at.options.some((o) => o.value === "site.N") && at.options.some((o) => o.value === "rock") && at.options.some((o) => o.value === "towers") && at.suffixes.some((s) => s.value === "top"), "锚点可选项");
+  const rk = knobsFor("node", findNode(plan, "towers").node, PLAN_SCHEMA, plan).map((k) => k.path);
+  assert(rk.includes("count") && rk.includes("radius_m") && rk.includes("start_deg") && !rk.includes("rows") && !rk.includes("roof"), "环形重复 " + rk);
+  const lk = knobsFor("node", findNode(plan, "light_bridge").node, PLAN_SCHEMA, plan).map((k) => k.path);
+  assert(lk.includes("style") && lk.includes("from") && lk.includes("to") && !lk.includes("size_m"), "连接 " + lk);
+  const tk = knobsFor("terrain", plan.terrain[0], PLAN_SCHEMA, plan).map((k) => k.path);
+  assert(tk.includes("op") && tk.includes("height_m") && tk.includes("edge") && !tk.includes("depth_m"), "地形 " + tk);
+  const sk = knobsFor("node", findNode(plan, "vault").node, PLAN_SCHEMA, plan).map((k) => k.path);
+  assert(sk.includes("layout") && sk.includes("branching") && sk.includes("connect.via"), "空间 " + sk);
+  assert(knobsFor("site", plan.site).some((k) => k.key === "ground") && knobsFor("look", plan).some((k) => k.key === "time_of_day"), "场地 / 外观");
+});
+
+test("summarize：场景树一行的关键值（「法师塔 · 环形 · × 6 · 半径 33 m」；锚点写人话）", () => {
+  const plan = EX["magic-academy"];
+  const s = summarize("node", findNode(plan, "towers").node, plan);
+  assert(s.includes("法师塔") && s.includes("环形") && s.includes("× 6") && s.includes("半径 33"), s);
+  const h = summarize("node", findNode(plan, "spire").node, plan);
+  assert(h.includes("主殿 顶上"), h);
+  const t = summarize("terrain", plan.terrain[0], plan);
+  assert(t.includes("抬起") && t.includes("高 22"), t);
+});
+
+test("newElement：每种节点 / 地形操作 / 关系按默认值造出来，id 唯一，加进去都能编译（0 error）", () => {
+  let p = EX["cyber-market"];
   const ops = [];
-  for (const g of ["terrain", "zones", "buildings", "landmarks", "paths", "water", "spaces", "relations"]) { const el = newElement(g, undefined, plan); assert(el, g); ops.push({ op: "add", group: g, value: el }); }
-  ops.push({ op: "add", group: "terrain", value: newElement("terrain", "ring_terraces", plan) });
-  const { plan: p2, warnings } = applyOps(plan, ops);
-  assert(p2.terrain.length === 5 && p2.spaces.length === 1 && p2.relations.length === 3, "都加进去了 " + warnings.join("|"));
-  assert(new Set(p2.terrain.map((t) => t.id)).size === p2.terrain.length, "id 唯一");
-  const r = compilePlan(p2, { seed: 1 });
-  assert(r.facts.errors === 0, "能编译");
+  for (const t of PLAN_SCHEMA.definitions.node.properties.type.enum) { const el = newElement("node", t, p); assert(el && el.type === t && el.id && !findNode(p, el.id), "节点 " + t); ops.push({ op: "add", to: "root", value: el }); }
+  for (const t of PLAN_SCHEMA.definitions.terrain_op.properties.op.enum) { const el = newElement("terrain", t, p); assert(el && el.op === t, "地形 " + t); }
+  const rel = newElement("relations", "reachable", p); assert(rel.type === "reachable" && rel.a && rel.b, "关系");
+  const r = applyOps(p, ops), c = compilePlan(r.plan, { seed: 1 });
+  assert(errs(c).length === 0, "加完能编译：" + errs(c).map((e) => e.msg));
+  const ids = new Set(); for (const e of expand(r.plan)) if (e.k === null && e.depth === 0) { assert(!ids.has(e.id), "id 重复 " + e.id); ids.add(e.id); }
 });
 
-test("planDistance：同一个 plan 为 0；6 个示例两两 ≥ 1；distinctPlans", () => {
-  assert(planDistance(EX["ring-stilt"], EX["ring-stilt"]) === 0, "自身为 0");
-  for (let i = 0; i < NAMES.length; i++) for (let j = i + 1; j < NAMES.length; j++) { const d = planDistance(EX[NAMES[i]], EX[NAMES[j]]); assert(d >= 1, `${NAMES[i]} vs ${NAMES[j]} = ${d}`); }
-  assert(distinctPlans(NAMES.map((n) => EX[n])) && !distinctPlans([EX["ring-stilt"], EX["ring-stilt"]]), "distinctPlans");
-  const small = applyOps(EX["ring-stilt"], [{ op: "set", id: "ring", field: "steps", value: 4 }]).plan;
-  assert(planDistance(EX["ring-stilt"], small) < 1, "只改级数不算换一批");
+test("expand 与 600 上限：实例按 pattern 计数；展开超过 600 个形体时缩最大的重复并提示", () => {
+  const plan = mini([{ id: "city", type: "repeat", at: "site.C", pattern: "grid", rows: 30, cols: 30, spacing_m: 4, child: { type: "box", size_m: [2, 2, 2] } }, { id: "ring", type: "repeat", at: "site.C", pattern: "radial", count: 20, radius_m: 60, child: { type: "column", size_m: [1, 4] } }]);
+  assert(expand(plan).filter((e) => e.instance_of === "city").length === 900, "展开 900");
+  const { plan: P, warnings } = normalizePlan(plan);
+  const n = expand(P).filter((e) => e.cls === "solid").length;
+  assert(n <= 600 && warnings.some((w) => w.includes("600")), `缩到 ${n}：${warnings}`);
+  assert(findNode(P, "ring").node.count === 20, "小的不动");
 });
 
-const MS = NAMES.map((n) => { const t0 = performance.now(); compilePlan(EX[n], { seed: 5 }); return Math.round(performance.now() - t0); });
-test(`性能：单个 plan 编译 + resolve 无头环境 < 2000 ms（${NAMES.map((n, i) => n + " " + MS[i]).join("、")} ms）`, () => {
-  for (let i = 0; i < MS.length; i++) assert(MS[i] < 2000, `${NAMES[i]} ${MS[i]} ms`);
+// ============================================================ 关系 / 可达 / 旧版 / 性能
+test("关系检查：看得见 / 走得到 / 挨着 / 在上方 / 远离 —— 不成立时给 ops 修法，按修法改完再编译就成立", () => {
+  const base = mini([
+    { id: "a", type: "box", at: "site.W", size_m: [4, 4, 4] },
+    { id: "b", type: "building", at: "site.E", size_m: [10, 8, 10] },
+  ], { relations: [{ type: "adjacent", a: "a", b: "b" }, { type: "above", a: "a", b: "b" }, { type: "far_from", a: "b", b: "spawn" }] });
+  const r = compilePlan(base, { seed: 1 });
+  for (const i of [0, 1]) { const c = chk(r, "rel_" + i); assert(!c.ok && c.fixes.some((f) => f.ops), "rel_" + i + " 不成立且有修法：" + c.detail); }
+  let p = r.plan;
+  p = applyOps(p, chk(r, "rel_1").fixes.find((f) => f.ops).ops).plan;
+  const r2 = compilePlan(p, { seed: 1 });
+  assert(chk(r2, "rel_1").ok && chk(r2, "rel_0").ok, "放到 b 顶上后：在上方 / 挨着都成立 " + chk(r2, "rel_1").detail + " / " + chk(r2, "rel_0").detail);
+  assert(vol(r2, "a").rests_on === "b", "立在 b 上");
 });
 
+test("可达：浮空花园每座小岛都经索桥走得到；拆掉一座索桥那座岛就到不了（程序检查 reach_* 与 planReach）", () => {
+  const r = comp("sky-garden");
+  assert(chk(r, "rel_0").ok, "isles[2] 走得到");
+  const p = applyOps(EX["sky-garden"], [{ op: "remove", id: "bridge_2" }, { op: "set", id: "isles", field: "role", value: "landmark" }]).plan;
+  const c = compilePlan(p, { seed: 1 });
+  assert(!chk(c, "rel_0").ok && chk(c, "rel_0").detail.includes("高处"), "拆桥后到不了：" + chk(c, "rel_0").detail);
+  assert(chk(c, "reach_isles").ok, "重复整体：别的岛还走得到");
+});
+
+test("旧版 v4 构成图：自动改写成 v2 再编译（提示一句），不报错", () => {
+  const v4 = { name: "旧寨", site: { size_m: 140, relief_layers: 5, layer_m: 3 }, terrain: [{ id: "hill", type: "hill", at: { of: "site", dir: "N", dist: 0.4 }, size_m: [120, 80], top_layer: 5 }, { id: "steps", type: "slope_terraces", at: { of: "site", dir: "C" }, size_m: [80, 90], steps: 4 }],
+    buildings: [{ id: "h", form: "house", size_m: [6, 4, 5] }], zones: [{ id: "z", use: "housing", on: "steps", building: "h" }], landmarks: [{ id: "lm", form: "tower", size_m: [7, 14, 7], place: { rel: "top_of", target: "steps" } }],
+    spawn: { place: { rel: "edge_of", target: "site", side: "S" }, look_at: "lm" }, paths: [{ id: "p", from: "spawn", to: "lm", style: "stairs" }] };
+  const r = compilePlan(v4, { seed: 1 });
+  assert(r.warnings.some((w) => w.includes("v4")) && errs(r).length === 0, "改写：" + r.warnings);
+  assert(findNode(r.plan, "steps").node.type === "terraces" && findNode(r.plan, "lm").node.at === "steps.top" && r.facts.houses > 5, "台地 / 地标 / 房子");
+});
+
+test("resolveTarget：节点 / 组 / 实例 / 地形 / 出生点 → 点、范围、高度、SID id", () => {
+  const r = comp("magic-academy");
+  const g = resolveTarget(r.sid, r.T, "academy"), t = resolveTarget(r.sid, r.T, "towers[2]"), k = resolveTarget(r.sid, r.T, "rock"), s = resolveTarget(r.sid, r.T, "spawn");
+  assert(g.kind === "node" && g.sid_ids.length >= 10 && g.top_y > 40, "组 " + JSON.stringify([g.kind, g.sid_ids.length, g.top_y]));
+  assert(t.kind === "node" && t.sid_ids.join() === "towers_2", "实例");
+  assert(k.kind === "terrain" && s.kind === "spawn" && resolveTarget(r.sid, r.T, "site").kind === "site", "地形 / 出生点 / 场地");
+  assert(resolveTarget(r.sid, r.T, "nope") === null, "找不到 null");
+});
+
+test("事实：形体数、各类计数、最高点、水面积、路长、悬空数", () => {
+  const r = comp("magic-academy"), f = r.facts;
+  assert(f.shapes === r.sid.volumes.filter((v) => v.land && !v.generated).length && f.by_kind.tower === 6 && f.by_type.repeat === 2, "计数 " + JSON.stringify([f.shapes, f.by_kind, f.by_type]));
+  assert(f.highest.y > 50 && f.water_area_m2 > 5000 && f.path_length_m > 50 && f.floating >= 2, "最高 / 水 / 路 / 悬空 " + JSON.stringify([f.highest, f.water_area_m2, f.path_length_m, f.floating]));
+});
+
+test("性能：560 个形体的程序编译 < 3000 ms（无头）且 facts.shapes ≤ 600", () => {
+  const plan = { name: "压力", site: { size_m: [240, 240], ground: "hills", relief_m: 8 }, terrain: [{ id: "pad", op: "flatten", at: "site.C", shape: "rect", size_m: [200, 200] }],
+    nodes: [
+      { id: "city", type: "repeat", at: "site.C", pattern: "grid", rows: 20, cols: 20, spacing_m: 9, child: { type: "building", size_m: [6, 8, 6], roof: "gable" } },
+      { id: "ring", type: "repeat", at: "site.C", pattern: "radial", count: 100, radius_m: 110, child: { type: "column", size_m: [1.5, 8] } },
+      { id: "rocks", type: "repeat", pattern: "scatter", count: 60, area: "site", child: { type: "rock", size_m: [3, 2, 3] } },
+      { id: "keep", type: "tower", role: "landmark", at: "site.N", size_m: [10, 30] },
+      { id: "road", type: "link", style: "road", from: "spawn", to: "keep" },
+    ], spawn: { at: "site.S", look_at: "keep" } };
+  const t0 = Date.now(), r = compilePlan(plan, { seed: 1 }), wall = Date.now() - t0;
+  assert(r.facts.shapes >= 500 && r.facts.shapes <= 600, "形体数 " + r.facts.shapes);
+  assert(r.ms < 3000 && wall < 3000, `编译 ${r.ms} ms / ${wall} ms`);
+  assert(errs(r).length === 0, "validate");
+});
+
+test("锚点写法规范化：site.center / site.north / hall.n / towers[2].s / X.Top 都认；后端与模型写的 site.center 不再被降级", () => {
+  const cases = { "site.center": "site.C", "site.centre": "site.C", "site.middle": "site.C", "site.north": "site.N", "site.sw": "site.SW", "hall.n": "hall.N", "towers[2].s": "towers[2].S", "hall.Top": "hall.top", "hall.c": "hall.center", "Hall": "hall", "site": "site", " hall.E ": "hall.E" };
+  for (const [a, b] of Object.entries(cases)) assert(canonRef(a) === b, `${a} → ${canonRef(a)}（应为 ${b}）`);
+  const p = mini([
+    { id: "core", type: "group", at: "site.center", children: [{ id: "hall", type: "building", size_m: [16, 10, 12], role: "landmark" }, { id: "kiosk", type: "box", at: "site.center", offset_m: [20, 0], size_m: [4, 3, 4] }] },
+    { id: "road", type: "link", style: "path", from: "site.south", to: "hall.s" },
+  ], { spawn: { at: "site.center", offset_m: [0, 40], look_at: "hall" } });
+  const r = compilePlan(p, { seed: 1 });
+  assert(!r.warnings.length, r.warnings.join("；"));
+  assert(r.plan.spawn.at === "site.C" && r.plan.nodes[1].from === "site.S" && r.plan.nodes[1].to === "hall.S", JSON.stringify([r.plan.spawn, r.plan.nodes[1]]));
+  assert(r.index.kiosk && r.index.road, "子节点的 site.center 锚点、连接都在");
+  const q = JSON.parse(JSON.stringify(p).replaceAll("site.center", "site.C").replace("site.south", "site.S").replace("hall.s", "hall.S"));
+  assert(JSON.stringify(compilePlan(q, { seed: 1 }).sid.volumes) === JSON.stringify(r.sid.volumes), "与规范写法编译结果相同");
+  assert(p.spawn.at === "site.center", "不改入参");
+});
+// ============================================================ v5 第 1 轮验收
+test("实例重合：镜像 axis:x 套一排默认沿 x 的柱子 → 两份完全重合，检查报出来并给修法（里面那排改沿 z 再偏开）；改了以后夹出一条南北向的道", () => {
+  const bad = mini([
+    { id: "temple", type: "building", role: "landmark", at: "site.N", size_m: [20, 12, 16] },
+    { id: "colonnade", type: "repeat", pattern: "mirror", axis: "x", at: "site.C", child: { type: "repeat", pattern: "linear", count: 6, spacing_m: 11, child: { type: "column", label: "残柱", size_m: [2, 10] } } },
+  ]);
+  const r = compilePlan(bad, { seed: 1 }), c = chk(r, "instances_distinct");
+  assert(c && !c.ok && /残柱 × 2|重合/.test(c.detail) && !/重复 /.test(c.detail), JSON.stringify(c));
+  const fix = c.fixes.find((f) => f.ops && f.ops.some((o) => o.field === "child.axis"));
+  assert(fix, "给出「里面那排改成沿 z」的修法：" + JSON.stringify(c.fixes));
+  const r2 = compilePlan(applyOps(bad, fix.ops).plan || applyOps(bad, fix.ops), { seed: 1 });
+  assert(!chk(r2, "instances_distinct"), "改了以后不再重合");
+  const cols = r2.sid.volumes.filter((v) => v.label === "残柱");
+  const xs = new Set(cols.map((v) => Math.round(v.position[0]))), zs = new Set(cols.map((v) => Math.round(v.position[2])));
+  assert(cols.length === 12 && xs.size === 2 && zs.size === 6, `两排南北向：x ${[...xs]} z ${[...zs]}`);
+});
+
+test("检查文案不出现未命名的「重复」：重复没写 label 用「模板名 × N」，实例写「X 的第 k 个」", () => {
+  const p = mini([
+    { id: "hall", type: "building", role: "landmark", at: "site.C", size_m: [30, 12, 30] },
+    { id: "posts", type: "repeat", pattern: "linear", at: "site.C", count: 3, spacing_m: 12, child: { type: "column", label: "灯柱", size_m: [2, 8] } },
+  ]);
+  const r = compilePlan(p, { seed: 1 });
+  const texts = r.checks.filter((c) => !c.ok).map((c) => c.detail).join("；");
+  assert(r.plan.nodes[1].label === undefined, "规范化不给重复补「重复」这个名字");
+  assert(!/(^|[^的])重复( |$)/.test(texts) && /灯柱/.test(texts), texts);
+});
+
+test("主地标取节点自己的体块：平台上放了四根细角柱，出生点看的是平台不是角柱", () => {
+  const p = mini([{ id: "altar", type: "platform", label: "祭坛", role: "landmark", at: "site.C", size_m: [20, 4, 20],
+    children: [{ type: "repeat", pattern: "radial", count: 4, radius_m: 7, child: { type: "column", label: "角柱", size_m: [1.2, 6] } }] }], { spawn: { at: "site.S", look_at: "altar" } });
+  const r = compilePlan(p, { seed: 1 }), fv = r.sid.volumes.find((v) => v.id === r.sid.meta.focus);
+  assert(fv && fv.label === "祭坛", "focus = " + (fv && fv.label));
+  assert(r.sid.volumes.filter((v) => v.label === "角柱").every((v) => v.importance !== "landmark"), "角柱不继承 landmark");
+});
+
+test("连接按样式走不通：不画实线路面，只留两端 + 虚线（unrouted），不算可走；检查给修法（台阶 / 桥）", () => {
+  const p = mini([
+    { id: "mesa", type: "box", label: "孤台", role: "landmark", at: "site.C", size_m: [10, 4, 10] },
+    { id: "road", type: "link", style: "road", label: "车道", from: "spawn", to: "mesa" },
+  ], { terrain: [{ op: "raise", id: "crag", at: "site.C", shape: "circle", size_m: [40, 40], height_m: 40, edge: "cliff" }], spawn: { at: "site.S" } });
+  p.nodes[0].at = "crag.top";
+  const r = compilePlan(p, { seed: 1 }), path = r.sid.paths.find((q) => q.plan_id === "road"), c = chk(r, "links_routed");
+  assert(path && path.unrouted && path.points.length === 2, JSON.stringify(path && { u: path.unrouted, n: path.points.length, f: path.fallback }));
+  assert(c && !c.ok && c.fixes.some((f) => f.ops && f.ops[0].value === "stairs") && c.fixes.some((f) => f.ops && f.ops[0].value === "bridge") && /ramp/.test(c.detail), JSON.stringify(c));
+});
+
+test("出生点落在水面上（海岸的南边）→ 就近挪到干地上", () => {
+  const p = mini([{ id: "fort", type: "tower", role: "landmark", at: "site.N", size_m: [10, 20] }], { site: { size_m: [200, 200], ground: "coast", layer_m: 3 }, spawn: { at: "site.S", look_at: "fort" } });
+  const r = compilePlan(p, { seed: 1 }), sp = r.sid.markers.find((m) => m.kind === "player_spawn");
+  const sea = r.sid.regions.find((g) => g.kind === "water");
+  assert(sea && !pointInPolygon([sp.position[0], sp.position[2]], sea.polygon), "出生点 " + JSON.stringify(sp.position));
+  assert(sp.position[2] < 100 - 2, "往北挪了：" + sp.position[2]);
+});
+
+// ============================================================ 第 2 轮验收（docs/06 §8）
+test("形体子节点的 elev_m 从父体底面量（挂立面）；在父体里面的推到外墙外；不写 elev_m 的仍立在顶上；同心的环不动", () => {
+  const p = mini([{ id: "tw", type: "building", label: "塔楼", at: "site.C", size_m: [16, 58, 14], roof: "flat", children: [
+    { id: "deck", type: "box", label: "外挂平台", offset_m: [3, 0], elev_m: 26, size_m: [10, 1, 12] },
+    { id: "cap", type: "cone", label: "顶罩", size_m: [6, 3] },
+    { id: "ring", type: "torus", label: "腰环", elev_m: 20, size_m: [20, 1, 20] },
+  ] }]);
+  const r = compilePlan(p, { seed: 1 }), t = vol(r, "tw"), d = vol(r, "deck"), c = vol(r, "cap"), g = vol(r, "ring");
+  close(d.position[1], t.position[1] + 26, 0.05, "平台在立面 26 m");
+  assert(d.position[0] - 5 > t.position[0] + 8 - 0.6, "平台推到东墙外 x=" + d.position[0]);
+  close(c.position[1], t.position[1] + t.size[1], 0.05, "顶罩立在顶上");
+  close(g.position[1], t.position[1] + 20, 0.05, "腰环 20 m"); close(g.position[0], t.position[0], 0.01, "腰环同心不推");
+  assert((r.facts.plan.autofix || []).some((a) => a.kind === "attach"), "autofix attach");
+});
+
+test("避让：悬空的薄雨棚压在钢架 / 柱顶上不算撞，不被推离街面", () => {
+  const p = mini([
+    { id: "street", type: "platform", label: "街", at: "site.C", size_m: [30, 0.4, 120] },
+    { id: "posts", type: "repeat", pattern: "mirror", axis: "x", at: "street.N", child: { type: "cylinder", label: "柱", offset_m: [12, 6], size_m: [2, 9] } },
+    { id: "frame", type: "repeat", pattern: "linear", axis: "z", count: 9, spacing_m: 13, at: "street.center", child: { type: "box", label: "钢架", size_m: [28, 0.8, 0.8], elev_m: 8 } },
+    { id: "canopy", type: "box", label: "雨棚", at: "street.center", size_m: [30, 0.3, 120], elev_m: 8.4 },
+  ]);
+  const r = compilePlan(p, { seed: 1 }), c = vol(r, "canopy"), s = vol(r, "street");
+  assert(!r.facts.plan.pushed.some((x) => x.id === "canopy"), "雨棚没被推：" + JSON.stringify(r.facts.plan.pushed));
+  close(c.position[0], s.position[0], 0.01, "雨棚还在街上");
+});
+
+test("镜像模板在翻转轴上：重复自己的偏移当成对称半间距（autofix），两份在两侧", () => {
+  const p = mini([{ id: "pair", type: "repeat", pattern: "mirror", axis: "x", at: "site.C", offset_m: [-13, -4], child: { type: "cylinder", label: "广告柱", size_m: [2.4, 9] } }]);
+  const r = compilePlan(p, { seed: 1 }), xs = vols(r, "pair").map((v) => v.position[0]).sort((a, b) => a - b);
+  assert(xs.length === 2 && Math.abs(xs[0] + 13) < 0.05 && Math.abs(xs[1] - 13) < 0.05, "x = " + xs);
+  assert(!chk(r, "instances_distinct") && r.facts.plan.autofix.some((a) => a.kind === "mirror"), "不再报重合，记 autofix");
+});
+
+test("台阶写 shape:cylinder = 螺旋梯（中柱 + 绕柱踏步），不画成大圆柱", () => {
+  const p = mini([{ id: "sp", type: "stairs", label: "旋梯", at: "site.C", shape: "cylinder", size_m: [6, 18, 48] }]);
+  const r = compilePlan(p, { seed: 1 }), vs = vols(r, "sp"), col = vol(r, "sp");
+  assert(col.shape === "cylinder" && col.size[0] < 2 && col.size[1] === 18, JSON.stringify(col.size));
+  const steps = vs.filter((v) => v.id !== "sp");
+  assert(steps.length >= 10 && steps.every((v) => v.shape === "box" && v.size[0] < 3), "踏步 " + steps.length);
+  assert(Math.max(...steps.map((v) => v.position[1])) > col.position[1] + 15, "踏步升到顶");
+});
+
+test("崖外的平台不垫几十米的基座：往中心收到台顶上（autofix pull_in）", () => {
+  const p = mini([{ id: "ledge", type: "repeat", pattern: "radial", count: 6, radius_m: 40, at: "crag.top", child: { type: "platform", label: "观星台", size_m: [8, 1.2, 8] } }],
+    { site: { size_m: [160, 160], ground: "flat", layer_m: 3 }, terrain: [{ op: "raise", id: "crag", at: "site.C", shape: "circle", size_m: [76, 76], height_m: 40, edge: "cliff" }] });
+  const r = compilePlan(p, { seed: 1 });
+  assert(!r.facts.plan.plinths.some((x) => x.m > 4), "基座 " + JSON.stringify(r.facts.plan.plinths));
+  assert(r.facts.plan.autofix.some((a) => a.kind === "pull_in"), "autofix pull_in");
+  assert(vols(r, "ledge").every((v) => v.position[1] > 35), "都在台顶");
+});
+
+test("repeat.axis 的旋钮：一排叫「方向」，镜像叫「镜像轴」", () => {
+  const a = knobsFor("node", { id: "r", type: "repeat", pattern: "linear", child: { type: "box" } }).find((k) => k.key === "axis");
+  const b = knobsFor("node", { id: "r", type: "repeat", pattern: "mirror", child: { type: "box" } }).find((k) => k.key === "axis");
+  assert(a && a.label === "方向" && a.options[0].label === "东西", JSON.stringify(a));
+  assert(b && b.label === "镜像轴" && b.options[0].label === "东西对称", JSON.stringify(b));
+});
+// ============================================================ 环带（空心圆柱）/ 立起来的环 / 一组连接
+/** 「绕坑三圈摊道」：坑 + 三圈空心圆柱（一圈比一圈小、一圈比一圈低）+ 坑底中心的灯柱 + 带子上的摊位 */
+const pitRings = () => mini([
+  { id: "rings", type: "group", at: "pit", children: [
+    { id: "r1", type: "cylinder", label: "上圈摊道", size_m: [112, 1.2], hollow: true, wall_m: 6 },
+    { id: "r2", type: "cylinder", label: "中圈摊道", size_m: [100, 1.2], hollow: true, wall_m: 6 },
+    { id: "r3", type: "cylinder", label: "下圈摊道", size_m: [88, 1.2], hollow: true, wall_m: 6 },
+  ] },
+  { id: "lamp", type: "cylinder", label: "巨灯柱", at: "pit", size_m: [8, 24], role: "landmark" },
+  { id: "stalls", type: "repeat", pattern: "radial", count: 8, radius_m: 16, at: "pit", child: { type: "box", label: "坑底食摊", size_m: [4, 3, 3] } },
+], { site: { size_m: [150, 150], ground: "flat", layer_m: 3 }, terrain: [{ id: "pit", op: "lower", at: "site.C", shape: "circle", size_m: [80, 80], depth_m: 15, edge: "terraced", steps: 3 }], spawn: { at: "site.S", look_at: "lamp" } });
+
+test("空心圆柱 = 环带：hollow + wall_m 进 SID（hollow / wall），落地按带子上最高点、离地量带子下面，孔里能放东西不算撞", () => {
+  const r = compilePlan(pitRings(), { seed: 1 });
+  assert(!errs(r).length, JSON.stringify(errs(r)));
+  const [a, b, c] = ["r1", "r2", "r3"].map((id) => vol(r, id));
+  assert(a.hollow && a.wall === 6 && b.wall === 6 && c.shape === "cylinder", JSON.stringify([a.hollow, a.wall, b.wall]));
+  // 一圈比一圈低（坑壁台阶化），每圈都不悬空（离地按带子下面量，不按坑底中心）
+  assert(a.position[1] > b.position[1] + 1 && b.position[1] > c.position[1] + 1, "高度 " + [a, b, c].map((v) => v.position[1]));
+  assert([a, b, c].every((v) => v.elev < 1), "离地 " + [a, b, c].map((v) => v.elev));
+  // 灯柱 / 食摊在孔里：不推、不报重叠
+  assert(!r.facts.plan.overlaps.length, "重叠 " + JSON.stringify(r.facts.plan.overlaps));
+  assert(!r.facts.plan.pushed.some((p) => p.id === "lamp" || p.id === "stalls"), "推了 " + JSON.stringify(r.facts.plan.pushed));
+  const lamp = vol(r, "lamp");
+  assert(dist(xz(lamp.position), [0, 0]) < 0.5, "灯柱还在坑心 " + lamp.position);
+  // 基座（如果有）也是一圈，中间不填实
+  for (const pv of r.sid.volumes.filter((v) => v.plinth_of && ["r1", "r2", "r3"].includes(v.plinth_of))) assert(pv.hollow && pv.wall > 0, "基座空心 " + pv.id);
+  // 方的东西压在带子上要推开（推到孔里或环外）
+  const p2 = pitRings(); p2.nodes.push({ id: "kiosk", type: "box", label: "售票亭", at: "pit", offset_m: [0, 57.4], size_m: [4, 3, 4] });
+  const r2 = compilePlan(p2, { seed: 1 }), k = vol(r2, "kiosk"), d = dist(xz(k.position), [0, 0]);
+  assert(r2.facts.plan.pushed.some((p) => p.id === "kiosk") && d >= 58 && d < 60, "售票亭推到环外 " + d);
+  const p3 = pitRings(); p3.nodes.push({ id: "kiosk", type: "box", label: "售票亭", at: "pit", offset_m: [0, 53], size_m: [4, 3, 4] });
+  assert(compilePlan(p3, { seed: 1 }).facts.plan.overlaps.some((o) => o.id === "kiosk" && o.b === "r1"), "整个压在带子上（推不开）就报告");
+});
+
+test("环带可走：贴地的环带是台面（出生点走得到坑里的地标）；剖面穿过孔是两段壁（segs）", () => {
+  const r = compilePlan(pitRings(), { seed: 1 });
+  const reach = r.checks.filter((c) => /^reach_|landmark_reachable|trail_reaches/.test(c.id));
+  assert(!reach.some((c) => !c.ok && /巨灯柱/.test(c.text)), JSON.stringify(reach.map((c) => [c.text, c.ok, c.detail])));
+  const S = sampleSection(r.sid, r.T, { mode: "line", line: [[0, 70], [0, -70]], width_m: 4 });
+  const sv = S.volumes.find((v) => v.id === "r1");
+  assert(sv && Array.isArray(sv.segs) && sv.segs.length === 2 && sv.segs.every(([a, b]) => b - a > 5 && b - a < 9) && sv.segs[1][0] - sv.segs[0][1] > 90, JSON.stringify(sv));
+});
+
+test("torus orient:upright = 立起来的环：SID size [直径, 直径, 管粗]、orient 带过去；俯视占地是一条细带；旋钮叫「摆法」", () => {
+  const p = mini([{ id: "gate", type: "torus", label: "星门", at: "site.C", size_m: [16, 1.5], orient: "upright", rotate_deg: 90 }, { id: "ring", type: "torus", label: "平环", at: "site.N", size_m: [16, 1.5] }]);
+  const r = compilePlan(p, { seed: 1 }), g = vol(r, "gate"), f = vol(r, "ring");
+  assert(g.orient === "upright" && g.size[0] === 16 && g.size[1] === 16 && g.size[2] === 1.5, JSON.stringify(g));
+  assert(g.position[1] + g.size[1] >= 15.9 && g.rotation_y === 90, "立着、转 90° " + g.position + " " + g.rotation_y);
+  assert(!f.orient && f.size[1] === 1.5, "平放的照旧 " + JSON.stringify(f.size));
+  const fp = boxCorners(g.position, g.size, g.rotation_y), xs = fp.map((q) => q[0]), zs = fp.map((q) => q[1]);
+  assert(Math.max(...xs) - Math.min(...xs) < 2 && Math.max(...zs) - Math.min(...zs) > 15, "转 90° 后环面朝东西（南北一条线） " + JSON.stringify(fp));
+  const kt = knobsFor("node", { id: "gate", type: "torus" }).find((k) => k.key === "orient"), kr = knobsFor("node", { id: "t", type: "terraces" }).find((k) => k.key === "orient");
+  assert(kt && kt.label === "摆法" && kt.options.map((o) => o.value).join() === "flat,upright", JSON.stringify(kt));
+  assert(kr && kr.label === "上坡朝" && !kr.options.some((o) => o.value === "upright"), JSON.stringify(kr && kr.options));
+  const kw = knobsFor("node", { id: "c", type: "cylinder", hollow: true }).find((k) => k.key === "wall_m"), kn = knobsFor("node", { id: "c", type: "cylinder" }).find((k) => k.key === "wall_m");
+  assert(kw && kw.label === "带宽" && !kn, "带宽旋钮只在空心时出现");
+});
+
+test("repeat 的 child 是 link：每个实例一条连接（radial × 4 的桥从中心殿连到四座学院；x[k] / 重复 id / center / 缺省）", () => {
+  const base = (child, extra = {}) => mini([
+    { id: "hub", type: "building", label: "中心殿", at: "site.C", size_m: [20, 16, 20], elev_m: 14 },
+    { id: "pods", type: "repeat", pattern: "radial", count: 4, radius_m: 50, at: "hub", child: { type: "island", label: "学院", size_m: [16, 6, 16], elev_m: 14 } },
+    Object.assign({ id: "spokes", type: "repeat", pattern: "radial", count: 4, radius_m: 50, at: "hub", child }, extra),
+  ], { site: { size_m: [160, 160], ground: "flat", layer_m: 3 } });
+  for (const child of [{ type: "link", style: "bridge", label: "放射栈桥", from: "hub", to: "pods", width_m: 3 }, { type: "link", style: "bridge", label: "放射栈桥", from: "center", to: "pods[k]" }]) {
+    const r = compilePlan(base(child), { seed: 1 });
+    const br = r.sid.paths.filter((q) => q.instance_of === "spokes");
+    assert(br.length === 4 && br.every((q) => q.kind === "bridge" && q.style === "bridge"), "4 座桥 " + JSON.stringify(r.sid.paths.map((q) => [q.id, q.kind, q.instance_of])) + JSON.stringify(r.warnings));
+    const ends = br.map((q) => q.points[q.points.length - 1]), pods = [0, 1, 2, 3].map((k) => vols(r, `pods[${k}]`)[0]);
+    for (let k = 0; k < 4; k++) assert(dist(ends[k], xz(pods[k].position)) < 10, `第 ${k} 座桥到第 ${k} 个学院 ` + ends[k] + " / " + pods[k].position);
+    assert(br.every((q) => dist(q.points[0], [0, 0]) < 15), "从中心殿出发");
+    assert(r.index["spokes[2]"] && r.index.spokes && r.index.spokes.sid_ids.length === 4, "索引 " + JSON.stringify(r.index.spokes));
+  }
+  // 缺省：from = 中心（at 那个东西），to = 每个实例自己的位置（辐条）
+  const r3 = compilePlan(base({ type: "link", style: "path", label: "辐条路" }), { seed: 1 });
+  const sp = r3.sid.paths.filter((q) => q.instance_of === "spokes");
+  assert(sp.length === 4 && sp.every((q) => Math.abs(dist(q.points[q.points.length - 1], [0, 0]) - 50) < 3), "辐条到半径 50 " + JSON.stringify(sp.map((q) => q.points[q.points.length - 1])));
+  // 认不出的引用去掉（按缺省连），schema 认 x[k]
+  const n = normalizePlan(base({ type: "link", style: "bridge", from: "nothing_here", to: "pods[k]" }));
+  const ch = n.plan.nodes.find((x) => x.id === "spokes").child;
+  assert(!ch.from && ch.to === "pods[k]" && n.warnings.some((w) => /nothing_here/.test(w)), JSON.stringify([ch, n.warnings]));
+});
+test("线形地形的方位锚点 = 岸：斜沟的 .SW / .NE、.left / .right 落在沟两侧；锚在 .mid 的方块顺着沟转；桥长 ≥ 沟宽；两端重合的连接进检查", () => {
+  const p = mini([
+    { id: "west_wall", type: "group", label: "西岸", at: "trench.SW", children: [{ type: "box", label: "西摊", size_m: [3, 2, 3] }] },
+    { id: "east_wall", type: "group", label: "东岸", at: "trench.NE", children: [{ type: "box", label: "东摊", size_m: [3, 2, 3] }] },
+    { id: "br", type: "link", style: "bridge", label: "铁桥", from: "west_wall", to: "east_wall", width_m: 2 },
+    { id: "br2", type: "link", style: "bridge", label: "左右桥", from: "trench.left", to: "trench.right", width_m: 2 },
+    { id: "dead", type: "link", style: "ramp", label: "原地坡", from: "trench.S", to: "trench.S", width_m: 3 },
+  ], { terrain: [
+    { op: "carve", id: "trench", label: "施工沟", from: "site.NW", to: "site.SE", width_m: 6, depth_m: 4, edge: "terraced", steps: 3 },
+    { op: "lower", id: "wet", label: "沟底积水", at: "trench.mid", shape: "rect", size_m: [6, 60], depth_m: 0.35 },
+  ] });
+  const r = compilePlan(p, { seed: 1 });
+  const tr = r.sid.terrain.features.find((f) => f.id === "trench"), L = tr.line;
+  const side = (q) => { const a = L[0], b = L[L.length - 1]; return (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]); };
+  const w = xz(vols(r, "west_wall")[0].position), e = xz(vols(r, "east_wall")[0].position);
+  assert(side(w) * side(e) < 0, "两岸在沟两侧 " + w + " / " + e);
+  assert(w[0] < 0 && w[1] > 0 && e[0] > 0 && e[1] < 0, "西岸在西南、东岸在东北 " + w + " / " + e);
+  for (const q of [w, e]) assert(distToPolyline(q, L) >= 3 + 1.5, "离沟中线 ≥ 半宽 + 1.5 m " + distToPolyline(q, L));
+  const P = (id) => r.sid.paths.find((q) => q.plan_id === id);
+  for (const id of ["br", "br2"]) { const b = P(id), len = dist(b.points[0], b.points[b.points.length - 1]); assert(len >= 6, `${id} 桥长 ${len} ≥ 沟宽 6`); assert(side(b.points[0]) * side(b.points[b.points.length - 1]) < 0, id + " 跨过沟"); }
+  const wet = r.sid.terrain.features.find((f) => f.id === "wet"), pg = wet.polygon;
+  let far = null; for (const a of pg) for (const b of pg) if (!far || dist(a, b) > dist(far[0], far[1])) far = [a, b];
+  const dv = [far[1][0] - far[0][0], far[1][1] - far[0][1]], dl = [L[L.length - 1][0] - L[0][0], L[L.length - 1][1] - L[0][1]];
+  const cos = Math.abs(dv[0] * dl[0] + dv[1] * dl[1]) / Math.hypot(...dv) / Math.hypot(...dl);
+  assert(cos > 0.95, "积水长边顺着沟 cos=" + cos.toFixed(3) + " " + JSON.stringify(pg));
+  const c = chk(r, "links_routed");
+  assert(c && !c.ok && /原地坡/.test(c.detail) && /锚点重合/.test(c.detail) && /两岸/.test(c.detail) && !/铁桥|左右桥/.test(c.detail), c && c.detail);
+});
+
+test("高架组：组的 elev_m 只抬台面，墩（柱 / 方，高 ≈ 离地高）落地撑到台面底；高拱落地撑到台面底、矮门立到台面上；墙之类戳出台面的进「支撑悬空」检查，ground:\"snap\" 落地", () => {
+  const mk = (extra = {}, more = []) => mini([{ id: "aq", type: "group", label: "高架渠", at: "site.C", elev_m: 20, children: [
+    { id: "deck", type: "box", label: "渠面", size_m: [90, 2, 10] },
+    { id: "piers", type: "repeat", pattern: "linear", count: 4, spacing_m: 26, child: { type: "box", label: "桥墩", size_m: [3, 19, 5] } },
+    Object.assign({ id: "arch1", type: "arch", label: "拱洞", offset_m: [13, 0], size_m: [14, 12, 3] }, extra),
+  ].concat(more) }]);
+  const r = compilePlan(mk({}, [{ id: "gate1", type: "gate", label: "渠上门", offset_m: [-30, 0], size_m: [6, 10, 2] }, { id: "fin", type: "wall", label: "挡板", offset_m: [30, 0], size_m: [2, 14, 2] }]), { seed: 1 });
+  const deck = vols(r, "deck")[0], piers = vols(r, "piers"), a1 = vols(r, "arch1")[0], g1 = vols(r, "gate1")[0];
+  assert(piers.length === 4, "4 个墩");
+  for (const v of piers) { assert(v.position[1] < 1, "墩落地 " + v.position); assert(Math.abs(v.position[1] + v.size[1] - deck.position[1]) < 0.05, "墩顶 = 台面底 " + (v.position[1] + v.size[1]) + " / " + deck.position[1]); }
+  assert(deck.position[1] > 19, "台面还在 20 m " + deck.position);
+  const af = r.facts.plan.autofix;
+  assert(af.some((a) => a.kind === "support" && a.id === "piers") && af.some((a) => a.id === "arch1" && /撑到台面底/.test(a.text)) && af.some((a) => a.id === "gate1" && /立到高架台面上/.test(a.text)), JSON.stringify(af));
+  assert(a1.position[1] < 1 && Math.abs(a1.position[1] + a1.size[1] - deck.position[1]) < 0.05, "高拱（≥ 0.6 × 离地高）落地、撑到台面底 " + a1.position + " / " + a1.size);
+  assert(Math.abs(g1.position[1] - (deck.position[1] + deck.size[1])) < 0.05, "矮门立在台面顶上 " + g1.position + " / " + (deck.position[1] + deck.size[1]));
+  const c = chk(r, "supports_grounded");
+  assert(c && !c.ok && /挡板/.test(c.detail) && !/拱洞|渠上门/.test(c.detail) && /支撑悬空/.test(c.detail) && c.fixes.some((f) => f.ops && f.ops[0].field === "ground" && f.ops[0].value === "snap"), c && JSON.stringify(c));
+  assert(!chk(r, "shapes_no_overlap") || !/桥墩/.test(chk(r, "shapes_no_overlap").detail || ""), "墩不和台面互撞");
+  const r2 = compilePlan(mk({ ground: "snap" }), { seed: 1 }), a2 = vols(r2, "arch1")[0];
+  assert(!chk(r2, "supports_grounded") && a2.position[1] < 1, "写了 ground:snap 的拱落地 " + a2.position);
+  // 抬高了却没有台面的组（真卡「天门花道」：elev_m 24 的仪仗组里只有三座门拱）：门拱落回地面，不悬空
+  const r3 = compilePlan(mini([{ id: "proc", type: "group", label: "仪仗", at: "site.C", elev_m: 24, children: [
+    { type: "repeat", id: "gates", pattern: "linear", axis: "z", count: 3, spacing_m: 30, child: { type: "arch", label: "门拱", size_m: [14, 16, 3] } },
+    { id: "g3", type: "arch", label: "高窄门拱", offset_m: [0, 50], size_m: [10, 22, 3] }] }]), { seed: 1 });
+  const gs = vols(r3, "gates").concat(vols(r3, "g3"));
+  assert(gs.length === 4 && gs.every((v) => v.position[1] < 1) && !chk(r3, "supports_grounded") && r3.facts.plan.autofix.filter((a) => /没有台面/.test(a.text)).length === 2, JSON.stringify([gs.map((v) => v.position), r3.facts.plan.autofix]));
+});
+
+test("环孔里的方块四角伸进环带：报伸进去的深度（不是一整圈的推距），修法是缩到内径以内", () => {
+  const p = mini([
+    { id: "ring_wall", type: "cylinder", label: "环墙", at: "site.C", size_m: [96, 22], hollow: true, wall_m: 6 },
+    { id: "floor", type: "platform", label: "院地", at: "site.C", size_m: [70, 0.5, 70] },
+  ]);
+  const r = compilePlan(p, { seed: 1 }), c = chk(r, "shapes_no_overlap");
+  assert(c && !c.ok && /伸进环带 7\.\d m/.test(c.detail) && /缩到内径/.test(c.detail), c && c.detail);
+  const f = c.fixes.find((x) => x.ops && x.ops[0].field === "size_m");
+  assert(f && f.ops[0].id === "floor" && Math.hypot(f.ops[0].value[0], f.ops[0].value[2]) / 2 < 42, JSON.stringify(c.fixes));
+});
 run();
 </script>

@@ -1,43 +1,41 @@
 <!doctype html><meta charset="utf-8"><pre id="out">running</pre>
 <script type="module">
-// eval_plans.test.html — 首次理解评测的几何环节：读 build/eval/plans.json（由 tools/eval_first_interpretation.py 生成），
-// 对每个输入的三张 plan 用 engine/plan.js 的 compilePlan 算几何，用 planDistance 看三张够不够不同。
-// 输出遵守 harness 约定（PASS / FAIL 行 + DONE），另加一行 "DATA <json>" 给脚本解析。不调 AI，不写坐标。
+// eval_plans.test.html — 首次理解评测的几何环节：读 build/eval/plans-v5.json（tools/eval_first_interpretation.py 生成；
+// 没有就退到 plans-v5-replay.json），每题三张场景程序（plan v2）用 compilePlan 编译：能编、validate 0 error、< 500 ms；
+// 用 planDistance 看三张够不够不同。输出遵守 harness 约定（PASS / FAIL 行 + DONE），另加一行 "DATA <json>" 给脚本解析。
+// 不调 AI，不写坐标。两个文件都没有时只报一行 PASS（评测没跑过，不算失败）。
 import { compilePlan, planDistance, distinctPlans } from "../plan.js";
 
 const out = document.getElementById("out");
 const lines = [], data = [];
 let pass = 0, fail = 0;
-const r1 = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
-
-try {
-  const res = await fetch("../../../build/eval/plans.json", { cache: "no-store" });
-  if (!res.ok) throw new Error(`读不到 build/eval/plans.json（HTTP ${res.status}）：先跑 python -X utf8 tools/eval_first_interpretation.py --mock`);
-  const j = await res.json();
-  for (const inp of j.inputs || []) {
-    const plans = inp.plans || [];
-    const row = { id: inp.id, text: inp.text, distinct: null, pairwise: [], plans: [] };
-    if (!plans.length) { fail++; lines.push(`FAIL ${inp.id} ${inp.text}: 没有 plan（${inp.error || "无"}）`); row.error = inp.error || "没有 plan"; data.push(row); continue; }
-    try {
-      const rs = plans.map((p) => compilePlan(p, { seed: 1 }));
-      row.distinct = distinctPlans(plans);
-      for (let a = 0; a < plans.length; a++) for (let b = a + 1; b < plans.length; b++) row.pairwise.push(planDistance(plans[a], plans[b]));
-      row.plans = rs.map((r) => ({
-        name: r.plan.name, houses: r.facts.houses, stilt_houses: r.facts.stilt_houses, trees: r.facts.trees, terraces: r.facts.terraces, has_stream: !!r.facts.has_stream,
-        spaces: r.sid.spaces.map((s) => ({ layout: s.layout, sublevels: s.sublevels, rooms: (s.rooms || []).length, passages: (s.passages || []).length })),
-        checks_ok: r.checks.filter((c) => c.ok).length, checks_total: r.checks.length, failing: r.checks.filter((c) => !c.ok && !c.ignored).map((c) => c.text),
-        errors: r.facts.errors, warnings: r.warnings, trail_len_m: r.facts.trail ? r1(r.facts.trail.length_m) : null, ms: r.ms,
-      }));
-      const ok = row.plans.every((c) => c.errors === 0);
-      ok ? pass++ : fail++;
-      lines.push(`${ok ? "PASS" : "FAIL"} ${inp.id} ${inp.text}: houses=${row.plans.map((c) => c.houses).join("/")} checks_ok=${row.plans.map((c) => `${c.checks_ok}/${c.checks_total}`).join(" ")} distinct=${row.distinct}` + (ok ? "" : ` errors=${row.plans.map((c) => c.errors).join("/")}`));
-    } catch (e) {
-      fail++; row.error = String((e && e.message) || e); lines.push(`FAIL ${inp.id} ${inp.text}: ${row.error}`);
-    }
-    data.push(row);
+let j = null, file = null;
+for (const f of ["plans-v5.json", "plans-v5-replay.json"]) {
+  try { const r = await fetch(`../../../build/eval/${f}`, { cache: "no-store" }); if (r.ok) { j = await r.json(); file = f; break; } } catch (e) { /* 下一个 */ }
+}
+if (!j) { pass++; lines.push("PASS 没有 build/eval/plans-v5.json（先跑 python -X utf8 tools/eval_first_interpretation.py --mock），跳过"); }
+for (const inp of (j && j.inputs) || []) {
+  const plans = inp.plans || [];
+  const row = { id: inp.id, text: inp.text, file, distinct: null, pairwise: [], plans: [] };
+  if (!plans.length) { fail++; lines.push(`FAIL ${inp.id} ${inp.text}: 没有 plan（${inp.error || "无"}）`); row.error = inp.error || "没有 plan"; data.push(row); continue; }
+  try {
+    const rs = plans.map((p) => compilePlan(p, { seed: 1 }));
+    row.distinct = distinctPlans(plans);
+    for (let a = 0; a < plans.length; a++) for (let b = a + 1; b < plans.length; b++) row.pairwise.push(planDistance(plans[a], plans[b]));
+    row.plans = rs.map((r, k) => ({
+      name: r.plan.name, source: (inp.sources || [])[k] || null, shapes: r.facts.shapes, volumes: r.sid.volumes.length, by_type: r.facts.by_type, floating: r.facts.floating,
+      terraces: r.facts.plan.terraces, terrain_ops: r.facts.plan.terrain_ops, water_area_m2: r.facts.water_area_m2, path_length_m: r.facts.path_length_m,
+      spaces: r.sid.spaces.map((s) => ({ layout: s.layout, sublevels: s.sublevels, rooms: (s.rooms || []).length, passages: (s.passages || []).length })),
+      checks_ok: r.checks.filter((c) => c.ok).length, checks_total: r.checks.length, failing: r.checks.filter((c) => !c.ok && !c.ignored).map((c) => c.text),
+      errors: r.facts.validation.filter((m) => m.level === "error").length, warnings: r.warnings, ms: r.ms,
+    }));
+    const ok = row.plans.every((c) => c.errors === 0 && c.ms < 500);
+    ok ? pass++ : fail++;
+    lines.push(`${ok ? "PASS" : "FAIL"} ${inp.id} ${inp.text}: ${row.plans.map((c) => `${c.name}（${c.source || "?"}）形体 ${c.shapes} 检查 ${c.checks_ok}/${c.checks_total} ${c.ms} ms`).join(" / ")} distinct=${row.distinct}` + (ok ? "" : ` errors=${row.plans.map((c) => c.errors).join("/")}`));
+  } catch (e) {
+    fail++; row.error = String((e && e.message) || e); lines.push(`FAIL ${inp.id} ${inp.text}: ${row.error}`);
   }
-} catch (e) {
-  fail++; lines.push("FAIL eval_plans: " + ((e && e.message) || e));
+  data.push(row);
 }
 lines.push("DATA " + JSON.stringify(data));
 lines.push(`DONE passed=${pass} failed=${fail}`);

@@ -1,0 +1,29 @@
+{
+  "name": "云岭寨",
+  "concept": "山南坡上一级级台地，吊脚民居顺着台地铺开，最高一级立着鼓楼，石阶从寨口直上，西坡是竹林，山脚是稻田",
+  "key_structures": ["坡上台地", "台地民居", "鼓楼", "石阶", "竹林", "稻田"],
+  "site": { "size_m": [180, 180], "ground": "mountain", "relief_m": 28, "layer_m": 3 },
+  "nodes": [
+    { "id": "steps", "type": "terraces", "label": "坡上台地", "form": "slope", "at": "site.C", "offset_m": [0, 30], "size_m": [90, 100], "steps": 5, "step_h_m": 4.5, "orient": "N" },
+    { "id": "village", "type": "scatter_houses", "label": "台地民居", "area": "steps", "density": 1,
+      "child": { "type": "building", "label": "吊脚民居", "size_m": [6, 4.5, 5], "roof": "gable" } },
+    { "id": "drum_tower", "type": "tower", "label": "鼓楼", "role": "landmark", "at": "steps.top", "shape": "prism", "sides": 8, "size_m": [8, 18], "roof": "spire", "floors": 7 },
+    { "id": "old_tree", "type": "tree", "label": "古树", "at": "drum_tower.E", "size_m": [8, 14] },
+    { "id": "stairway", "type": "link", "style": "stairs", "label": "寨口石阶", "from": "spawn", "to": "drum_tower", "width_m": 2.5 },
+    { "id": "bamboo", "type": "grove", "label": "竹林", "at": "site.W", "offset_m": [10, 0], "size_m": [40, 80], "density": 1.2 },
+    { "id": "paddies", "type": "field", "label": "稻田", "at": "site.SE", "size_m": [44, 34] }
+  ],
+  "spawn": { "at": "site.S", "look_at": "drum_tower" },
+  "relations": [
+    { "type": "visible_from", "a": "drum_tower", "b": "spawn" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#4A4A4A", "note": "青瓦" },
+    { "role": "wall", "hex": "#B88E5E", "note": "杉木" },
+    { "role": "stone", "hex": "#9A9890", "note": "石阶" },
+    { "role": "foliage", "hex": "#4F6B3A", "note": "竹" },
+    { "role": "mist", "hex": "#DDE6F0", "note": "山雾" }
+  ],
+  "lighting": { "time_of_day": "dusk" },
+  "mood": ["宁静", "烟火气"]
+}

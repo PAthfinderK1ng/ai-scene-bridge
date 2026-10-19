@@ -1,37 +1,35 @@
 {
-  "name": "矿工村",
-  "one_liner": "坡上是矿工村，井架下面是两层的矿洞迷宫，岔路很多，最深处有终点室。",
-  "site": { "size_m": 140, "relief_layers": 5, "layer_m": 3 },
+  "name": "黑岩矿场",
+  "concept": "丘陵里削出一块矿场，井架下面是两层的矿洞迷宫，岔路很多；工棚排在井架南边，西边平地上住着矿工",
+  "key_structures": ["井架", "地下迷宫", "工棚", "矿工住处", "矿渣堆"],
+  "site": { "size_m": [160, 160], "ground": "hills", "relief_m": 10, "layer_m": 3 },
   "terrain": [
-    { "id": "hill", "type": "hill", "label": "矿山", "at": { "of": "site", "dir": "N", "dist": 0.4 }, "size_m": [130, 80], "top_layer": 5 },
-    { "id": "steps", "type": "slope_terraces", "label": "坡上台地", "at": { "of": "site", "dir": "C", "dist": 0 }, "size_m": [80, 96], "orient": "N", "steps": 4, "from_layer": 1 }
+    { "id": "yard", "op": "flatten", "label": "矿场", "at": "site.C", "shape": "rect", "size_m": [64, 56], "edge_m": 8 },
+    { "id": "camp_flat", "op": "flatten", "label": "矿工住处", "at": "site.W", "offset_m": [8, 0], "shape": "rect", "size_m": [40, 56], "edge_m": 8 }
   ],
-  "buildings": [
-    { "id": "miner_house", "label": "矿工房", "form": "house", "size_m": [6, 4, 5], "floors": 1, "roof": "gable" }
+  "nodes": [
+    { "id": "headframe", "type": "tower", "label": "井架", "role": "landmark", "at": "yard", "offset_m": [0, -8], "shape": "box", "size_m": [9, 18, 9], "roof": "flat", "hollow": true, "color": "iron" },
+    { "id": "sheds", "type": "repeat", "label": "工棚", "at": "headframe.S", "offset_m": [0, 6], "pattern": "linear", "count": 3, "spacing_m": 12,
+      "child": { "id": "shed", "type": "building", "label": "工棚", "size_m": [9, 5, 7], "roof": "gable" } },
+    { "id": "mine", "type": "space", "label": "矿洞迷宫", "stratum": "underground", "under": "headframe", "depth_m": 10, "layout": "maze", "size_m": 44, "branching": "high", "sublevels": 2, "corridor_m": 2.5, "connect": { "via": "shaft", "from": "headframe" } },
+    { "id": "camp", "type": "scatter_houses", "label": "矿工房", "area": "camp_flat", "density": 0.9,
+      "child": { "type": "building", "label": "矿工房", "size_m": [6, 4, 5], "roof": "gable" } },
+    { "id": "spoil", "type": "repeat", "label": "矿渣堆", "pattern": "scatter", "count": 6, "area": "site", "seed_hint": "clustered",
+      "child": { "id": "heap", "type": "cone", "label": "矿渣堆", "size_m": [9, 4], "color": "stone" } },
+    { "id": "rail", "type": "link", "style": "path", "label": "矿道口路", "from": "spawn", "to": "headframe", "width_m": 3 }
   ],
-  "zones": [
-    { "id": "z_village", "label": "矿工村", "use": "housing", "on": "steps", "levels": "all", "building": "miner_house", "density": 1 }
-  ],
-  "landmarks": [
-    { "id": "headframe", "label": "井架", "form": "tower", "size_m": [6, 13, 6], "floors": 1, "roof": "flat", "place": { "rel": "edge_of", "target": "steps", "side": "E" } }
-  ],
-  "spawn": { "place": { "rel": "edge_of", "target": "site", "side": "S" }, "look_at": "headframe" },
-  "paths": [
-    { "id": "main", "label": "矿道口路", "from": "spawn", "to": "headframe", "style": "winding", "width_m": 2.5 }
-  ],
-  "spaces": [
-    { "id": "mine", "stratum": "underground", "label": "矿洞迷宫", "under": "steps", "depth_layers": 3, "layout": "maze", "size_m": 44, "branching": "high", "sublevels": 2, "corridor_m": 2.5, "connect": { "via": "shaft", "from": "headframe" } }
-  ],
+  "spawn": { "at": "site.S", "look_at": "headframe" },
   "relations": [
     { "type": "visible_from", "a": "headframe", "b": "spawn" },
-    { "type": "below", "a": "mine", "b": "z_village" }
+    { "type": "below", "a": "mine", "b": "headframe" }
   ],
   "palette": [
     { "role": "roof", "hex": "#55504A", "note": "铁皮顶" },
     { "role": "wall", "hex": "#B59F82", "note": "土墙" },
     { "role": "stone", "hex": "#6E6A63", "note": "矿渣" },
     { "role": "foliage", "hex": "#56663F", "note": "灌木" },
-    { "role": "mist", "hex": "#D8D4CC", "note": "灰尘" }
+    { "role": "mist", "hex": "#D8D4CC", "note": "灰尘" },
+    { "role": "iron", "hex": "#3F3B38", "note": "钢架" }
   ],
   "lighting": { "time_of_day": "overcast" },
   "mood": ["粗粝", "幽深"]

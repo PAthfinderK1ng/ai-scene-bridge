@@ -1,8 +1,10 @@
 // views/eye.js — 「第一眼」：从出生点 1.7 m 眼高朝地标看过去的示意透视。
 // 不是渲染器：按方位角分列扫地形，得到远 / 中 / 近三层山脊轮廓；房子和地标按方位 / 仰角投成矩形。
 // 目的是把最关键的一眼——玩家进场看到什么——先在沟通阶段摆出来。v4：所有地标都投、都标名字（主地标加粗），
-// 空中空间的平台 / 栈道按各自高度当板画；每个体块带 data-type / data-plan-id。纯函数，不调 AI。
-import { svgel, landmarkOf, spawnOf, paletteOf, mainTrailOf, EYE_FOV_DEG } from "./map.js";
+// 空中空间的平台 / 栈道按各自高度当板画；每个体块带 data-type / data-plan-id。v5：按形体画轮廓（锥 / 尖顶三角、穹顶半圆、拱、环、浮岛倒三角），
+// 悬空的按真实高度。纯函数，不调 AI。
+import { svgel, landmarkOf, spawnOf, spawnY, paletteOf, mainTrailOf, EYE_FOV_DEG, shapeOf, volDims, roofOf, volumeBase, footprintPolygon, volToWorld, volumeColor, volumeType, ringOf } from "./map.js";
+import { volumeOutline } from "./profile.js";
 
 const FOV = EYE_FOV_DEG, VFOV_UP = 28, VFOV_DOWN = 16, COLS = 112, MAXR = 180, EYE_M = 1.7;
 const deg = (r) => (r * 180) / Math.PI;
@@ -23,7 +25,7 @@ export function renderEye(ctx) {
   if (!sp) { s.append(svgel("text", { x: 10, y: 20, "font-size": 8 }, "还没有出生点")); wrap.append(s); return { node: wrap, facts: {} }; }
 
   const ex = sp.position[0], ez = sp.position[2];
-  const eyeH = T.heightAt(ex, ez) + EYE_M;
+  const eyeH = spawnY(sp, T) + EYE_M;
   // 朝向：有地标就看地标，否则按 marker 的 rotation_y
   let a0;
   if (lm) a0 = Math.atan2(lm.position[2] - ez, lm.position[0] - ex);
@@ -116,18 +118,48 @@ export function renderEye(ctx) {
   }
 
   // 体块：按距离远→近。空中空间（平台 / 栈道 / 浮岛 / 天桥）当一块板画（板面 floor_y，板厚 1 m）；地下空间看不见，不画
-  const vols = (sid.volumes || []).filter((v) => v.position && v.size).map((v) => {
-    const hw = v.size[0] / 2, hd = v.size[2] / 2, th = ((v.rotation_y || 0) * Math.PI) / 180;
-    const cs = Math.cos(th), sn = Math.sin(th);
-    const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([lx, lz]) => [v.position[0] + lx * cs + lz * sn, v.position[2] - lx * sn + lz * cs]);
-    return { v, corners, y0: v.position[1], y1: v.position[1] + v.size[1], dist: Math.hypot(v.position[0] - ex, v.position[2] - ez) };
+  // 环带（空心圆柱）：每条视线和带子交出一两段（近的一段 / 远的一段，孔里是空的），各按真实距离算高低，分两层画（远的先画）
+  const ringCols = (v, RG, y0, yw, seg) => {
+    const c = [v.position[0] - ex, v.position[2] - ez], R = (RG.rx + RG.rz) / 2, ri = (RG.ix + RG.iz) / 2, N = 64, runs = [];
+    const hit = (u, r) => { const b = u[0] * c[0] + u[1] * c[1], d = b * b - (c[0] * c[0] + c[1] * c[1] - r * r); return d < 0 ? null : [b - Math.sqrt(d), b + Math.sqrt(d)]; };
+    const ang = (y, t) => deg(Math.atan2(y - eyeH, t));
+    let cur = null;
+    for (let k = 0; k <= N; k++) {
+      const az = a0 + ((k / N) * FOV - FOV / 2) * (Math.PI / 180), u = [Math.cos(az), Math.sin(az)], O = hit(u, R), I = O && hit(u, ri);
+      const iv = (O ? (I ? [[O[0], I[0]], [I[1], O[1]]] : [O]) : []).filter((q) => q[1] > 0.5).map((q) => [Math.max(0.5, q[0]), q[1]]);
+      const q = iv[seg];
+      if (!q) { cur = null; continue; }
+      const x = fmt1((k / N) * Wv), top = Math.max(-20, sy(Math.min(VFOV_UP, Math.max(ang(yw, q[0]), ang(yw, q[1]))))), gy = (t) => Math.max(y0, T.inside(ex + u[0] * t, ez + u[1] * t) ? T.heightAt(ex + u[0] * t, ez + u[1] * t) : y0), bot = Math.min(Hv, sy(Math.max(-VFOV_DOWN, Math.min(ang(gy(q[0]), q[0]), ang(gy(q[1]), q[1]))))); // 埋在地里的部分（基座）看不见
+      if (!cur) runs.push((cur = []));
+      cur.push([x, fmt1(top), fmt1(bot)]);
+    }
+    const rr = runs.filter((r) => r.length > 1);
+    return { d: rr.map((r) => `M${r.map((p) => `${p[0]} ${p[1]}`).join("L")}L${r.slice().reverse().map((p) => `${p[0]} ${p[2]}`).join("L")}Z`).join(""), top: rr.map((r) => `M${r.map((p) => `${p[0]} ${p[1]}`).join("L")}`).join(""), ribs: rr.flatMap((r) => r.filter((_, i) => i % 3 === 1).map((p) => `M${p[0]} ${p[1]}V${p[2]}`)).join("") };
+  };
+  const vols = (sid.volumes || []).filter((v) => v.position && v.size).flatMap((v) => {
+    const y0 = volumeBase(v, T), yw = y0 + volDims(v)[1], r = roofOf(v), dc = Math.hypot(v.position[0] - ex, v.position[2] - ez), RG = ringOf(v);
+    const o = { v, corners: footprintPolygon(v), y0, yw, y1: yw + (r ? r.h : 0), roof: r, dist: dc };
+    if (!RG || RG.torus || RG.ix < 0.5) return [o];
+    const R = (RG.rx + RG.rz) / 2, ri = (RG.ix + RG.iz) / 2;
+    return dc < ri ? [Object.assign({}, o, { ring: RG, seg: 0, dist: Math.max(1.5, ri - dc) })] // 站在孔里：只看得见四周的内壁
+      : [Object.assign({}, o, { ring: RG, seg: 1, dist: dc + ri * 0.7 }), Object.assign({}, o, { ring: RG, seg: 0, dist: Math.max(1.5, dc - R * 0.7) })];
   });
   for (const sk of skySpaces(sid)) vols.push(Object.assign(sk, { dist: centroidDist(sk.corners, ex, ez) }));
   vols.sort((a, b) => b.dist - a.dist);
   let landmarkVisible = null, landmarkScreen = null, skyDrawn = 0;
   const lmFacts = [], lmLabels = [], sel = ctx.selected || null;
   const isSel = (v) => !!sel && ((sel.sid_id && sel.sid_id === v.id) || (sel.plan_id && (sel.plan_id === v.plan_id || sel.plan_id === v.zone_id)));
-  for (const { v, corners, y0, y1, dist } of vols.filter((o) => o.dist > 1 && o.dist < MAXR)) {
+  for (const { v, corners, y0, yw, y1, roof, dist, ring, seg } of vols.filter((o) => o.dist > 1 && o.dist < MAXR)) {
+    if (ring) {
+      const { d, top, ribs } = ringCols(v, ring, y0, yw, seg), hot = isSel(v), c0 = volumeColor(v, pal, "side");
+      const base = !seg && Math.max(...hex2(c0).map((x, i) => Math.abs(x - hex2(mix(sky[0], pal.mist, 0.5))[i]))) < 70 ? mix(c0, "#2b2722", 0.3) : c0; // 灰墙和灰天分不开：近段压暗一点
+      const fog = seg ? Math.min(1, dist / MAXR) * 0.6 + 0.12 : Math.min(0.25, Math.min(1, dist / MAXR) * 0.6); // 近段（眼前的墙）少混雾：不然和天空一个灰
+      if (d) s.append(svgel("path", Object.assign({ d, fill: mix(base, pal.mist, fog), "data-type": volumeType(v), "data-sid-id": v.id, "data-plan-id": v.plan_id || null, "data-shape": "cylinder", "data-ring-seg": seg, "data-selected": hot ? 1 : null, class: "vol-body ring-band" },
+        hot ? { stroke: "#f08c00", "stroke-width": 1.4 } : { stroke: "rgba(0,0,0,.35)", "stroke-width": 0.3 })));
+      if (top && !seg) s.append(svgel("path", { d: top, fill: "none", stroke: mix(base, "#000000", 0.45), "stroke-width": 1.4, class: "ring-top", "pointer-events": "none" })); // 墙的上沿：和天空分开
+      if (ribs && !seg) s.append(svgel("path", { d: ribs, fill: "none", stroke: "rgba(0,0,0,.16)", "stroke-width": 0.6, class: "ring-ribs", "pointer-events": "none" })); // 竖向分格：一眼看出是一面弯墙，不是天
+      continue;
+    }
     const azs = corners.map(([x, z]) => norm(Math.atan2(z - ez, x - ex) - a0));
     const azMin = Math.min(...azs), azMax = Math.max(...azs);
     if (azMax - azMin > Math.PI) continue; // 跨越正后方
@@ -151,13 +183,20 @@ export function renderEye(ctx) {
     const yt = sy(Math.min(et, VFOV_UP)), yb = Math.min(Hv, sy(Math.max(eb, -VFOV_DOWN)));
     if (x1 - x0 < 0.6 || yb - yt < 0.6) continue;
     const far = Math.min(1, dist / MAXR), hot = isSel(v);
-    const ids = { "data-type": v.kind === "sky_space" ? "space" : isLm ? "landmark" : v.kind === "prop" ? "tree" : "house", "data-sid-id": v.id, "data-plan-id": v.plan_id || null, "data-selected": hot ? 1 : null };
+    const legacyTree = v.kind === "prop" && !v.plan_id && !isLm;
+    const ids = { "data-type": v.kind === "sky_space" ? "space" : legacyTree ? "tree" : volumeType(v), "data-sid-id": v.id, "data-plan-id": v.plan_id || null, "data-selected": hot ? 1 : null, "data-shape": v.kind === "sky_space" ? null : shapeOf(v) };
     const edge = (w, c) => (hot ? { stroke: "#f08c00", "stroke-width": 1.4 } : { stroke: c, "stroke-width": w });
     if (v.kind === "sky_space") { skyDrawn++; s.append(svgel("rect", Object.assign({ class: "sky-space", "data-id": v.id, x: x0, y: yt, width: x1 - x0, height: Math.max(1, yb - yt), fill: mix("#8a7f6e", pal.mist, far * 0.6), opacity: blocked ? 0.35 : 0.95 }, ids, edge(0.3, "rgba(0,0,0,.4)")))); continue; }
-    if (v.kind === "prop" && !isLm) { s.append(svgel("ellipse", Object.assign({ cx: (x0 + x1) / 2, cy: (yt + yb) / 2, rx: (x1 - x0) / 2, ry: (yb - yt) / 2, fill: mix(pal.foliage, pal.mist, far * 0.7), opacity: 0.9 }, ids))); continue; }
-    const wall = isLm ? pal.roof : pal.wall, roofH = Math.min((yb - yt) * 0.35, 6), g = svgel("g", ids);
-    g.append(svgel("rect", Object.assign({ x: x0, y: yt + roofH, width: x1 - x0, height: Math.max(0.5, yb - yt - roofH), fill: mix(wall, pal.mist, far * 0.6), opacity: blocked ? 0.35 : 1, "stroke-dasharray": blocked ? "2 2" : null }, edge(isLm ? 1 : 0.3, isLm ? "#4a1a10" : "rgba(0,0,0,.35)"))));
-    g.append(svgel("path", { d: `M${x0 - 0.5} ${yt + roofH} L${(x0 + x1) / 2} ${yt} L${x1 + 0.5} ${yt + roofH} Z`, fill: mix(isLm ? "#b8452b" : pal.roof, pal.mist, far * 0.6), opacity: blocked ? 0.35 : 1 }));
+    if (legacyTree) { s.append(svgel("ellipse", Object.assign({ cx: (x0 + x1) / 2, cy: (yt + yb) / 2, rx: (x1 - x0) / 2, ry: (yb - yt) / 2, fill: mix(pal.foliage, pal.mist, far * 0.7), opacity: 0.9 }, ids))); continue; }
+    // 形体轮廓：竖向按真实仰角（米 → 屏幕 y），横向按方位；wedge 的高边朝它在画面上真实的一侧
+    const syM = (h) => Math.max(-20, Math.min(Hv + 20, sy(deg(Math.atan2(h - eyeH, dist))))), sh = shapeOf(v);
+    let hiRight = true;
+    if (sh === "wedge") { const d = volDims(v)[2], hi = volToWorld(v, 0, -d / 2), lo = volToWorld(v, 0, d / 2); hiRight = norm(Math.atan2(hi[1] - ez, hi[0] - ex) - a0) >= norm(Math.atan2(lo[1] - ez, lo[0] - ex) - a0); }
+    const o = volumeOutline({ sh, kind: v.kind, v, roof, hiRight }, x0, x1, syM, y0, yw, roof ? roof.h : 0);
+    const tree = v.kind === "tree", wall = isLm ? pal.roof : v.kind === "building" || v.kind === "tower" ? pal.wall : volumeColor(v, pal, "side"), g = svgel("g", ids);
+    g.append(svgel("path", Object.assign({ d: o.body, "fill-rule": "evenodd", fill: mix(tree ? pal.foliage : wall, pal.mist, far * 0.6), opacity: blocked ? 0.35 : 1, "stroke-dasharray": blocked || v.elev > 0.5 ? "2 2" : null, class: "vol-body" }, edge(isLm ? 1 : 0.3, isLm ? "#4a1a10" : "rgba(0,0,0,.35)"))));
+    if (o.roof) g.append(svgel("path", { d: o.roof, fill: mix(isLm ? "#b8452b" : pal.roof, pal.mist, far * 0.6), opacity: blocked ? 0.35 : 1, class: "vol-roof" }));
+    if (o.extra) g.append(svgel("path", { d: o.extra, fill: "none", stroke: mix(pal.foliage, pal.mist, far * 0.5), "stroke-width": 1.4 }));
     s.append(g);
     if (isLm) lmLabels.push({ x: (x0 + x1) / 2, y: Math.max(8, yt - 3), text: `${v.label || "地标"}${blocked ? "（被挡住）" : ""}`, focus: !!isFocus, id: v.id, plan_id: v.plan_id });
   }

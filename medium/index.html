@@ -15,8 +15,8 @@
     <div class="brand">场景对话</div>
     <ol id="steps">
       <li data-step="1" title="一句话说你要什么">说</li>
-      <li data-step="2" title="三张构成不同的方案挑一张">选</li>
-      <li data-step="3" title="在图上拖、画、圈，右边的构成清单里改">改</li>
+      <li data-step="2" title="三个空间组织不同的概念挑一个">选</li>
+      <li data-step="3" title="在图上拖、画、圈，右边的场景树里改">改</li>
       <li data-step="4" title="导出给引擎，搭完读回对比">出</li>
     </ol>
     <div class="spacer"></div>
@@ -27,7 +27,7 @@
     <section id="chat">
       <div id="log" aria-live="polite"></div>
       <form id="composer">
-        <input id="input" type="text" placeholder="说一句，比如「半山环台寨，地下有个两层的矿洞迷宫」" autocomplete="off" />
+        <input id="input" type="text" placeholder="说一句，比如「我要生成魔法学院」「海盗港口，地下有溶洞」" autocomplete="off" />
         <button type="submit" id="send" title="发送会调用一次 AI"><span id="send-label">发送</span><span class="ai-tag">调 AI</span></button>
       </form>
     </section>
@@ -39,15 +39,15 @@
         <button type="button" class="tab" data-view="eye" title="从入口看的第一眼 (3)">第一眼</button>
         <button type="button" class="tab" data-view="three" title="3D 预览 (4)">3D</button>
         <div class="spacer"></div>
-        <button type="button" id="btn-variants" class="ubtn" disabled title="锁住的项不动，按一条结构轴（地形组合 / 空间布局 / 地标关系）再出三张">换一批<span class="ai-tag">调 AI</span></button>
+        <button type="button" id="btn-variants" class="ubtn" disabled title="再出三个新的空间概念；场景树里锁住的项三张都保留">换一批<span class="ai-tag">调 AI</span></button>
         <button type="button" id="btn-export" class="ubtn primary" disabled title="导出引擎包，随时可点">出 →</button>
       </div>
       <div id="toolbar" class="disabled">
-        <button type="button" data-tool="move" class="tool active" title="拖地标、入口、地形块、空间、房子、主路折点、连接点、剖切线；点一下看它是什么 (V)">移动</button>
-        <button type="button" data-tool="path" class="tool" title="画一笔就是主路；在地下 / 天上层画 = 给空间加通道 (P)">画路</button>
-        <button type="button" data-tool="region" class="tool" title="圈一块地；在地下 / 天上层圈 = 新建空间 (R)">圈区域</button>
+        <button type="button" data-tool="move" class="tool active" title="拖形体 / 组 / 地形块 / 空间 / 出生点 = 改它的偏移；按住 Alt 拖重复里的一个 = 只挪这一个；点一下看它是什么 (V)">移动</button>
+        <button type="button" data-tool="path" class="tool" title="从一个东西画到另一个 = 加一条连接（路 / 桥 / 台阶，样式在场景树里改） (P)">画路</button>
+        <button type="button" data-tool="region" class="tool" title="圈一块 = 加树林 / 田 / 撒房子 / 水池 / 平台；在地下 / 天上层圈 = 新建空间 (R)">圈区域</button>
         <button type="button" data-tool="section" class="tool" title="在图上拉一条剖切线 (S)">剖切</button>
-        <button type="button" data-tool="erase" class="tool" title="点掉房子、你圈的地、你画的路或通道、一个构成项 (E)">擦除</button>
+        <button type="button" data-tool="erase" class="tool" title="点掉一个节点 / 地形块 / 连接；点重复里的一个 = 只去掉这一个 (E)">擦除</button>
         <span class="sep"></span>
         <button type="button" id="btn-undo" class="tool" disabled title="撤销 (Ctrl+Z)">↶ 撤销</button>
         <button type="button" id="btn-redo" class="tool" disabled title="重做 (Ctrl+Shift+Z / Ctrl+Y)">↷ 重做</button>
@@ -73,17 +73,17 @@
         <div id="note" class="note-bar" hidden></div>
       </div>
       <aside id="side" class="empty">
-        <div id="side-empty" class="hint">挑一张方案后，这里是这次生成出来的构成清单：AI 生成了什么就列什么，每项都有自己的旋钮。</div>
+        <div id="side-empty" class="hint">挑一个概念后，这里是它的场景程序：地形操作、节点树（组 → 子节点，重复 →「× 6 · 环形」），每项都有自己的旋钮。</div>
         <section class="panel" id="p-sel" hidden>
           <h3>选中</h3>
           <div id="selection"></div>
         </section>
         <section class="panel" id="p-comp">
-          <h3 title="AI 生成的构成图：点一项看旋钮、图上高亮它生成的东西。全部本地改，可撤销。">构成清单</h3>
+          <h3 title="AI 写的场景程序：点一项看旋钮、图上高亮它生成的整组东西；点图上的东西 = 这里展开对应的项。全部本地改，可撤销。">构成 · 场景树</h3>
           <div id="comp"></div>
         </section>
         <section class="panel" id="p-checks">
-          <h3 title="程序按几何算出来的 ✓ / ✗，每条带原因和修法">关系检查 <span class="count"></span></h3>
+          <h3 title="引擎按几何算出来的 ✓ / ✗（看得见、走得到、不压、不悬空、关系），每条带原因和修法">检查 <span class="count"></span></h3>
           <ul id="checks"></ul>
         </section>
       </aside>
@@ -95,7 +95,7 @@
   <dialog id="settings">
     <form method="dialog" id="settings-form">
       <h3>AI 设置</h3>
-      <p class="hint">密钥只存在本机 <code>%LOCALAPPDATA%\ai-scene-bridge\config.json</code>，由本地 Python 服务代为调用，网页拿不到明文。没有密钥时用模拟 AI，不花钱，流程照样能走。只有说话、重出、换一批会调 AI。</p>
+      <p class="hint">密钥只存在本机 <code>%LOCALAPPDATA%\ai-scene-bridge\config.json</code>，由本地 Python 服务代为调用，网页拿不到明文。没有密钥时用模拟 AI，不花钱，流程照样能走。只有说话、重出、换一批会调 AI（说一句 = 构思 1 次 + 展开 3 次）。</p>
       <div id="s-prov" class="row" role="group" aria-label="服务商"><span>服务商</span><button type="button" class="ubtn" data-p="deepseek" aria-pressed="true">DeepSeek</button><button type="button" class="ubtn" data-p="anthropic" aria-pressed="false">Claude</button></div>
       <label class="row"><span id="s-key-label">DeepSeek API Key</span> <input id="s-key" type="password" placeholder="sk-…" autocomplete="off" /><button type="button" id="s-show" class="ubtn" title="只切换输入框的显示方式">显示</button></label>
       <div id="s-key-hint" class="hint"></div>

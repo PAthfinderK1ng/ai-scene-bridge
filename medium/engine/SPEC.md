@@ -27,6 +27,12 @@
 - hill：height × max(0, 1 − (r/R)²)。pit 同形取负。
 用 max 叠加，上层台地多边形落在下层之内就自然形成叠落。
 
+**雕刻模式**（plan v2：`sid.terrain.sculpt = true`）：特征按顺序作用在高度上，`h = base`，每个带 `op` 的特征 `h = blend(h, 遮罩权重 w)`：
+遮罩 `mask` = poly（polygon，可带 hole）/ line（折线 + half 半宽）/ all；边 `edge` = slope（smoothstep 坡裙 skirt）/ cliff（线性窄坡）/ terraced（坡裙按 steps 级量化）/ round（只在多边形里面渐变，圆丘 / 湖岸）。
+合成 `blend` = add（+ amount 或 wave 起伏 × w）/ set（→ target 或 ramp 线性目标）/ max（抬到）/ min（压到）/ quant（按 step / base 台阶化）。
+不带 op 的旧特征照旧（override 平顶落在多边形里就是它的高度，外面取较大者）。`register: top | quant` 的特征在建好网格后把平顶 / 各级按格点取凸包登记进 `T.terraces`（id = 特征 id 或 `<id>_<级>`，`sculpt: true`）。
+导出 `sculptHeight(feats, base, x, z)`（给编译时求锚点处的当前高度）、`maskWeight`、`applySculpt`、`valueNoise`。
+
 ### 接口
 ```js
 import { buildTerrain, MIN_BAND, MIN_BAND_HARD } from "./terrain.js";
@@ -171,6 +177,7 @@ snapshot(sid) / restore(json)
 - Card（applyCard / applyPatch / normalizeCard）随 v4 删除：场景由 plan 编译（§13）。
 - **两种模式**：`meta.plan_mode`（plan 编译出来的 SID）下 resolve 不碰路、地标、出生点（它们由编译决定），只清 / 重放 generated 的房子与树、自动支路，检查里没有 `landmark_on_top`（换成 plan.js 的放置检查），`trail_reaches_landmark` 看主路自己的终点（`meta.trail_target`）；旧模式（测试夹具直接摆的 SID）还按「出生点 → 地标门前」算主路 `main_trail`。
 - 多个地标时主地标 = `meta.focus`（出生点第一眼看的那个）；房子 = 非地标的 building。
+- **plan v2**（`meta.plan_version = 2`）：resolve 按体块的 `land` 重新落地（`landVolumes`，规则见 §13），出生点站在体块上时跟着它；没有 regions 时不再默认铺满台地布房；analyze 里「房子」只算布房生成的 / 人放的，主路只认 main_trail。
 - regions[].building（plan 的建筑类型）决定布房的形制与尺寸（§2、§13）；volumes 带 `form / roof / floors / label / plan_id / zone_id`。
 - facts 另有 `forms`（按形制计数）、`stilt_houses`（柱脚 > 0.5 m 的吊脚楼数）、`bridges`（路过溪处）、`spaces`（interior.spaceFacts 的汇总对象）。
 - 空间直接用 interior.js：resolve 在布房前 `refreshSpaces`，检查末尾接 `spaceChecks`（spaces_connected / interior_connected / spaces_clear_of_terrain）；没有本地桩。
@@ -238,20 +245,42 @@ projectToPath(path, [x,z]) → { d, off, q }    // 最近点的弧长与横向�
 全部本地、即时、绝不调 AI；状态只有 `store`（app.js 导出），每次改动走 `edit(label, fn)` / `planOps(label, ops)`，自动进撤销栈。
 - 改 plan：构成清单的旋钮、＋加一个、删除、锁 → `planOps` → `compileWith(plan, user)` 重编译。
 - 人的覆盖（`store.user`，重编译时保留）：拖过的房子（锁住的 `u_house_<n>`）、删掉的生成物（按位置记）、剖面上调过的台地高度（`terraceH`）、画的路 / 通道、圈的区域 / 空间。
-- 图上拖动：地标 / 入口 → `place.nudge_m`；地形块 → 反算 `at.dir / at.dist`；空间 → `offset_m`。plan 里依然没有 AI 写的坐标。
+- 图上拖动：节点 / 地形操作 / 实例 / 出生点 → `offsetFromPoint` 反算父组局部 `offset_m`（实例写进 repeat 的 overrides）。plan 里依然没有全局坐标。
 
-## 13. 构成图编译（plan.js，v4，docs/05 §2–3）
+## 13. 场景程序（plan v2，docs/06；plan.js + program.js）
 
 ```js
-import { PLAN_SCHEMA, PLAN_GROUPS, DIRV, normalizePlan, compilePlan, applyOps, resolveTarget, knobsFor, summarize, newElement, planDistance, distinctPlans } from "./plan.js";
-normalizePlan(plan) → { plan, warnings }        // 按 spec/plan.schema.json 清洗：丢未知 / 坐标字段、夹数值、校枚举、补 id 与按 type 的默认值、引用降级、断环
+import { PLAN_SCHEMA, PLAN_GROUPS, DIRV, canonRef, normalizePlan, compilePlan, applyOps, resolveTarget, atFromPoint, offsetFromPoint, expand, knobsFor, summarize, newElement, planDistance, distinctPlans, findNode } from "./plan.js";
+canonRef("site.center") → "site.C"              // 锚点写法规范化（site.center / centre / middle → site.C，north / n → N，Top → top）；normalizePlan 先对全部引用字段做一遍
+normalizePlan(plan) → { plan, warnings }        // 按 spec/plan.schema.json 清洗；v4 旧图先改写；补 id（全树唯一）与按 op / type 的默认值；引用降级；断环；展开 > 600 个形体时缩最大的重复
 compilePlan(plan, { seed, ignored }) → { sid, T, checks, facts, index, plan, warnings, ms }
-applyOps(plan, ops) → { plan, warnings }         // set（字段可嵌套，value null = 删字段）/ add / remove（"rel:<i>" 删关系）
+applyOps(plan, ops) → { plan, warnings }         // set { id, field, value }（id = 节点 / 地形操作 / 实例 id[k] → overrides / site / spawn / lighting / plan）
+                                                  // add { to: root | terrain | relations | <节点 id>, value, index? }；remove { id }（实例 → skip；"rel:<i>"）
+offsetFromPoint(plan, id, [x, z]) → offset_m      // 拖动：世界坐标反算成父组局部偏移（用上一次编译的坐标系）
+atFromPoint(sid, T, plan, id, [x, z]) → { at, offset_m }
+expand(plan) → [{ id, node_id, type, cls, label, depth, path, instance_of, k }]   // 不编译，只展开场景树（数节点）
 resolveTarget(sid, T, id) → { point, polygon, top_y, base_y, kind, label, sid_ids } | null
-knobsFor(group, element, schema = PLAN_SCHEMA, plan) → 旋钮数组；summarize(group, element, plan) → 清单一行
-newElement(group, type, plan) → 「＋ 加一个」的默认项
+knobsFor(group = node | terrain | relation | site | spawn | look | plan, element, schema, plan) → 旋钮；summarize(group, element, plan) → 场景树一行
+newElement(group = node | terrain | relations, type, plan) → 「＋」的默认项
 ```
-- PLAN_SCHEMA 在模块加载时从 `spec/plan.schema.json` fetch（单一事实来源；页面必须经 http 打开）。
-- 编译顺序：场地（bounds = ±size_m/2）→ 地形块按 at 依赖顺序叠（hill / ridge = 椭圆穹顶；slope_terraces / ring_terraces / plateau / cliff / island 顶 = `override` 平顶，按顺序压上去；valley / basin / pit = 负的平底多边形）→ 池塘 → buildTerrain → 水（溪沿低处 A*，有谷且没给源头时顺第一条谷）→ 区域（on 的台地按 levels / side 取子集 → regions，带 building）→ 地标 / 入口按位置依赖顺序求解（候选点 + 打分：出场地 1000、压水 50、挤别的地标 80、压已路由的路 30、地面不平 2 + 高差、关系不成立 2（入口看不见 look_at 1）、名次 × 0.05；之后加 nudge_m）→ 朝向（place.facing / 入口）→ 空间（interior.compileSpaces：外轮廓、内部布局、高度、连接点）→ 路（第一条是 main_trail；节点：地标 = 门前，桥 = 两头（中间直线过桥），途经的门 = 门前门后，区域 / 地形 = 里面靠前一点的位置，水 / 路 = 最近点；style：winding A* 0.7、stairs A* 1.2（绕两倍多远或上不去就直上）、zigzag 之字、straight / bridge / tunnel 直线）→ 外观 → resolve → 放置检查 `place_<id>` + 关系检查 `rel_<i>`（relations.relationChecks，修法是 plan ops）→ 索引 `index[plan_id] = { group, sid_ids }`。
-- 层号压在 `site.relief_layers` 以内（总高差调小时顶上几层并成一层）；层高 = `site.layer_m`。
-- 确定性：同 plan + seed → 同 SID；seed 只影响台地多边形抖动、布房、A* 抖动与空间内部。
+- 坐标规则：局部尺寸与偏移可以写（size_m / offset_m / rotate_deg / spacing_m / radius_m / path_m / polygon_m，x 东、z 南、米），全局摆放交给引擎：根节点用锚点 `at`（`site.<C|N|…>`、`<id>`、`<id>.<top|bottom|center|N|…|inner|outer|start|mid|end>`、`<repeat>[k]`、`spawn`）。rotate_deg 与 SID 的 rotation_y 同约定（0 = 门朝北，俯视逆时针为正）。
+- 编译（program.js `runProgram`）：
+  1. 场地基础形态 `site.ground` → 雕刻特征（plan_id = site）；`terrain[]` 按顺序 → 雕刻特征（只能锚到场地与前面的操作；ref = 锚点处当前高度）：raise / cliff = max 抬到 ref + h（round 边 = add 圆丘），lower = min 压到 ref − d，flatten = set 到 ref，terrace = quant，ramp = set 线性，carve / river = add −d（河带蜿蜒、出 river 水线），lake = min + 水面区域（surface_y = ref − 0.4），dune / noise = add 起伏（种子跟 op id，不跟编译 seed）；台地生成器 `terraces` 在这一步落成 override 平台（v4 算法，高度 = 锚点处地面按级高取整 + k 级）。buildTerrain（terrain.js 的雕刻模式）→ 平顶 / 台阶化的面登记成台地。
+  2. 节点按依赖顺序放（ensure：先父组坐标系、再锚点目标；成环在 normalize 里已断开）：形体 → SID 体块（size 总是 [x, 高, z]），组 → 坐标系，repeat → 每个实例一个坐标系（linear / grid / radial / along / scatter / mirror / stack，skip / overrides），带子节点的形体 → 子节点立在它顶上。
+  3. 落地（体块 `land`，sid.landVolume；resolve 时按同一规则重放）：snap 取覆盖范围最高点（地面 = 地形与水面取高者，码头 / 船贴水面），高差 > 1 m 补基座体块（plinth_of）；float = 地面 + elev_m（浮岛默认 20 m）；carve = 最低点 + elev（岩 / 锥 / 穹顶 / 金字塔默认）；rest = 立在 X 顶上（锚点 X.top、带子节点的形体、悬空目标）；rest + from:"base" = 挂在 X 立面上（形体的子节点写了低于父体高的 elev_m，从父体底面量）；abs = 绝对高度（浮空组、叠层）。
+  4. 避让：每个全局形体 / 重复放好后，和已放的、不在自己子树 / 祖先里的形体比（y 区间重叠、俯视 OBB 重叠 > 10 cm）；先沿最小平移推，推不开就一圈圈找最近空位，≤ 半个尺寸；推不开记 `overlaps`（检查「形体不重叠」+ 修法 ops）。第 2 轮：推的上限按推的方向量半个自己（重复按单个实例量）；悬空的竖向只搭一点 / 贴地的顶只顶到悬空的底部算「搭在上面」不撞；环套住的不撞，两个圆按圆算；悬空的推完中心不能离开锚着的东西，不然只报告。镜像模板在翻转轴上、挂立面的子形体在父体里面、崖外要垫两倍高基座的，引擎直接修并记 `facts.plan.autofix`（mirror / attach / pull_in；第 3 轮：mirror / attach 的几何与 2×2 矩阵在 layout.js 的 `mirrorFix` / `attachOffset` / `rotM…invM`）。自动生成的关系（on_top_of / connects）只引用 SID 里有的对象：雕刻出的台阶面（`rise_1` …）归到它所属的地形操作 `rise`。出场地的整体夹回。重复的两个实例体块位置一一重合（< 0.1 m，镜像轴写反 / 间距 0）记 `instanceCoincide`（检查「重复的实例 不重合」+ 修法：里面那排改沿另一条轴、模板偏开、换翻转轴）。检查文案里没写 label 的重复叫「模板名 × N」，实例叫「X 的第 k 个」（plan.js 的 nodeLabel）。主地标体块（meta.focus）= 节点自己的体块；组 / 重复取显式 landmark 体块里最大的，否则取最高的（最高的是细柱这类小件时取最大的）。出生点落在水面上就近挪到干地（info.spawnMoved）。
+  5. 连接（最后路由，避开全部形体；被沿路排列 / 锚到时提前）：path / road / stairs / ramp 走 A*（坡度 0.7 / 0.45 / 1.2 / 0.45），台阶上不去就直上（straight），path / road / ramp 走不通时只留两端点（unrouted：视图画两端 + 虚线，不算可走，检查「连接 都按样式走通」给修法：改台阶 / 桥，或加 ramp 坡道），一端在高处时直线；bridge / rope_bridge 直线，ends_y / deck_y / elevated，桥面离地 > 4 m 每 12 m 一个桥墩；tunnel 直线 + tunnel；canal 开沟（追加 carve 特征后重建高度场）+ river；portal 两端 marker（kind portal）。碰到出生点的第一条 = main_trail；没有就从出生点到 look_at 自动补一条（auto）。
+  6. 生成器：scatter_houses / grove / field → regions（area 是台地 / 有登记台地的操作时按台地分区），resolve 里 layout.js 布房 / 种树（v2 不再默认铺满台地）；space → interior.compileSpaces。
+  7. 出生点（锚点 + 偏移；站在体块里就推出去；锚到浮岛就站在岛上 rests_on）、主地标（look_at → landmark 角色 → 最大的根节点；它最高的体块 = meta.focus）、调色板、光照、bounds 的 y。
+- 检查：resolve 的 analyze（v2 里「房子」只算布房生成的 / 人放的；主路只认 main_trail）+ program 的 `shapes_no_overlap` / `instances_no_overlap` / `shapes_grounded` / `supports_grounded`（高架组里没落地、又戳出台面的墙 / 方块；拱 / 门 / 柱由 layout.standsUp 自动立到台面上或落地）/ `inside_site` / `links_routed`（含两端 < 3 m 的退化连接） / `reach_<id>`（relations.planReach：地面 BFS + 连接把高处的宿主连起来，宿主在地面的算爬得上）+ 关系检查 `rel_<i>`（visible_from / reachable / adjacent / above / below / behind / between / far_from / faces，修法是 v2 ops）。
+- 索引 `index[id] = { group: terrain | nodes | spawn, type, sid_ids }`：节点（组 / 重复收子孙，按体块的 plan_path）、实例 `id[k]`、地形操作、spawn、生成器（含布出来的房子）。
+- 事实：shapes / by_kind / by_type / instances / highest / water_area_m2 / path_length_m / floating + resolve 的（houses / trees / terraces / spurs / bridges / spaces / validation）+ plan（links / pushed / clamped / overlaps / plinths / auto_trail / focus / warnings）。
+- SID v0.5 与视图（medium/views）的约定：volumes[].size 恒为 [x, 总高, z]，**屋顶在总高之内**（roof_h = 顶部那一段；flat = min(0.5, 0.1 总高) 压顶板，none = 0）；视图 `volDims(v)[1]` 是墙身高 = size[1] − roof_h，墙身 + 屋顶 = size[1]（没给 roof_h 时按同一规则估）。出生点 marker 的 position[1] 是它脚下的高度（站在浮岛 / 平台上时高于地面），人眼 / 剖面 / 3D 都从这里起算。接缝测试：tests/examples.test.html（7 个示例 + desktop/test_app.py 写的 build/eval/mock-drafts.json：模拟 draft、每个片段、revise 前后）。
+- 第 4 轮（环带 / 竖环 / 一组连接）：
+  - **环带** = 空心圆柱（`hollow: true` + `wall_m` 带宽 / 壁厚，缺省短半径的 15%）。SID 体块带 `hollow` 与 `wall`；`layout.ringOf(v)`（平放的 torus 也算，带宽 = 管粗）是四个视图与引擎共用的判断。落地按带子上的最高点（`sid.footSamples` 只采带子，不采孔），离地 `elev` 量带子下面的地（孔里可能是坑底）；基座也是一圈。避让：圆 × 环按圆环带、方 × 环按 `ringPolyMtv`（孔里 / 环外都不算撞，压在带子上往孔里或往外推）；散布、布房、寻路按 `footRects`（一段段带子），≤ 3.5 m 高的环带路可以跨上去。可达：贴地的环带是台面（`ringPoly` 钥匙孔多边形进 reachSet 的 walkPolys）。剖面 `volumes[].segs` = 剖切线在带子上的几段（穿过孔 = 两段壁）。俯视画环（evenodd）、3D 是环形截面拉伸（`ring:k`）、第一眼按每条视线和带子的交点分近 / 远两段画（站在孔里只看得见内壁）。
+  - **立起来的环** = torus + `orient: "upright"`：size_m [直径, 管粗] → SID size [直径, 直径（高）, 管粗（厚）]、`orient: "upright"`，环面按 rotate_deg 朝向（0 = 从南北方向穿过去）；俯视是一条圆头线段，3D `utorus`，剖面 / 第一眼画一个圈（侧着看只剩一道竖椭圆）。schema 的 orient 同时给台地（方位）和环（flat / upright），旋钮用 x-ui `enum` + `variants` 按类型换选项。
+  - **一组连接** = repeat 的 child 是 link：跟连接一起最后路由，每个实例一条（SID path `plan_id = id[k]`、`instance_of`）。模板里 from / to / via 写重复的 id（"pods"）或 "pods[k]"（字母 k）= 那个重复的第 k 个实例（个数不同时取余），"center" = 这个重复的中心（写了 at 就是 at 那个东西）；不写 from = 中心、不写 to = 实例自己的位置（放射辐条）。
+  - 坑的台阶边：`lower` + edge terraced 的坑壁按 steps 一级级（每级 6 m 宽），绕坑的环带一圈圈落在各级上。事实加 `volumes`（全部体块，含布出来的房子 / 树）与 `generated`；界面说明里的「N 个形体」用 volumes。
+  - 俯视标签：同名同组只标一次（文字一样且同一个 plan 根 id 或相距 < 24 m；「内庭」标了「内庭墙」不再标）；出生点 / 连接点 / 入口 / 传送门这类小图标是加权障碍（× 6）；候选位置上下 ±5 行、左右 ±0.75 个字宽；水面的名字放在真的有水的地方（不在湖心岛 / 岩柱上）。
+- 程序用的平面几何（support / ellipsePoly / rectPoly / hull / bboxOf / polyLen / alongLine / deepPoint / mtv）与环带工具在 layout.js；program.js 只留解释器。
+- 确定性：同 plan + seed → 同 SID；seed 只影响散布、布房、A* 抖动与空间内部。性能：600 个形体以内编译约 0.4 s（无头 Edge）。
