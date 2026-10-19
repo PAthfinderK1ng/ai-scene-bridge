@@ -1,4 +1,4 @@
-// relations.js — 关系与检查：自动生成 relations、固定顺序的 checks、视线（lineOfSight）与可达性（reachable）
+// relations.js — 关系与检查：自动生成 relations、固定顺序的 checks、视线（lineOfSight）与可达性（reachable）；v6：引用的事实 describeRef、改动摘要 diffCompiled（docs/07 §1）
 // 约定见 SPEC.md 第 4 节。纯函数、确定性（没有随机）；LLM 不写坐标，fixes 的 patch 也只做几何推导后直接改 sid。
 import { buildTerrain, pointInPolygon, distToPolyline, distToPolygon, distToSegment, polygonCentroid, r2 } from "./terrain.js";
 import { boxCorners, obbOverlap, findObject } from "./validate.js";
@@ -181,6 +181,16 @@ export function landmarkWalk(landmark) { return landmark ? [boxCorners(landmark.
  * @param {{R?: object}} [opts] 可复用已算好的 reachSet
  * @returns {{origin: number[]|null, R: object|null, failing: {t: object, target: number[], nearPt: number[]|null, why: string}[]}}
  */
+/**
+ * 人在图上手调高度抬出来的小鼓包（地形操作 hand_* /「手调高度 N」）不算要连路的台地：
+ * 只有高过一层、而且上面有东西（体块中心在台地里）时才当台地查可达、补支路。
+ */
+function handBump(sid, T, t) {
+  const f = t.feature || {};
+  if (!/^hand_\d+$/.test(t.plan_id || f.plan_id || "") && !/^手调高度/.test(f.label || "")) return false;
+  if (Math.abs(t.height || 0) <= (T.layer || 4) + 1e-6) return true;
+  return !(sid.volumes || []).some((v) => v && v.plan_id && !v.generated && v.position && pointInPolygon([v.position[0], v.position[2]], t.polygon));
+}
 export function unreachedTerraces(sid, T, opts = {}) {
   const { landmark, spawn, trail, walkPaths } = findActors(sid);
   const origin = spawn ? xz(spawn.position) : trail ? trail.points[0] : null;
@@ -189,6 +199,7 @@ export function unreachedTerraces(sid, T, opts = {}) {
   const roadPts = walkPaths.flatMap((p) => samplePolyline(p.points, 1));
   const failing = [];
   for (const t of T.terraces) {
+    if (handBump(sid, T, t)) continue;
     let nearPt = null, nd = Infinity, insidePt = null, idn = Infinity;
     for (const p of roadPts) {
       if (pointInPolygon(p, t.polygon)) { const d = dist2(p, t.centroid); if (d < idn) { idn = d; insidePt = p; } nd = 0; nearPt = nearPt || p; continue; }
@@ -735,4 +746,345 @@ export function relationChecks(sid, T, plan) {
     out.push(Object.assign({ id, text, ok, detail, severity: "warn", relation: i, plan: true, fixes }, ignored.has(id) ? { ignored: true, detail: "已标记不重要 · " + detail } : {}));
   });
   return out;
+}
+
+// ============================================================ 加到对话：引用的事实（describeRef）与改动摘要（diffCompiled）（docs/07 §1）
+// 纯函数、确定性、不调 AI。坐标都是场地坐标（plan 编译出的 SID 场地中心 = 原点）。
+const DIR8 = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"];
+/** plan 树的索引：全局节点（模板外）id → { node, parent, label, depth }，按树的顺序 */
+function planIndex(plan) {
+  const out = new Map();
+  const walk = (arr, parent, depth) => {
+    for (const n of arr || []) {
+      if (!n || typeof n !== "object" || !n.id) continue;
+      const child = n.type === "repeat" && n.child && typeof n.child === "object" ? n.child : null;
+      const label = n.label || (child && child.label) || n.id;
+      out.set(n.id, { node: n, parent, label, depth });
+      walk(n.children, n.id, depth + 1);
+    }
+  };
+  walk(plan && plan.nodes, null, 0);
+  return out;
+}
+const bboxWD = (pts) => { let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity; for (const [x, z] of pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); } return [x0, z0, x1, z1]; };
+const r1_ = (v) => Math.round(v * 10) / 10;
+const lineLen = (pts) => { let L = 0; for (let i = 1; i < pts.length; i++) L += dist2(pts[i - 1], pts[i]); return L; };
+/** 多边形里地面高度的范围（2 m 格采样；太小时取顶点与质心） */
+function groundRange(T, poly) {
+  const [x0, z0, x1, z1] = bboxWD(poly), st = Math.max(2, Math.sqrt(((x1 - x0) * (z1 - z0)) / 4000));
+  let lo = Infinity, hi = -Infinity;
+  const take = (x, z) => { const h = T.heightAt(x, z); lo = Math.min(lo, h); hi = Math.max(hi, h); };
+  for (let z = z0 + st / 2; z < z1; z += st) for (let x = x0 + st / 2; x < x1; x += st) if (pointInPolygon([x, z], poly)) take(x, z);
+  if (!Number.isFinite(lo)) { for (const q of poly) take(q[0], q[1]); const c = polygonCentroid(poly); take(c[0], c[1]); }
+  return [r1_(lo), r1_(hi)];
+}
+/** 编译结果里每个全局节点的几何（按 sid 缓存） */
+const GEO = new WeakMap();
+function geoOf(sid, T, id) {
+  let m = GEO.get(sid); if (!m) { m = new Map(); GEO.set(sid, m); }
+  if (!m.has(id)) m.set(id, planGeo(sid, T, id));
+  return m.get(id);
+}
+/** 中心落在 poly 里的节点（最上层的那个；它的子孙不再列）；不算连接 */
+function nodesInside(sid, T, idx, poly) {
+  const out = [], hit = new Set();
+  for (const [id, e] of idx) {
+    if (e.node.type === "link") continue;
+    let a = e.parent, skip = false; while (a) { if (hit.has(a)) { skip = true; break; } a = idx.get(a) && idx.get(a).parent; }
+    if (skip) continue;
+    const g = geoOf(sid, T, id);
+    if (g && g.point && pointInPolygon(g.point, poly)) { out.push(id); hit.add(id); }
+  }
+  return out;
+}
+/** 离 shape（点 / 多边形 / 折线）R 米以内、不在 exclude 里的节点，近的在前；只列根或没被父节点代表的 */
+function nodesNear(sid, T, idx, shape, R, exclude = new Set()) {
+  const out = [];
+  for (const [id, e] of idx) {
+    if (e.node.type === "link" || exclude.has(id) || (e.parent && (exclude.has(e.parent) || out.some((o) => o.id === e.parent)))) continue;
+    const g = geoOf(sid, T, id);
+    if (!g || !g.point) continue;
+    const d = shape.point ? (g.polygon && pointInPolygon(shape.point, g.polygon) ? 0 : g.polygon ? distToPolygon(shape.point, g.polygon) : dist2(shape.point, g.point)) : shape.poly ? distToPolygon(g.point, shape.poly) : distToPolyline(g.point, shape.line);
+    if (d <= R) out.push({ id, d });
+  }
+  return out.sort((a, b) => a.d - b.d || (a.id < b.id ? -1 : 1)).map((o) => o.id);
+}
+/** facts 压到 ≤ 300 字符的 JSON：先削最长的列表，再去可选字段 */
+function fitFacts(f, max = 300) {
+  const lists = ["near", "contains", "children"];
+  for (let guard = 0; guard < 60 && JSON.stringify(f).length > max; guard++) {
+    const k = lists.filter((q) => Array.isArray(f[q]) && f[q].length).sort((a, b) => f[b].length - f[a].length)[0];
+    if (k) { f[k].pop(); if (!f[k].length) delete f[k]; continue; }
+    const opt = ["material", "pattern", "at", "label_of", "extent_m"].find((q) => f[q] !== undefined);
+    if (!opt) break;
+    delete f[opt];
+  }
+  return f;
+}
+/** 点 c 相对主地标（role = landmark 的第一个节点，根节点优先；没有就是场地中心）：{fact: {id, dir, dist_m}, text: 「在中空圆塔西北 90 m」} */
+function fromLandmark(sid, T, idx, c) {
+  let L = null;
+  for (const root of [true, false]) for (const [id, e] of idx) if (!L && !e.parent === root && e.node.role === "landmark") { const g = geoOf(sid, T, id); if (g && g.point) L = { id, label: e.label, p: g.point }; }
+  if (!L) L = { id: "site", label: "场地中心", p: [0, 0] };
+  const v = [c[0] - L.p[0], c[1] - L.p[1]], d = Math.round(Math.hypot(v[0], v[1]));
+  if (d < 3) return { fact: { id: L.id, dir: "中", dist_m: 0 }, text: `在${L.label}正中` };
+  const dir = DIR8[((Math.round(Math.atan2(v[0], -v[1]) / (Math.PI / 4)) % 8) + 8) % 8];
+  return { fact: { id: L.id, dir, dist_m: d }, text: `在${L.label}${dir} ${d} m` };
+}
+const namesOf = (idx, ids, n = 3) => ids.slice(0, n).map((id) => (idx.get(id) || {}).label || id).join("、") + (ids.length > n ? ` 等 ${ids.length} 个` : "");
+const yTxt = (g) => (g[0] === g[1] ? `${g[0] >= 0 ? "+" : ""}${g[0]} m` : `${g[0] >= 0 ? "+" : ""}${g[0]}–${g[1]} m`);
+/**
+ * 「加到对话」的引用卡片：一个东西的名字 + 一组事实（给 AI 看，也给卡片上那一句话）。
+ * ref.kind：node（节点；instance = 重复里的第几个，从 0 数）/ mark（人画的标记）/ op（地形操作）/ link（连接）/ space（空间）/ spawn（出生点）。
+ * facts（≤ 300 字符 JSON，只有有意义的才写）：type、size_m（plan 里写的尺寸；圈选 = 包围盒 [东西, 南北]）、area_m2、length_m、
+ * ground_y（地面高度 [低, 高]，图钉是一个数）、top_y、extent_m（编译后的占地 [宽, 深, 高]）、count / pattern（重复）、at（锚点）、
+ * contains（中心落在里面的节点 id）、near（附近的节点 id，近的在前）、on（图钉落在哪个节点上）、op / height_m / depth_m（地形操作）、
+ * style / from / to / unrouted（连接）、stratum / layout / floor_y（空间）、hand_op（图钉上手调高度的操作 id）、elevated（悬空）、
+ * from_landmark（标记：中心相对主地标 / 场地中心的 {id, dir 八方位, dist_m}）。
+ * @param {{sid: object, T?: object}} compiled compilePlan 的结果
+ * @param {object} plan 规范化后的 plan（省略时用 sid.meta.plan）
+ * @param {{kind: string, id?: string, instance?: number}} ref
+ * @returns {{label: string, facts: object, text: string}} text = 卡片上那一句（「81×48 m · 地面 +3–7 m · 含 主宅、谷仓」）
+ */
+export function describeRef(compiled, plan, ref) {
+  const sid = compiled && compiled.sid;
+  if (!sid || !ref) return { label: "", facts: {}, text: "" };
+  const T = compiled.T || buildTerrain(sid, { res: 2 });
+  plan = plan || (sid.meta && sid.meta.plan) || {};
+  const idx = planIndex(plan), f = {}, txt = [];
+  let label = ref.id || "";
+  const kind = ref.kind === "op" ? "op" : ref.kind;
+  if (kind === "mark") {
+    const m = (plan.marks || []).find((q) => q && q.id === ref.id);
+    if (!m) return { label: ref.id || "", facts: { missing: true }, text: "已经删掉了" };
+    label = m.label || m.id; f.type = m.type;
+    // 相对主地标（没有就相对场地中心）的方位和距离：AI 复述「在哪」时照这个说，不要猜
+    const mc = m.type === "area" ? polygonCentroid(m.polygon_m) : m.type === "trace" ? m.path_m[Math.floor(m.path_m.length / 2)] : m.point_m;
+    const fl = mc && fromLandmark(sid, T, idx, mc);
+    if (fl) f.from_landmark = fl.fact;
+    if (m.type === "area") {
+      const poly = m.polygon_m, bb = bboxWD(poly), g = groundRange(T, poly), inside = nodesInside(sid, T, idx, poly);
+      Object.assign(f, { size_m: [Math.round(bb[2] - bb[0]), Math.round(bb[3] - bb[1])], area_m2: Math.round(polyAreaAbs(poly)), ground_y: g });
+      if (inside.length) f.contains = inside;
+      const near = nodesNear(sid, T, idx, { poly }, 15, new Set(inside)); if (near.length) f.near = near;
+      txt.push(`${f.size_m[0]}×${f.size_m[1]} m`, fl ? fl.text : "", `地面 ${yTxt(g)}`, inside.length ? `含 ${namesOf(idx, inside)}` : "里面是空的");
+    } else if (m.type === "trace") {
+      const L = m.path_m, hs = [];
+      for (let i = 1; i < L.length; i++) { const n = Math.max(1, Math.ceil(dist2(L[i - 1], L[i]) / 2)); for (let k = 0; k <= n; k++) hs.push(T.heightAt(L[i - 1][0] + ((L[i][0] - L[i - 1][0]) * k) / n, L[i - 1][1] + ((L[i][1] - L[i - 1][1]) * k) / n)); }
+      Object.assign(f, { length_m: Math.round(lineLen(L)), ground_y: [r1_(Math.min(...hs)), r1_(Math.max(...hs))] });
+      const near = nodesNear(sid, T, idx, { line: L }, 10); if (near.length) f.near = near;
+      txt.push(`长 ${f.length_m} m`, fl ? fl.text : "", `地面 ${yTxt(f.ground_y)}`, near.length ? `经过 ${namesOf(idx, near)}` : "沿途没有东西");
+    } else {
+      const p = m.point_m, h = r1_(T.heightAt(p[0], p[1]));
+      f.ground_y = h;
+      const near = nodesNear(sid, T, idx, { point: p }, 25), on = near.find((id) => { const g = geoOf(sid, T, id); return g && g.polygon && pointInPolygon(p, g.polygon); });
+      if (on) f.on = on;
+      const rest = near.filter((id) => id !== on); if (rest.length) f.near = rest;
+      const op = (plan.terrain || []).find((t) => t && t.at === m.id);
+      if (op) { f.hand_op = op.id; if (op.height_m) f.height_m = op.height_m; if (op.depth_m) f.depth_m = op.depth_m; }
+      txt.push(fl ? fl.text : "", `地面 ${yTxt([h, h])}`, on ? `在 ${namesOf(idx, [on])} 上` : near.length ? `近 ${namesOf(idx, near)}` : "空地");
+      if (op) txt.push(`${op.label || op.id} ${op.op === "lower" ? "−" + (op.depth_m || 0) : "+" + (op.height_m || 0)} m`);
+    }
+  } else if (kind === "op") {
+    const t = (plan.terrain || []).find((q) => q && q.id === ref.id);
+    if (!t) return { label: ref.id || "", facts: { missing: true }, text: "已经删掉了" };
+    label = t.label || t.id; f.op = t.op;
+    if (t.size_m) f.size_m = t.size_m.slice();
+    for (const k of ["height_m", "depth_m", "width_m", "at", "area", "along", "target"]) if (t[k] !== undefined) f[k] = t[k];
+    const g = geoOf(sid, T, t.id);
+    if (g && g.polygon) { f.ground_y = groundRange(T, g.polygon); const inside = nodesInside(sid, T, idx, g.polygon); if (inside.length) f.contains = inside; }
+    txt.push(t.op === "lower" || t.op === "lake" || t.op === "carve" || t.op === "river" ? `深 ${t.depth_m ?? "?"} m` : t.height_m != null ? `高 ${t.height_m} m` : t.op);
+    if (f.ground_y) txt.push(`地面 ${yTxt(f.ground_y)}`);
+    if (f.contains) txt.push(`上面有 ${namesOf(idx, f.contains)}`);
+  } else if (kind === "spawn") {
+    label = (plan.spawn && plan.spawn.label) || "出生点";
+    const g = geoOf(sid, T, "spawn");
+    if (plan.spawn && plan.spawn.at) f.at = plan.spawn.at;
+    if (plan.spawn && plan.spawn.look_at) f.look_at = plan.spawn.look_at;
+    if (g) { f.ground_y = r1_(g.base); if (g.elevated) f.elevated = true; const near = nodesNear(sid, T, idx, { point: g.point }, 30); if (near.length) f.near = near; txt.push(`高 ${yTxt([f.ground_y, f.ground_y])}`, near.length ? `近 ${namesOf(idx, near)}` : "四周空"); }
+  } else {
+    const e = idx.get(ref.id);
+    if (!e) return { label: ref.id || "", facts: { missing: true }, text: "已经删掉了" };
+    const n = e.node, inst = Number.isInteger(ref.instance) && n.type === "repeat" ? ref.instance : null;
+    const tpl = n.type === "repeat" && n.child ? Object.assign({}, n.child, inst !== null && n.overrides && n.overrides[String(inst)] || {}) : null;
+    label = inst !== null ? `${e.label}[${inst}]` : e.label;
+    f.type = inst !== null && tpl ? tpl.type : n.type;
+    const src = inst !== null && tpl ? tpl : n;
+    if (src.size_m !== undefined) f.size_m = Array.isArray(src.size_m) ? src.size_m.slice() : src.size_m;
+    else if (tpl && tpl.size_m !== undefined) f.size_m = Array.isArray(tpl.size_m) ? tpl.size_m.slice() : tpl.size_m;
+    if (n.type === "repeat" && inst === null) { f.pattern = n.pattern || "linear"; f.count = sid.volumes.filter((v) => v.instance_of === n.id).reduce((s, v) => s.add(v.instance), new Set()).size || n.count || 0; if (n.radius_m) f.radius_m = n.radius_m; if (tpl) f.of = tpl.type; }
+    if (n.at && inst === null) f.at = n.at;
+    if (n.type === "link") {
+      for (const k of ["style", "from", "to", "along"]) if (n[k] !== undefined) f[k] = n[k];
+      const pa = (sid.paths || []).find((q) => q.plan_id === n.id);
+      if (pa) { f.length_m = Math.round(lineLen(pa.points)); if (pa.unrouted) f.unrouted = true; }
+      txt.push(`${f.style || "path"}`, f.length_m != null ? `长 ${f.length_m} m` : "没生成");
+    } else if (n.type === "space" || kind === "space") {
+      for (const k of ["stratum", "layout", "depth_m"]) if (n[k] !== undefined) f[k] = n[k];
+      const sp = (sid.spaces || []).find((q) => q.plan_id === n.id);
+      if (sp) { f.floor_y = r1_(sp.floor_y); if (sp.rooms) f.rooms = sp.rooms.length; }
+      txt.push(n.stratum === "sky" ? "天上" : "地下", n.layout || "chamber", sp ? `地面 ${f.floor_y} m` : "");
+    } else {
+      const g = geoOf(sid, T, inst !== null ? `${n.id}[${inst}]` : n.id);
+      if (g && g.polygon) {
+        const bb = bboxWD(g.polygon);
+        f.extent_m = [Math.round(bb[2] - bb[0]), Math.round(bb[3] - bb[1]), Math.round(g.top - g.base)];
+        f.top_y = r1_(g.top);
+        if (g.elevated) f.elevated = true;
+        if (n.type === "group" && inst === null) { const ch = (n.children || []).map((c) => c.id).filter(Boolean); if (ch.length) f.children = ch; }
+        const near = nodesNear(sid, T, idx, { poly: g.polygon }, 12, new Set([n.id, ...[...idx].filter(([, q]) => { let a = q.parent; while (a) { if (a === n.id) return true; a = idx.get(a) && idx.get(a).parent; } return false; }).map(([k]) => k)]));
+        if (near.length) f.near = near;
+        txt.push(`${f.extent_m[0]}×${f.extent_m[1]} m`, `高 ${f.extent_m[2]} m`);
+        if (f.count) txt.push(`× ${f.count}`);
+        if (g.elevated) txt.push("悬空");
+      } else txt.push("没生成出来");
+      if (n.material) f.material = n.material;
+    }
+  }
+  return { label, facts: fitFacts(f), text: txt.filter(Boolean).join(" · ") };
+}
+function polyAreaAbs(p) { return Math.abs(polyArea(p)); }
+
+/** 一份编译结果里每个 plan 元素（地形操作 + 全局节点）的几何摘要 */
+function unitsOf(c, plan) {
+  const sid = c.sid, T = c.T || buildTerrain(sid, { res: 2 }), out = new Map();
+  for (const t of plan.terrain || []) {
+    if (!t || !t.id) continue;
+    const g = geoOf(sid, T, t.id), bb = g && g.polygon ? bboxWD(g.polygon) : null;
+    out.set(t.id, { id: t.id, kind: "terrain", label: t.label || t.id, parent: null, c: g ? g.point : null, dims: bb ? [bb[2] - bb[0], bb[3] - bb[1], 0] : null, p: t });
+  }
+  const idx = planIndex(plan);
+  for (const [id, e] of idx) {
+    const n = e.node, g = geoOf(sid, T, id);
+    const u = { id, kind: "node", type: n.type, label: e.label, parent: e.parent, p: n, c: g ? g.point : null, dims: null, n: null, look: "" };
+    if (g && g.line) u.dims = [lineLen(g.line), 0, 0];
+    else if (g && g.polygon) { const bb = bboxWD(g.polygon); u.dims = [bb[2] - bb[0], bb[3] - bb[1], Math.max(0, g.top - g.base)]; }
+    if (n.type === "repeat") u.n = new Set([...sid.volumes.filter((v) => v.instance_of === id).map((v) => v.instance), ...(sid.paths || []).filter((q) => q.instance_of === id).map((q) => q.instance)]).size;
+    u.look = [...new Set(planVols(sid, id).map((v) => `${v.shape}:${v.roof || ""}:${v.color_role || ""}:${v.hollow ? 1 : 0}`))].sort().join("|"); // 去重：个数变了不算「样子变了」
+    out.set(id, u);
+  }
+  const sp = (sid.markers || []).find((m) => m.kind === "player_spawn");
+  if (sp) out.set("spawn", { id: "spawn", kind: "spawn", label: (plan.spawn && plan.spawn.label) || "出生点", parent: null, c: [sp.position[0], sp.position[2]], dims: null, p: {} });
+  return { units: out, T };
+}
+const dirWord = (v) => DIR8[((Math.round(Math.atan2(v[0], -v[1]) / (Math.PI / 4)) % 8) + 8) % 8];
+const fmt = (v) => String(Math.round(v * 10) / 10);
+/**
+ * 改动前后对比（AI 改完 / 本地改完都能算）：新增 / 删除 / 挪动 > 1 m / 尺寸变化 > 10% / 数量变化 / 样子变了（形体、屋顶、颜色）/ 地形变了 / 色板、时段。
+ * 子节点跟着父节点一起挪的只报父节点；组变大是因为里面加了东西的只报加的那个。
+ * 没改定义、被避让推走的节点（prev / next 都带 facts 时看得出）记成 kind「bump」，摘要开头单列「顺带被挤动：…」。
+ * @param {{sid: object, T?: object, facts?: object}|null} prev 改之前的编译结果（null = 新场景）
+ * @param {{sid: object, T?: object, facts?: object}} next 改之后的编译结果
+ * @param {object} [prevPlan] 省略时用 sid.meta.plan
+ * @param {object} [nextPlan]
+ * @param {{focus?: string[]}} [opts] focus = 这轮 / 上一轮引用的标记、节点 id：它们、锚在它们上面的和这些的子孙排在摘要最前面
+ * @returns {{summary: string, items: {id: string, label: string, change: string, kind: string, visible: boolean}[], visible: boolean}}
+ * 摘要按 id 合并后取前 4 处，「等 N 处」的 N 是合并后的处数；items 不合并，按摘要的顺序排。
+ */
+export function diffCompiled(prev, next, prevPlan, nextPlan, opts = {}) {
+  if (!next || !next.sid) return { summary: "没有结果", items: [], visible: false };
+  const np = nextPlan || (next.sid.meta && next.sid.meta.plan) || {};
+  if (!prev || !prev.sid) return { summary: "新场景", items: [{ id: "plan", label: np.name || "场景", change: "新建", kind: "add", visible: true }], visible: true };
+  const pp = prevPlan || (prev.sid.meta && prev.sid.meta.plan) || {};
+  const { units: A, T: TA } = unitsOf(prev, pp), { units: B, T: TB } = unitsOf(next, np);
+  const raw = [], J = (v) => JSON.stringify(v ?? null);
+  const push = (u, kind, change, visible = true, extra = {}) => raw.push(Object.assign({ id: u.id, label: u.label, change, kind, visible, parent: u.parent }, extra));
+  // 被挤动：自己的定义（不算子节点）没改、避让推它的量变了的节点挪了 → 是别人长大挤的，摘要单列在最前面（prev / next 带 facts 时才知道）
+  const pushOf = (c) => new Map((((c.facts && c.facts.plan) || {}).pushed || []).map((q) => [q.id, q.by]));
+  const PA = pushOf(prev), PB = pushOf(next), knowPush = !!(prev.facts && next.facts);
+  const own = (n) => J(Object.fromEntries(Object.entries(n || {}).filter(([k]) => k !== "children")));
+  const bumped = (a, b) => { if (!knowPush || b.kind !== "node" || own(a.p) !== own(b.p)) return false; const x = PA.get(b.id) || [0, 0], y = PB.get(b.id) || [0, 0]; return Math.hypot(y[0] - x[0], y[1] - x[1]) > 1; };
+  const isMove = (k) => k === "move" || k === "bump";
+  for (const [id, b] of B) {
+    const a = A.get(id);
+    if (!a) { push(b, "add", b.n ? `新增 × ${b.n}` : "新增", !!b.c || b.kind === "terrain"); continue; }
+    if (a.c && !b.c) { push(b, "gone", "没生成出来"); continue; }
+    if (!a.c && b.c) { push(b, "add", "生成出来了"); continue; }
+    const parts = [];
+    const cnt = a.n != null && b.n != null && a.n !== b.n;
+    if (cnt) parts.push(`× ${a.n} → × ${b.n}`);
+    for (const [k, w] of [["radius_m", "半径"], ["spacing_m", "间距"], ["height_m", "高"], ["depth_m", "深"], ["elev_m", "离地"]]) {
+      const va = a.p[k], vb = b.p[k];
+      if (typeof va === "number" && typeof vb === "number" && Math.abs(va - vb) > 1e-6) parts.push(`${w} ${fmt(va)} → ${fmt(vb)} m`);
+      else if ((typeof va === "number") !== (typeof vb === "number") && (typeof va === "number" || typeof vb === "number") && k !== "spacing_m") parts.push(`${w} ${typeof va === "number" ? fmt(va) : 0} → ${typeof vb === "number" ? fmt(vb) : 0} m`);
+    }
+    if (a.p.op && b.p.op && a.p.op !== b.p.op) parts.push(`${a.p.op} → ${b.p.op}`);
+    if (b.kind === "terrain" && J(a.p.size_m) !== J(b.p.size_m) && a.p.size_m && b.p.size_m) parts.push(`大小 ${a.p.size_m.join("×")} → ${b.p.size_m.join("×")} m`);
+    if (b.kind !== "terrain" && a.dims && b.dims && !parts.length) {
+      const nm = b.p.type === "link" ? ["长", "", ""] : ["宽", "深", "高"];
+      for (let i = 0; i < 3; i++) if (nm[i] && Math.abs(b.dims[i] - a.dims[i]) > 0.1 * Math.max(a.dims[i], 1)) parts.push(`${nm[i]} ${Math.round(a.dims[i])} → ${Math.round(b.dims[i])} m`);
+      if (parts.length) { push(b, "size", parts.join("，")); parts.length = 0; }
+    }
+    const mv = a.c && b.c ? [b.c[0] - a.c[0], b.c[1] - a.c[1]] : [0, 0], d = Math.hypot(mv[0], mv[1]);
+    if (parts.length) push(b, "param", parts.join("，"), true, cnt ? { counted: true } : {});
+    if (d > 1) { const bp = bumped(a, b); push(b, bp ? "bump" : "move", `${bp ? "被挤动" : "挪了"} ${Math.round(d)} m（往${dirWord(mv)}）`, true, { dv: mv }); }
+    if (b.kind === "node" && a.look !== b.look && b.look && a.look && !parts.length && d <= 1) push(b, "look", "样子变了（形体 / 屋顶 / 颜色）");
+    if (a.label !== b.label && b.kind !== "spawn") push(b, "rename", `改名为「${b.label}」`, false);
+  }
+  for (const [id, a] of A) if (!B.has(id)) push(a, "remove", "删掉了");
+  // 父子：一起挪的只报父；新增 / 删除的子孙不再报；组的尺寸变化如果有子孙的改动解释，就不报
+  const byId = new Map(); for (const it of raw) { if (!byId.has(it.id)) byId.set(it.id, []); byId.get(it.id).push(it); }
+  const parentOf = (id) => (B.get(id) || A.get(id) || {}).parent || null;
+  const anc = (id) => { const out = []; let p = parentOf(id); while (p) { out.push(p); p = parentOf(p); } return out; };
+  // 重复的个数变了：它和子孙的质心跟着偏，祖先组的质心也跟着偏——这些 < 5 m 的「挪了」不报
+  const counted = new Set(raw.filter((it) => it.counted).map((it) => it.id));
+  const below = (id, pred) => raw.some((o) => o.id !== id && anc(o.id).includes(id) && pred(o));
+  const items = raw.filter((it) => {
+    const up = anc(it.id).flatMap((p) => byId.get(p) || []);
+    if ((it.kind === "add" || it.kind === "remove" || it.kind === "gone") && up.some((u) => u.kind === it.kind)) return false;
+    if (isMove(it.kind) && up.some((u) => isMove(u.kind) && Math.hypot(u.dv[0] - it.dv[0], u.dv[1] - it.dv[1]) < 1.5)) return false;
+    if (isMove(it.kind) && up.some((u) => u.kind === "add" || u.kind === "remove")) return false;
+    if (it.kind === "move" && Math.hypot(it.dv[0], it.dv[1]) < 5 && (counted.has(it.id) || anc(it.id).some((a) => counted.has(a)) || below(it.id, (o) => o.counted || o.kind === "add" || o.kind === "remove"))) return false;
+    if (it.kind === "size" && below(it.id, (o) => o.kind !== "rename")) return false;
+    // 样子变了：子孙有新增 / 删除 / 参数 / 尺寸 / 样子的改动，是它们带出来的，不报父级
+    if (it.kind === "look" && below(it.id, (o) => o.kind !== "rename" && !isMove(o.kind))) return false;
+    return true;
+  });
+  // 根上的：色板、时段、场地
+  if (J(pp.palette) !== J(np.palette)) items.push({ id: "palette", label: "色板", change: "换了颜色", kind: "look", visible: true });
+  const ta = pp.lighting && pp.lighting.time_of_day, tb = np.lighting && np.lighting.time_of_day;
+  if (ta !== tb) items.push({ id: "lighting", label: "时段", change: `${ta || "默认"} → ${tb || "默认"}`, kind: "look", visible: true });
+  if (J(pp.site) !== J(np.site)) items.push({ id: "site", label: "场地", change: "基础地形 / 大小变了", kind: "param", visible: true });
+  // 地形高度场：没有哪个地形操作的改动能解释时，报一句最大变化
+  const ha = TA.grid.h, hb = TB.grid.h;
+  if (ha.length === hb.length && !items.some((it) => it.id === "site" || (A.get(it.id) || B.get(it.id) || {}).kind === "terrain")) {
+    let mx = 0; for (let i = 0; i < ha.length; i++) mx = Math.max(mx, Math.abs(ha[i] - hb[i]));
+    if (mx > 0.3) items.push({ id: "terrain", label: "地形", change: `地面最多变了 ${fmt(mx)} m`, kind: "terrain", visible: true });
+  }
+  // 排序：这轮引用的（或上一轮引用的标记 / 节点，连锚在它上面的和它们的子孙）在前，再按 新增 / 删除 > 参数 > 尺寸 > 挪动 > 样子
+  const focus = new Set((opts && opts.focus) || []);
+  // 关注的范围：引用的 id → 锚在它们上面（at / area / along / around / target）或连到它们（from / to / via）的节点，再连一层；子孙跟着祖先
+  const refersTo = (u, F) => { const p = (u && u.p) || {}; return ["at", "area", "along", "around", "target", "from", "to", "via"].some((k) => { const v = p[k]; const sv = typeof v === "string" ? v : v && typeof v === "object" ? JSON.stringify(v) : ""; return sv && [...F].some((f) => sv === f || sv.startsWith(f + ".") || sv.startsWith(f + "[") || ["\"", ".", "["].some((e) => sv.includes(`"${f}${e}`))); }); };
+  for (let pass = 0; pass < 2 && focus.size; pass++) for (const [id, u] of B) if (!focus.has(id) && refersTo(u, focus)) focus.add(id);
+  const focused = (id) => focus.size > 0 && [id, ...anc(id)].some((q) => focus.has(q));
+  const RANK = { add: 0, remove: 0, gone: 1, param: 1, size: 2, terrain: 2, move: 3, look: 4, rename: 5 };
+  const rank = (it) => (["lighting", "palette", "site"].includes(it.id) ? 1 : RANK[it.kind] ?? 3);
+  items.forEach((it, i) => { it._k = it.kind === "bump" ? -1 : (focused(it.id) ? 0 : 10) + rank(it); it._i = i; });
+  items.sort((x, y) => x._k - y._k || x._i - y._i);
+  for (const it of items) { delete it.parent; delete it.dv; delete it.counted; delete it._k; delete it._i; }
+  const vis = items.filter((it) => it.visible);
+  // 按 id 合并（同一个东西的「参数 + 挪了」算一处）再数「等 N 处」
+  const merge = (arr) => { const m = new Map(); for (const it of arr) { if (!m.has(it.id)) m.set(it.id, { label: it.label, ch: [] }); m.get(it.id).ch.push(it.change); } return [...m.values()]; };
+  const say = (arr) => { const g = merge(arr); return g.slice(0, 4).map((q) => `${q.label} ${q.ch.join("，")}`).join("；") + (g.length > 4 ? ` 等 ${g.length} 处` : ""); };
+  // 锚在圈选（at: area 标记）上、这轮改过的东西：体块中心落到圈外的个数（提示词也说了要放得下；放不下就在摘要里直说）
+  const areas = new Map((np.marks || []).filter((m) => m && m.type === "area" && Array.isArray(m.polygon_m)).map((m) => [m.id, m]));
+  const outside = [];
+  if (areas.size) for (const [id, u] of B) {
+    const m = u.kind === "node" && typeof u.p.at === "string" ? areas.get(u.p.at.split(/[.[]/)[0]) : null;
+    if (!m || !items.some((it) => it.id === id || anc(it.id).includes(id))) continue;
+    const vs = planVols(next.sid, id), n = vs.filter((v) => !pointInPolygon([v.position[0], v.position[2]], m.polygon_m)).length;
+    if (n) outside.push({ id, label: u.label, mark: m.label || m.id, n, total: vs.length });
+  }
+  const outTxt = outside.length ? `（${outside.slice(0, 2).map((o) => `${o.label} 有 ${o.n}/${o.total} 块超出了圈的范围`).join("；")}${outside.length > 2 ? ` 等 ${outside.length} 组` : ""}）` : "";
+  // 顺带被挤动的（没改它、被别人长大挤走的）单列在最前面，不混进「改了」里被「等 N 处」藏掉
+  const bumps = vis.filter((it) => it.kind === "bump"), rest = vis.filter((it) => it.kind !== "bump");
+  const bumpTxt = bumps.length ? `顺带被挤动：${bumps.slice(0, 3).map((it) => `${it.label} ${it.change.replace(/^被挤动 /, "")}`).join("、")}${bumps.length > 3 ? ` 等 ${bumps.length} 处` : ""}` : "";
+  const main = rest.length ? `改了：${say(rest)}` : bumps.length ? "" : items.length ? `没有看得见的变化（${say(items)}）` : "没有看得见的变化";
+  const summary = [bumpTxt, main].filter(Boolean).join("；") + outTxt;
+  // 摘要里「等 N 处」藏掉的也要看得到（docs/07 §1.2）：all = 每处一行（被挤动的在前），cut = 摘要省略了一部分；界面点开看全部
+  const listed = merge(rest.length ? rest : bumps.length ? [] : items);
+  const all = [...bumps.map((it) => `被挤动：${it.label} ${it.change.replace(/^被挤动 /, "")}`), ...listed.map((q) => `${q.label} ${q.ch.join("，")}`)];
+  const cut = bumps.length > 3 || listed.length > 4 || outside.length > 2;
+  if (outside.length) all.push(...outside.map((o) => `${o.label} 有 ${o.n}/${o.total} 块超出了圈的范围`));
+  return { summary, items, visible: vis.length > 0, outside, all, cut };
 }

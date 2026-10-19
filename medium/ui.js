@@ -3,7 +3,7 @@
 // 连接 / 生成器 / 地形操作、删除、锁；选中卡（重复里的单个实例、空间内部的部件、连接点、一个点）；检查；AI 设置；导出（引擎包 + 读回对比）。
 // 所有改动走 app.js 的 edit / planOps（本地、可撤销、不调 AI）。只从 app.js 拿 store 和一个 actions 对象。
 import { store, actions as A } from "./app.js";
-import { PLAN_SCHEMA, knobsFor, summarize, newElement, normalizePlan, findNode, expand, resolveTarget } from "./engine/plan.js";
+import { PLAN_SCHEMA, knobsFor, summarize, newElement, normalizePlan, findNode, expand, resolveTarget, describeRef, addMark, updateMark, removeMark, worldToSite } from "./engine/plan.js";
 import { levelsOf, LAYOUT_LABEL, SKY_LAYOUT_LABEL, VIA_LABEL, STRATUM_LABEL, ROLE_LABEL, CONNECTOR_VIA } from "./engine/interior.js";
 import { extractPalette, assignRoles, paletteShift } from "./engine/color.js";
 import { polygonArea } from "./engine/terrain.js";
@@ -43,6 +43,7 @@ const GROUPS = [
   { key: "site", label: "场地与出生点", hint: "基础地形、场地大小、出生点在哪、第一眼看什么" },
   { key: "terrain", label: "地形", hint: "雕刻操作按顺序作用在高度场上（抬起 / 压低 / 削平 / 台阶化 / 开沟 / 成湖 / 立崖 …）；拖图上的地形块 = 改它的偏移" },
   { key: "nodes", label: "场景", hint: "场景程序：形体组成组、组可以嵌套和重复，位置是锚点 + 局部偏移；拖图上的东西 = 改它的偏移" },
+  { key: "marks", label: "标记", hint: "你在图上圈的一块 / 画的一笔 / 点的位置（人给的几何，不是建筑）：AI 拿它们当锚点；拖图上的标记 = 挪它" },
   { key: "relations", label: "关系", hint: "要成立的关系：引擎按几何检查" },
   { key: "look", label: "外观", hint: "时段、色板、气氛" },
 ];
@@ -55,6 +56,7 @@ function itemsOf(g) {
   if (g === "look") return [{ ref: "look", kind: "look", kg: "look", el: p, name: "外观" }];
   if (g === "terrain") return p.terrain.map((t) => ({ ref: t.id, kind: "terrain", kg: "terrain", el: t, name: t.label || t.id }));
   if (g === "relations") return (p.relations || []).map((r, i) => ({ ref: `rel:${i}`, kind: "rel", kg: "relation", el: r, name: relName(r) }));
+  if (g === "marks") return (p.marks || []).map((m) => ({ ref: m.id, kind: "mark", kg: "mark", el: m, name: m.label || m.id }));
   const visit = (n, depth, template) => {
     if (!n || typeof n !== "object") return;
     const tpl = (n.type === "repeat" || n.type === "scatter_houses") && n.child && typeof n.child === "object" ? n.child : null;
@@ -79,7 +81,7 @@ function renderComp(box) {
   const ks = p.key_structures || [];
   box.replaceChildren(el("div", { class: "psum" }, name, el("div", { class: "one" }, p.concept || ""), ks.length ? el("div", { class: "keys" }, el("span", { class: "kk" }, "关键结构"), ks.map((k) => el("span", { class: "key" }, k))) : null),
     el("div", { class: "comp-tokens" }, A.structTokens(p).map((t) => el("span", { class: "tag" }, t.label))));
-  for (const g of GROUPS) box.append(groupBlock(g));
+  for (const g of GROUPS) if (g.key !== "marks" || (p.marks || []).length) box.append(groupBlock(g));
   box.scrollTop = keep;
   if (store.sel && store.sel._scroll !== false) {
     const cur = box.querySelector(".item.sel");
@@ -89,7 +91,7 @@ function renderComp(box) {
 }
 function groupBlock(g) {
   const items = itemsOf(g.key), open = groupOpen(g.key, items);
-  const n = g.key === "nodes" ? `${store.plan.nodes.length} · 展开 ${expand(store.plan).length}` : g.key === "terrain" || g.key === "relations" ? String(items.length) : "";
+  const n = g.key === "nodes" ? `${store.plan.nodes.length} · 展开 ${expand(store.plan).length}` : g.key === "terrain" || g.key === "relations" || g.key === "marks" ? String(items.length) : "";
   const head = el("button", { type: "button", class: "ghead", "aria-expanded": String(open), title: g.hint, onclick: () => { if (open) { store.closed.add(g.key); store.open.delete("g:" + g.key); } else { store.closed.delete(g.key); store.open.add("g:" + g.key); } renderSide(); } },
     el("span", { class: "caret" }, open ? "▾" : "▸"), g.label, n ? el("span", { class: "count" }, n) : null);
   const box = el("section", { class: "group", "data-group": g.key }, head);
@@ -105,6 +107,7 @@ function summaryOf(it) {
   const p = store.plan, e = it.el;
   if (it.kind === "look") return summarize("look", p);
   if (it.kind === "rel") return "";
+  if (it.kind === "mark") return describe({ kind: "mark", id: it.ref }).text;
   const s = summarize(it.kg, Object.assign({}, e, { label: undefined }), p).replace(/(\d)\/(?=\d)/g, "$1×");
   if (it.kind === "node" && e.type === "repeat") {
     const pat = A.OPT("node", "pattern")[e.pattern || "linear"] || e.pattern;
@@ -122,20 +125,33 @@ function itemBlock(it) {
   if (lockable) lock.innerHTML = LOCK_SVG(locked);
   const caret = it.hasKids ? el("button", { type: "button", class: "tcaret", title: "收起 / 展开子节点", onclick: (e) => { e.stopPropagation(); if (store.collapsed.has(it.ref)) store.collapsed.delete(it.ref); else store.collapsed.add(it.ref); renderSide(); } }, store.collapsed.has(it.ref) ? "▸" : "▾") : el("span", { class: "tcaret-sp" });
   const instTag = s && s.inst && INST.exec(s.inst) && INST.exec(s.inst)[1] === it.ref ? el("span", { class: "inst-tag", title: "图上选中的是这一个实例" }, `#${+INST.exec(s.inst)[2] + 1}`) : null;
-  const deletable = it.kind === "terrain" || it.kind === "rel" || (it.kind === "node") || (it.kind === "template" && !(findNode(store.plan, it.ref) || {}).template);
-  const row = el("div", { class: "irow", tabindex: 0, title: "点开看旋钮；图上会高亮它生成的东西", onclick: () => toggleItem(it), onkeydown: (e) => { if (e.key === "Enter") toggleItem(it); } },
+  const deletable = it.kind === "terrain" || it.kind === "rel" || it.kind === "mark" || (it.kind === "node") || (it.kind === "template" && !(findNode(store.plan, it.ref) || {}).template);
+  const rf = treeRef(it);
+  const row = el("div", { class: "irow", tabindex: 0, title: "点开看旋钮；图上会高亮它生成的东西" + (rf ? "；拖进输入框 = 加到对话" : ""), draggable: rf ? "true" : null, onclick: () => toggleItem(it), onkeydown: (e) => { if (e.key === "Enter") toggleItem(it); },
+    ondragstart: rf ? (e) => { e.dataTransfer.setData("text/x-scene-ref", JSON.stringify(rf)); e.dataTransfer.effectAllowed = "copy"; } : null },
     it.depth != null ? caret : null, lock, relCheck ? el("span", { class: relCheck.ok ? "ok" : "bad" }, relCheck.ok ? "✓" : "✗") : null,
     el("span", { class: "nm" }, it.name), instTag, el("span", { class: "sum" }, summaryOf(it)),
+    rf ? el("button", { type: "button", class: "addref", title: "加到对话：发送时把它（名字 + 尺寸 / 位置等事实）一起告诉 AI", onclick: (e) => { e.stopPropagation(); addRef(rf); } }, "＋对话") : null,
     deletable ? el("button", { type: "button", class: "x", title: "删除（可撤销）", onclick: (e) => { e.stopPropagation(); removeItem(it); } }, "×") : null);
   const box = el("div", { class: "item" + (open ? " open" : "") + (sel ? " sel" : "") + (locked ? " locked" : "") + (it.kind === "template" ? " tpl" : ""), "data-ref": it.ref, "data-kind": it.kind, "data-type": it.el && it.el.type ? it.el.type : null, style: it.depth ? `--d:${it.depth}` : null }, row);
   if (open) box.append(knobsBlock(it));
   return box;
+}
+/** 场景树的一行 → 引用（场地 / 外观 / 关系不加） */
+function treeRef(it) {
+  if (it.kind === "mark") return { kind: "mark", id: it.ref };
+  if (it.kind === "spawn") return { kind: "spawn", id: "spawn" };
+  if (it.kind === "terrain") return { kind: "op", id: it.ref };
+  if (it.kind === "template") { const f = findNode(store.plan, it.ref); return f && f.parent ? { kind: "node", id: f.parent.id } : null; }
+  if (it.kind === "node") return { kind: it.el.type === "space" ? "space" : it.el.type === "link" ? "link" : "node", id: it.ref };
+  return null;
 }
 function toggleItem(it) {
   if (store.open.has(it.ref)) { store.open.delete(it.ref); if (store.sel && store.sel.plan_id === it.ref) { store.sel = null; A.render(); return; } renderSide(); return; }
   store.open.add(it.ref);
   if (it.kind === "site" || it.kind === "look" || it.kind === "rel") { renderSide(); return; }
   if (it.kind === "spawn") return A.select({ type: "spawn", plan_id: "spawn" });
+  if (it.kind === "mark") return A.select({ type: "mark", mark_id: it.ref });
   if (it.kind === "terrain") return A.select({ type: "feature", plan_id: it.ref });
   if (it.el.type === "space") { const s = A.spaceOf({ plan_id: it.ref }); return A.select({ type: "space", plan_id: it.ref, sid_id: s ? s.id : null }); }
   A.select({ type: "node", plan_id: it.ref });
@@ -148,6 +164,7 @@ function toggleLock(ref) {
   renderSide();
 }
 function removeItem(it) {
+  if (it.kind === "mark") return removeMarkLocal(it.ref);
   if (it.kind === "rel") return A.planOps(`删了关系「${it.name}」`, [{ op: "remove", id: it.ref }]);
   A.removePlanItem(it.ref);
 }
@@ -198,7 +215,7 @@ function knobsBlock(it) {
   const box = el("div", { class: "knobs" });
   let sec = null;
   for (const k of ks) {
-    if (k.kind === "node" || k.kind === "palette") continue; // 模板在树里单独成行；色板在外观下面单独画
+    if (k.kind === "node" || k.kind === "palette" || (it.kind === "mark" && k.path !== "label")) continue; // 模板在树里单独成行；色板在外观下面单独画；标记只改名字
     if (k.section !== sec) { sec = k.section; if (sec && it.kind !== "look") box.append(el("div", { class: "ksec" }, sec)); }
     box.append(el("div", { class: "krow", "data-path": k.path, "data-kind": k.kind }, numLabel(it, k), ctlFor(it, k)));
   }
@@ -215,6 +232,7 @@ function knobsBlock(it) {
     if (it.kind === "node" && (solid || n.type === "group" || n.type === "repeat")) box.append(el("div", { class: "selact" }, btn("剖到这里", () => sectionTo({ type: "node", plan_id: A.hlId(it.ref) })), n.role === "landmark" ? btn("看第一眼", () => A.setView("eye")) : null));
   }
   if (it.kind === "look") box.append(lookExtras());
+  if (it.kind === "mark") box.append(el("div", { class: "hint" }, "人给的几何（场地坐标，AI 不改它）：AI 用「" + it.ref + "」当锚点；图上拖它 = 挪，选中后 × = 删。"));
   return box;
 }
 /** 数字旋钮的名字可以左右拖（每 8 px 一步），松手才改 */
@@ -379,10 +397,19 @@ function renderSel(box) {
     const m = INST.exec(s.inst), f = findNode(store.plan, m[1]); if (!f) return false;
     const k = +m[2], rep = f.node, v = A.volOf(s.sid_id), ov = (rep.overrides || {})[String(k)];
     head(A.labelOf(s.inst), `「${A.labelOf(m[1])}」× ${instCount(m[1])} 的第 ${k + 1} 个${v ? ` · ${r1(v.size[0])}×${r1(v.size[2])} m · 高 ${r1(v.size[1])} m${v.elev > 0.5 ? ` · 离地 ${r1(v.elev)} m` : ""}` : ""}`);
-    acts(btn("只去掉这一个", () => A.removePlanItem(s.inst), "", "写进重复的 skip（可撤销）"),
+    acts(btn("加到对话", () => addRef({ kind: "node", id: m[1], instance: k }), "", "只说这一个（AI 会收到「第 k 个」）"), btn("只去掉这一个", () => A.removePlanItem(s.inst), "", "写进重复的 skip（可撤销）"),
       ov ? btn("回到模板", () => { const o = Object.assign({}, rep.overrides); delete o[String(k)]; A.planOps(`${A.labelOf(s.inst)}回到模板`, [{ op: "set", id: rep.id, field: "overrides", value: Object.keys(o).length ? o : null }]); }) : null,
       btn("剖到这里", () => sectionTo(s)));
     tip(ov ? `它有单独的改动：${Object.keys(ov).join("、")}。` : "拖它 = 整组一起挪；按住 Alt 拖 = 只挪这一个（记在重复的 overrides 里）。");
+    return true;
+  }
+  if (s.type === "mark") {
+    const m = markOf(s.mark_id); if (!m) return false;
+    const d = describe({ kind: "mark", id: m.id }), T = { area: "圈选", trace: "手绘线", pin: "图钉" }[m.type];
+    head(m.label || m.id, `${T} · ${d.text}`);
+    box.append(el("div", { class: "krow" }, el("span", { class: "kl" }, "名字"), el("input", { class: "txt", type: "text", value: m.label || "", maxlength: 16, onchange: (e) => { const v = e.target.value.trim(); if (v && v !== m.label) A.planOps(`${m.label}改名「${v}」`, [{ op: "set", id: m.id, field: "label", value: v }]); } })));
+    acts(btn("加到对话", () => addRef({ kind: "mark", id: m.id })), m.type === "area" ? btn("清空这块里的东西", () => clearInside(m.id)) : null, btn("删掉", () => removeMarkLocal(m.id), "", "可撤销"));
+    tip("人给的几何（不是建筑）：AI 用它当锚点（at / area / along）。图上拖它 = 挪。");
     return true;
   }
   if (s.type === "connector") {
@@ -411,6 +438,7 @@ function renderSel(box) {
       const r = (sp.rooms || []).find((x) => x.id === s.part); if (!r) return false;
       head(`${sp.label} · ${r.label || ROLE_LABEL[r.role] || "房间"}`, `${A.levelName(r.sublevel | 0, n) || "单层"} · ${Math.round(Math.abs(polygonArea(r.polygon)))} m² · 净高 ${r1(r.height)} m`);
     }
+    acts(btn("加到对话", () => addRef({ kind: "space", id: sp.plan_id })));
     tip("内部是按布局生成的：在场景树里改布局、岔路、层数，或「换一个」。");
     return true;
   }
@@ -423,10 +451,151 @@ function renderSel(box) {
   if (s.type === "ground" && s.p) {
     const p = s.p, sp = MapView.spawnOf(sid), h = store.T.heightAt(p[0], p[1]);
     head(store.stratum === "ground" ? "这一点" : `${STRATUM_LABEL[store.stratum]}层`, `地面 ${r1(h)} m${sp ? ` · 比出生点高 ${Math.round(h - store.T.heightAt(sp.position[0], sp.position[2]))} m · 离出生点 ${Math.round(Math.hypot(p[0] - sp.position[0], p[1] - sp.position[2]))} m` : ""}`);
-    tip(store.stratum === "ground" ? "「画路」从一个东西画到另一个 = 加一条连接；「圈区域」= 加树林 / 田 / 撒房子 / 水池 / 平台。" : `用「圈区域」在这一层圈一块，就是一个新的${STRATUM_LABEL[store.stratum]}空间。`);
+    if (store.stratum === "ground") acts(btn("在这放个图钉（加到对话）", () => pinHere(worldToSite(sid, p))), btn("在这调高度", () => A.setTool("height")));
+    tip(store.stratum === "ground" ? "「圈区域」圈一块 / 「画路」画一笔 = 加到对话，再说要做成什么；右键或 Ctrl+点 = 放图钉；「高度」(H) 在任意一点上下拖。" : `用「圈区域」在这一层圈一块，就是一个新的${STRATUM_LABEL[store.stratum]}空间。`);
     return true;
   }
   return false;
+}
+
+// ============================================================ 加到对话（docs/07 §1）：引用卡片、@ 补全；人画的几何 = 标记（plan.marks，场地坐标，人给的）
+const refKey = (r) => `${r.kind}:${r.id}${r.instance != null ? `[${r.instance}]` : ""}`;
+const KIND_WORD = { node: "节点", space: "空间", link: "连接", op: "地形", spawn: "出生点", mark: "标记" };
+/** 一个引用的事实（describeRef：名字 + 一句话 + ≤ 300 字符的 facts） */
+export function describe(ref) {
+  try { return describeRef({ sid: store.sid, T: store.T }, store.plan, ref); } catch (e) { console.warn(e); return { label: ref.id, facts: {}, text: "" }; }
+}
+export const refLabel = (ref, d = describe(ref)) => (ref.kind === "mark" || ref.kind === "op" ? d.label || ref.id : A.labelOf(ref.instance != null ? `${ref.id}[${ref.instance}]` : ref.id) || d.label);
+/** 图上的目标 → 引用：标记 / 出生点 / 实例（重复里的第几个）/ 地形操作 / 节点（空间、连接按类型） */
+export function refOf(t) {
+  if (!t || !store.plan) return null;
+  if (t.type === "mark") return { kind: "mark", id: t.mark_id || t.id };
+  if (t.type === "spawn") return { kind: "spawn", id: "spawn" };
+  const v = A.volOf(t.sid_id), inst = (v && A.instanceIdOf(v)) || (INST.test(t.plan_id || "") ? t.plan_id : null);
+  if (inst) { const m = INST.exec(inst); return { kind: "node", id: m[1], instance: +m[2] }; }
+  const id = A.treeIdOf((v && v.plan_id) || t.plan_id);
+  const f = id && id !== "site" && id !== "spawn" ? findNode(store.plan, id) : null;
+  if (!f) return id === "spawn" ? { kind: "spawn", id: "spawn" } : null;
+  if (f.kind === "terrain") return { kind: "op", id };
+  if (f.template) return { kind: "node", id: f.parent.id };
+  return { kind: f.node.type === "space" ? "space" : f.node.type === "link" ? "link" : "node", id };
+}
+/** 加一张引用卡片（同一个东西只有一张）；最多 8 张，多了挤掉最早的没钉住的 */
+export function addRef(ref, { quiet = false } = {}) {
+  if (!store.plan || !ref || !ref.id) { if (!quiet) A.note("这个没法加到对话"); return false; }
+  const k = refKey(ref);
+  if (!store.refs.some((r) => refKey(r) === k)) {
+    const d = describe(ref);
+    if (d.facts && d.facts.missing) { if (!quiet) A.note("这个已经删掉了"); return false; }
+    store.refs.push(Object.assign({ kind: ref.kind, id: ref.id, label: refLabel(ref, d), pinned: false }, ref.instance != null ? { instance: ref.instance } : {}));
+    while (store.refs.length > 8) { const i = store.refs.findIndex((r) => !r.pinned); if (i < 0) break; store.refs.splice(i, 1); }
+  }
+  renderRefs(); A.hidePopup();
+  if (!quiet) { A.note(`加到对话：${store.refs.find((r) => refKey(r) === k).label}`); $("#input").focus(); }
+  return true;
+}
+/** 发送时：输入框里手打的 @名字 也算引用；每张卡重新算事实（删掉了的丢掉）；没钉住的发完清空 */
+export function takeRefs(t) {
+  for (const m of String(t).matchAll(/@([^\s@，。,;；]+)/g)) { const c = atCandidates(m[1]).find((x) => x.label === m[1]); if (c) addRef(c.ref, { quiet: true }); }
+  const out = [];
+  for (const r of store.refs) {
+    const d = describe(r);
+    if (!d.facts || d.facts.missing) continue;
+    out.push(Object.assign({ kind: r.kind, id: r.id }, r.instance != null ? { instance: r.instance } : {}, { label: r.label, facts: d.facts }));
+  }
+  store.refs = store.refs.filter((r) => r.pinned); renderRefs();
+  return out;
+}
+/** @ 补全的候选：节点（模板外）、地形操作、标记、出生点；名字里有 q 的，开头就是 q 的在前 */
+export function atCandidates(q = "") {
+  if (!store.plan) return [];
+  const all = [], push = (label, ref) => { if (label && ref && !all.some((x) => x.label === label)) all.push({ label, ref }); };
+  const walk = (list) => { for (const n of list || []) { if (!n || !n.id) continue; push(A.nodeName(n), refOf({ plan_id: n.id })); walk(n.children); } };
+  walk(store.plan.nodes);
+  for (const t of store.plan.terrain || []) push(t.label || t.id, { kind: "op", id: t.id });
+  for (const m of store.plan.marks || []) push(m.label || m.id, { kind: "mark", id: m.id });
+  push(A.labelOf("spawn"), { kind: "spawn", id: "spawn" });
+  const s = String(q).toLowerCase(), hit = all.filter((x) => !s || x.label.toLowerCase().includes(s) || x.ref.id.startsWith(s));
+  return hit.sort((a, b) => (b.label.toLowerCase().startsWith(s) ? 1 : 0) - (a.label.toLowerCase().startsWith(s) ? 1 : 0)).slice(0, 8);
+}
+/** 加一个标记（本地、可撤销）→ 新 id */
+export function newMark(label, mark) {
+  let id = null;
+  A.edit(() => label, (s) => { const a = addMark(s.plan, mark); if (!a.id) return false; s.plan = a.plan; id = a.id; });
+  return id;
+}
+export const markOf = (id) => ((store.plan && store.plan.marks) || []).find((m) => m.id === id) || null;
+export function pinHere(point_m, { ref = true } = {}) {
+  const id = newMark(`在 (${point_m.map(Math.round).join(", ")}) 放了个图钉`, { type: "pin", point_m });
+  if (id && ref) addRef({ kind: "mark", id });
+  return id;
+}
+export function moveMark(id, delta) {
+  const m = markOf(id); if (!m || !delta) return false;
+  const sh = (q) => [r1(q[0] + delta[0]), r1(q[1] + delta[1])];
+  const patch = m.type === "pin" ? { point_m: sh(m.point_m) } : m.type === "area" ? { polygon_m: m.polygon_m.map(sh) } : { path_m: m.path_m.map(sh) };
+  return A.edit(`${m.label || id}挪了 ${Math.round(Math.hypot(delta[0], delta[1]))} m`, (s) => { s.plan = updateMark(s.plan, id, patch); });
+}
+export function removeMarkLocal(id) {
+  const m = markOf(id); if (!m) return false;
+  const ok = A.edit(`删了${m.label || id}${(store.plan.terrain || []).some((t) => t.at === id && /^hand_/.test(t.id)) ? "（连同它上面的手调高度）" : ""}`, (s) => { s.plan = removeMark(s.plan, id); if (s.sel && s.sel.mark_id === id) s.sel = null; });
+  store.refs = store.refs.filter((r) => !(r.kind === "mark" && r.id === id)); renderRefs();
+  return ok;
+}
+/** 「算了」：刚加的标记撤掉不留痕（栈顶就是它时撤销并丢掉重做，否则删掉） */
+export function dropMark(id, label) {
+  const top = store.undo[store.undo.length - 1];
+  if (top && top.label === label) { A.undo(); store.redo.pop(); store.localFx = store.localFx.slice(0, -2); A.render(); } else removeMarkLocal(id);
+  store.refs = store.refs.filter((r) => !(r.kind === "mark" && r.id === id)); renderRefs(); A.placeholder(); A.note(null);
+}
+/** 圈的这块里的东西（中心落在里面的节点）全删掉（本地、可撤销） */
+export function clearInside(id) {
+  const ids = (describe({ kind: "mark", id }).facts.contains || []).filter((x) => findNode(store.plan, x));
+  if (!ids.length) { A.note("这块里没有东西"); return false; }
+  return A.planOps(`清空了${(markOf(id) || {}).label || "这块"}里的 ${ids.length} 样东西（${ids.slice(0, 3).map(A.labelOf).join("、")}${ids.length > 3 ? " …" : ""}）`, ids.map((x) => ({ op: "remove", id: x })));
+}
+/** 输入框上方的引用卡片：种类 · 名字 · 一句事实（悬停看全部 facts）；钉住 = 发完不清空；× 去掉 */
+export function renderRefs() {
+  const box = $("#refs"); if (!box) return;
+  box.hidden = !store.refs.length;
+  box.replaceChildren(...store.refs.map((r, i) => {
+    const d = store.plan ? describe(r) : { facts: { missing: true }, text: "" }, gone = !d.facts || d.facts.missing;
+    return el("div", { class: "ref" + (r.pinned ? " pinned" : "") + (gone ? " gone" : ""), "data-ref-kind": r.kind, "data-ref-id": r.id, title: gone ? "已经删掉了，发送时会丢掉" : JSON.stringify(d.facts) },
+      el("span", { class: "rk" }, r.kind === "mark" ? ({ area: "圈选", trace: "手绘线", pin: "图钉" }[(markOf(r.id) || {}).type] || "标记") : KIND_WORD[r.kind] || r.kind),
+      el("b", {}, r.label), el("span", { class: "rt" }, gone ? "已经删掉了" : d.text),
+      btn(r.pinned ? "已钉" : "钉住", () => { r.pinned = !r.pinned; renderRefs(); A.markDirty(); }, "rpin" + (r.pinned ? " on" : ""), "钉住 = 发送后还留着，下一句接着说它"),
+      btn("×", () => { store.refs.splice(i, 1); renderRefs(); }, "rx", "不带它了"));
+  }));
+}
+/** 输入框：@ 补全节点名（↑↓ 选、回车 / Tab 选中、Esc 收起）；把场景树的一行拖进来 = 加到对话 */
+export function bindComposer() {
+  const inp = $("#input"), list = $("#at-list");
+  let items = [], k = 0;
+  const close = () => { list.hidden = true; items = []; };
+  const at = () => { const v = inp.value.slice(0, inp.selectionStart ?? inp.value.length), m = /@([^\s@]*)$/.exec(v); return m ? { q: m[1], start: v.length - m[0].length } : null; };
+  const choose = (i) => {
+    const c = items[i], a = at(); if (!c || !a) return close();
+    const end = inp.selectionStart ?? inp.value.length;
+    inp.value = inp.value.slice(0, a.start) + `@${c.label} ` + inp.value.slice(end);
+    const pos = a.start + c.label.length + 2; inp.setSelectionRange(pos, pos);
+    addRef(c.ref, { quiet: true }); close(); inp.focus();
+  };
+  const show = () => {
+    list.replaceChildren(...items.map((c, i) => el("div", { class: "at-item" + (i === k ? " on" : ""), role: "option", onpointerdown: (e) => { e.preventDefault(); choose(i); } }, el("b", {}, c.label), el("span", { class: "hint" }, KIND_WORD[c.ref.kind] || ""))));
+    list.hidden = !items.length;
+  };
+  inp.addEventListener("input", () => { const a = at(); if (!a || !store.plan || store.comparing) return close(); items = atCandidates(a.q); k = 0; show(); });
+  inp.addEventListener("keydown", (e) => {
+    if (list.hidden || !items.length) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); k = (k + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length; show(); }
+    else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); choose(k); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  inp.addEventListener("blur", () => setTimeout(close, 150));
+  const comp = $("#composer");
+  comp.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("text/x-scene-ref")) { e.preventDefault(); comp.classList.add("drop"); } });
+  comp.addEventListener("dragleave", () => comp.classList.remove("drop"));
+  comp.addEventListener("drop", (e) => { comp.classList.remove("drop"); const raw = e.dataTransfer.getData("text/x-scene-ref"); if (!raw) return; e.preventDefault(); try { addRef(JSON.parse(raw)); } catch { /* 不是场景树的行 */ } });
 }
 
 // ============================================================ 剖到这里：直线剖切过对象中心，保持当前角度，宽度至少盖住它

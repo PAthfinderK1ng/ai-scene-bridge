@@ -30,13 +30,18 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 **AI 自己搭结构（v5，docs/06）**：AI 不从菜单里挑，而是先想三个**空间概念**（从题材自己的逻辑出发、设计动机各不相同，每次请求另抽两个随机「视角」作可选参考），再把每个概念并行写成一段**场景程序**：形体（盒、圆柱、空心环带、圆锥、穹顶、金字塔、楔、拱、环、球、多棱柱）与建筑件（楼、塔、墙、院、台阶、平台、柱、门、雕像、树、岩、晶体、浮岛、水）组成组，可嵌套、可**重复**（一排 / 网格 / 环形 / 沿路 / 散布 / 镜像 / 叠层）；地形用雕刻操作叠（抬起、压低、削平、台阶化、坡道、开沟、成湖、河、立崖、沙丘、起伏）；路、台阶、桥、索桥、隧道、水渠、传送门把东西连起来；台地村落、撒房子、迷宫 / 矿道 / 地宫是可选的生成器。组内可以写米制尺寸与偏移（像建筑师的草图），**根节点只用锚点**（`site.N`、`主殿.top`、`法师塔[2]`），落地、避让、路由、检查都由引擎（`medium/engine/program.js`）做。
 
 「改」里能做的：
+- **加到对话**：图上点的东西、场景树里的一项、**圈的一块**、**画的一笔**、**放的图钉**都能加到对话（右键「加到对话」、Ctrl+点、输入框 `@` 补全）；输入框上方是引用卡片（名字 + 一句事实）。圈的一块 / 画的一笔 / 图钉是**人给的几何**（`marks`），AI 拿它们当锚点（「这里做成夜市」→ 夜市就放进圈的那块）。每次请求带上本场景最近 10 轮对话与上一轮的改动摘要，所以「还是太空了」「还是没改」听得懂，接着改同一处。
+- **改动摘要**：每次改完聊天里写「改了：夜市 × 12 → × 18；灯柱 新增 × 8」，没有看得见的变化会直说。
+- **场景会话**：左上角场景列表，每个场景有自己的程序、聊天、撤销栈和视图状态，自动保存在 `%LOCALAPPDATA%\ai-scene-bridge\scenes\`；新建、重命名、复制、删除（回收站 7 天）。
+- **用户记忆**：说「记住：我喜欢夜景，不要撒小房子」直接存（不调 AI）；AI 发现你的长期偏好会问「要记住吗」；顶栏「记忆」面板可开关、编辑、删除。记忆跟着每次 AI 请求走，这句话说的优先。
+- **随意选点调高度**：「高度」工具（H）在俯视图任意一点上下拖 = 抬高 / 压低（Shift 削平，滚轮调半径），剖面地面线任意一点也能拖；同一处连续拖改同一个操作，3D 实时跟着变。
 - **右栏场景树**：AI 写了什么就列什么——地形操作、组 → 子节点、重复（「法师塔 × 6 · 环形」）、连接、生成器；每项的旋钮从 `spec/plan.schema.json` 生成（尺寸、个数、半径、间距、偏移、旋转、离地、屋顶、排法、锚点），可改名、加节点、删除、锁住。
 - **俯视图直接拖**：拖一个东西 = 改它在父组里的偏移；Alt 拖重复里的单个实例只改那一个；工具 移动 / 画路 / 圈区域 / 剖切 / 擦除，Ctrl+Z 撤销，Esc 取消。
 - **剖面**自选剖切线与宽度，悬空的东西在剖面里上下拖改离地高度；**3D 小窗**实时跟着变；地下 / 天上图层看空间内部（迷宫、矿道、厅堂、房间图）。
 - 只有「发送」「三个都不要，重出」「换一批」会调 AI（按钮标「调 AI」，显示构思 + 展开三步合计的耗时、token、费用）；你那句话里说死的东西（时段、点了名的结构、地形词、地下空间、规模）本地锁定，三张都有。
 
 视图：俯视语义图、侧剖面、「第一眼」（出生点 1.7 m 眼高）、3D；俯视与剖面带 3D 小窗。
-细节与文件说明见 [medium/README.md](medium/README.md)；v5 规格见 [docs/06](docs/06-场景程序.md)，之前几轮见 [docs/05](docs/05-AI原生场景构成.md)、[docs/04](docs/04-改版-直接操作与多层空间.md)，交互原则见 [docs/03](docs/03-交互设计-场景对话.md)。
+细节与文件说明见 [medium/README.md](medium/README.md)；v6（加到对话 / 场景会话 / 记忆 / 调高度）见 [docs/07](docs/07-加到对话-场景会话-用户记忆.md)，v5 规格见 [docs/06](docs/06-场景程序.md)，之前几轮见 [docs/05](docs/05-AI原生场景构成.md)、[docs/04](docs/04-改版-直接操作与多层空间.md)，交互原则见 [docs/03](docs/03-交互设计-场景对话.md)。
 
 ## 过程产物
 
@@ -53,6 +58,7 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 - [docs/04-改版-直接操作与多层空间.md](docs/04-改版-直接操作与多层空间.md) —— 试用后的改版：说→选→改→出、只有打字才调 AI、直接拖动、自选剖切与剖面调高、地下 / 空中空间（D18–D21）、DeepSeek 接入与实测
 - [docs/05-AI原生场景构成.md](docs/05-AI原生场景构成.md) —— v4：开放构成图、空间内部布局（迷宫 / 矿道 / 厅堂 / 洞穴网 / 房间图）、代码合并
 - [docs/06-场景程序.md](docs/06-场景程序.md) —— v5：AI 写场景程序（形体 + 组 + 重复 + 地形雕刻 + 连接 + 生成器），两步生成（三个概念 → 并行展开），为什么 v4 还像预设
+- [docs/07-加到对话-场景会话-用户记忆.md](docs/07-加到对话-场景会话-用户记忆.md) —— v6：把任何东西加到对话（marks + 引用 + 对话历史 + 改动摘要）、场景会话、用户记忆、随意选点调高度
 - [spec/](spec/README.md) —— SID 的 JSON Schema（含多边形台地 `polygon/level/skirt`、`meta.layer_height_m`）、手写示例、给引擎侧 AI 的 [PROTOCOL.md](spec/PROTOCOL.md)
 - [medium/engine/SPEC.md](medium/engine/SPEC.md) —— 几何引擎规范：坐标约定、地形原型、布局规则、路由、关系检查、笔画事实、变体差异、颜色
 
@@ -62,7 +68,7 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 python -X utf8 tools\run_browser_test.py medium\engine\tests\sid.test.html
 python -X utf8 desktop\test_app.py
 ```
-引擎 11 页测试（无头 Edge 运行，不需要 Node）共 418 个用例（含 7 个示例程序的 222 条编译检查）；界面流程 `medium/tests/flow.test.html` 138 例（需先起本地服务，见文件头）；后端 `desktop/test_app.py` 178 条（模拟 AI + 假的 DeepSeek / Claude 客户端 + 两步生成 + 本地锁定）；读回评分 38 条。DeepSeek 实测见 `desktop/README.md` 与 `build/eval/`。
+引擎 12 页测试（无头 Edge 运行，不需要 Node）共 439 个用例；界面流程 `medium/tests/flow.test.html` 240 例（需先用临时数据目录起本地服务：`SCENE_DIALOG_DATA_DIR` 指到 build/ 下，见文件头；不会碰你的真实场景与记忆）；后端 `desktop/test_app.py` 227 条；读回评分 38 条。DeepSeek 实测见 `desktop/README.md` 与 `build/eval/`。
 
 ## 当前状态
 
@@ -84,7 +90,7 @@ python -X utf8 desktop\test_app.py
 ai-scene-bridge/
 ├── README.md
 ├── medium/                       正式版「场景对话」（ES modules，无构建）
-│   ├── index.html / style.css / app.js（store + 流程）/ ui.js（构成清单）/ views/（map / profile / eye / view3d）
+│   ├── index.html / style.css / app.js（store + 流程）/ ui.js（构成清单）/ session.js（场景会话 + 记忆）/ views/（map / profile / eye / view3d）
 │   └── engine/                   确定性几何引擎 + SPEC.md + tests/
 ├── desktop/                      app.py（本地服务 + WebView2 窗口）、ai.py（提示词、两步生成、入口）、providers.py（DeepSeek / Claude / 模拟）、plans.py（程序 schema 与工具）、rules.py（本地锁定、片段库、组织标签）、test_app.py，build.bat 打包
 ├── prototype/                    交互原型（脚本 AI）

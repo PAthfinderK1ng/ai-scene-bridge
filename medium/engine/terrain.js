@@ -406,3 +406,53 @@ export function meander(line, seed) {
   for (let k = 0; k <= n; k++) { const t = k / n, off = amp * Math.sin(t * Math.PI * 2 + ph) * Math.sin(t * Math.PI); out.push(P2_([a[0] + (b[0] - a[0]) * t + nn[0] * off, a[1] + (b[1] - a[1]) * t + nn[1] * off])); }
   return out;
 }
+
+// ============================================================ 台地生成器（v5f 第 3 轮从 program.js 挪来：program.js 超过 1200 行；v4 的坡上台地 / 环台算法）
+const TS2 = Math.SQRT1_2;
+const TDIRV = { C: [0, 0], N: [0, -1], NE: [TS2, -TS2], E: [1, 0], SE: [TS2, TS2], S: [0, 1], SW: [-TS2, TS2], W: [-1, 0], NW: [-TS2, -TS2] };
+const tDist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const tUnit = (v) => { const L = Math.hypot(v[0], v[1]); return L < 1e-9 ? [0, 0] : [v[0] / L, v[1] / L]; };
+const tAdd = (a, u, k = 1) => [a[0] + u[0] * k, a[1] + u[1] * k];
+const tP2 = (p) => [r2(p[0]), r2(p[1])];
+function tHash(s) { let h = 2166136261; for (const ch of String(s)) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+/** 多边形内离边最远的格点（同 layout.deepPoint；这里不 import layout，免得成环） */
+function innerPoint(poly, step = 2) {
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  for (const [x, z] of poly) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
+  let best = null, bd = -1;
+  for (let z = z0 + step / 2; z < z1; z += step) for (let x = x0 + step / 2; x < x1; x += step) if (pointInPolygon([x, z], poly)) { const d = distToPolygon([x, z], poly); if (d > bd + 1e-9) { bd = d; best = [x, z]; } }
+  return best || polygonCentroid(poly);
+}
+/** 台地生成器 → override 平台特征（坡上台地 / 环台，v4 算法；高度相对锚点处的地面，按级高取整） */
+export function terraceFeatures(n, c, { hAt, layer, hw, hd, seed }) {
+  const steps = n.steps || 4, st = n.step_h_m || layer, size = Array.isArray(n.size_m) ? n.size_m : [80, 80];
+  const rand = rng(tHash(n.id) || 1), jit = (p, a) => tP2([p[0] + (rand() - 0.5) * 2 * a, p[1] + (rand() - 0.5) * 2 * a]);
+  const feats = [];
+  const flat = (k, poly, height, extra) => { const c = polygonCentroid(poly); feats.push(Object.assign({ id: `${n.id}_${k}`, plan_id: n.id, kind: "plateau", label: n.label || "台地", notes: "", polygon: poly, center: [r2(c[0]), 0, r2(c[1])], radius: r2(Math.max(...poly.map((q) => tDist(q, c)))), level: Math.round(height / layer), height: r2(height), skirt: clamp(st * 0.8, 2, 10), override: true, step: k }, extra || {})); };
+  if (n.form === "ring") {
+    const R = clamp(Math.min(size[0], size[1]) / 2, 12, Math.max(12, Math.min(hw - Math.abs(c[0]), hd - Math.abs(c[1])) - 2));
+    let bw = n.width_m || Math.max(8, R / steps);
+    if (R - (steps - 1) * bw < 5) bw = Math.max(4, (R - 5) / Math.max(1, steps - 1));
+    const r0 = Math.max(3, R - (steps - 1) * bw), N = 12, base = Math.round(hAt(c[0] + R, c[1]) / st) * st;
+    const circ = (r, rev) => { const pts = []; for (let k = 0; k <= N; k++) { const a = -Math.PI / 2 + ((rev ? -1 : 1) * 2 * Math.PI * k) / N; pts.push(tP2([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)])); } return pts; };
+    for (let k = 0; k < steps; k++) {
+      const lv = n.inverse ? steps - k : k + 1, ro = R - k * bw, ri = R - (k + 1) * bw;
+      const poly = k === steps - 1 ? circ(r0, false).slice(0, N).map((p) => jit(p, 0.4)) : [...circ(ro, false), ...circ(Math.max(ri, 2), true)].map((p, i) => (i % (N + 1) === 0 || i % (N + 1) === N ? p : jit(p, 0.4)));
+      flat(k, poly, base + lv * st, { ring: true, label: `${n.label || "环台"} 第 ${k + 1} 圈` });
+    }
+    const outline = circ(R, false).slice(0, N), top = feats.reduce((m, f) => (f.height > m.height ? f : m));
+    return { feats, outline, topPoint: tP2(n.inverse ? tAdd(c, [0, 1], R - bw / 2) : c), top: top.height };
+  }
+  // 坡上台地：上坡方向 = orient，否则沿地面上升的方向（平地时朝场地中心 / 朝北）
+  let ax = n.orient && TDIRV[n.orient] && n.orient !== "C" ? TDIRV[n.orient] : null;
+  if (!ax) { const g = [hAt(c[0] + 10, c[1]) - hAt(c[0] - 10, c[1]), hAt(c[0], c[1] + 10) - hAt(c[0], c[1] - 10)]; ax = Math.hypot(g[0], g[1]) > 0.5 ? tUnit(g) : Math.hypot(c[0], c[1]) > 5 ? tUnit([-c[0], -c[1]]) : [0, -1]; }
+  ax = tUnit(ax);
+  const a = size[1] / 2, b = size[0] / 2, F = (s, t) => [c[0] + ax[0] * s - ax[1] * t, c[1] + ax[1] * s + ax[0] * t];
+  const lowPt = F(-a, 0), base = Math.round(hAt(lowPt[0], lowPt[1]) / st) * st, depth = (2 * a) / steps;
+  for (let k = 0; k < steps; k++) {
+    const s0 = -a + k * depth, s1 = s0 + depth, w = b * (1 - (0.25 * k) / Math.max(1, steps - 1));
+    flat(k, [[s0, -w], [s0, 0], [s0, w], [s1, w], [s1, 0], [s1, -w]].map(([s, t]) => jit(F(s, t), 0.8)), base + (k + 1) * st, { label: `${n.label || "台地"} 第 ${k + 1} 级` });
+  }
+  const top = feats[feats.length - 1];
+  return { feats, outline: [F(-a, -b), F(a, -b), F(a, b), F(-a, b)].map(tP2), topPoint: tP2(innerPoint(top.polygon, 2.5)), top: top.height };
+}

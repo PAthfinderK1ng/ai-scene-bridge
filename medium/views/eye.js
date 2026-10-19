@@ -6,6 +6,10 @@
 import { svgel, landmarkOf, spawnOf, spawnY, paletteOf, mainTrailOf, EYE_FOV_DEG, shapeOf, volDims, roofOf, volumeBase, footprintPolygon, volToWorld, volumeColor, volumeType, ringOf } from "./map.js";
 import { volumeOutline } from "./profile.js";
 
+/** 按时段的天色 [天顶, 地平线]（第一眼和 3D 共用） */
+export const SKY_TOD = { dawn: ["#f6d5c3", "#dfe6ee"], morning: ["#dfeaf3", "#f4f6f3"], noon: ["#c9ddf0", "#eef3f6"], afternoon: ["#d7e3ee", "#f6efe3"], dusk: ["#f0b27a", "#e8d6c0"], night: ["#1e2638", "#3a4256"], overcast: ["#c9cdd1", "#e3e5e6"] };
+/** 3D 的光照：半球光 [天, 地, 强度]、太阳 [颜色, 强度]（按时段；没写时段 = 原来的白天） */
+export const LIGHT_TOD = { dawn: [0xffe6d6, 0x7a6f68, 0.8, 0xffc49a, 0.85], dusk: [0xffdcc0, 0x6a5a4a, 0.75, 0xffa860, 0.9], night: [0x7f8fbf, 0x1c1f2e, 0.5, 0xaabbee, 0.35], overcast: [0xe8eaec, 0x8a8a84, 1.0, 0xffffff, 0.5] };
 const FOV = EYE_FOV_DEG, VFOV_UP = 28, VFOV_DOWN = 16, COLS = 112, MAXR = 180, EYE_M = 1.7;
 const deg = (r) => (r * 180) / Math.PI;
 const fmt1 = (v) => Math.round(v * 10) / 10;
@@ -36,7 +40,7 @@ export function renderEye(ctx) {
 
   // 天空
   const tod = (sid.style && sid.style.lighting && sid.style.lighting.time_of_day) || "dusk";
-  const sky = { dawn: ["#f6d5c3", "#dfe6ee"], morning: ["#dfeaf3", "#f4f6f3"], noon: ["#c9ddf0", "#eef3f6"], afternoon: ["#d7e3ee", "#f6efe3"], dusk: ["#f0b27a", "#e8d6c0"], night: ["#1e2638", "#3a4256"], overcast: ["#c9cdd1", "#e3e5e6"] }[tod] || ["#dfe6ee", "#f4f6f3"];
+  const sky = SKY_TOD[tod] || ["#dfe6ee", "#f4f6f3"];
   const defs = svgel("defs");
   const g = svgel("linearGradient", { id: "eye-sky", x1: 0, y1: 0, x2: 0, y2: 1 });
   g.append(svgel("stop", { offset: 0, "stop-color": sky[0] }), svgel("stop", { offset: 1, "stop-color": sky[1] }));

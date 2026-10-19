@@ -1,11 +1,11 @@
-# desktop/ — 本地服务与 AI（v5：场景程序 + 两步生成）
+# desktop/ — 本地服务与 AI（v6：场景程序 + 两步生成 + 场景会话 / 用户记忆 / 引用）
 
 几个内聚的文件，没有互相注入：
 
 | 文件 | 作用 |
 | --- | --- |
-| `app.py` | 入口。起本地服务（只监听 127.0.0.1，默认随机端口；拒绝外部 Origin），用系统 WebView2（pywebview）开窗口加载 `/medium/`；没有 WebView2 时退回 Edge `--app`，再不行用默认浏览器。`--no-window` 只起服务，`--port N` 固定端口。`/api/*` 路由见下表 |
-| `ai.py` | **问什么**：提示词（构思 / 展开 / 改动）、后处理（本地修 / 夹取 / 校验）、模拟 AI、`DeepSeekAI` / `ClaudeAI`（= 底层客户端 + 构思 / 展开 / 改动）、两步编排 `generate`、入口 `draft` / `revise`。`plans.py` / `rules.py` / `providers.py` 的名字在这里全部再导出，外部只用 `ai.X` |
+| `app.py` | 入口。起本地服务（只监听 127.0.0.1，默认随机端口；拒绝外部 Origin），用系统 WebView2（pywebview）开窗口加载 `/medium/`；没有 WebView2 时退回 Edge `--app`，再不行用默认浏览器。`--no-window` 只起服务，`--port N` 固定端口。`/api/*` 路由见下表。v6：**AI 入口** `draft` / `revise`（两步之后的收尾 `finish_draft`、本地锁定、记忆；v6 从 ai.py 挪来，ai.py 超过 1200 行）、**场景存储**（`/api/scenes`）、**记忆库**（`/api/memory`）与本地「记住」识别 |
+| `ai.py` | **问什么**：提示词（构思 / 展开 / 改动；v6 加引用 / 历史 / 标记说明、用户偏好 `memory_context`、`memory_suggestions`）、后处理（本地修 / 夹取 / 校验）、模拟 AI（v6 会用 refs / history、给记忆建议、读偏好）、`DeepSeekAI` / `ClaudeAI`（= 底层客户端 + 构思 / 展开 / 改动）、两步编排 `generate`。`plans.py` / `rules.py` / `providers.py` 的名字在这里全部再导出，外部只用 `ai.X`；入口在 `app.draft` / `app.revise` |
 | `providers.py` | **怎么问**（v5 从 ai.py 拆出，ai.py 超过 1200 行）：DeepSeek urllib 客户端（json_object、回喂一次、429 / 5xx / 断连重试、调用上限、线程安全）、Claude SDK 客户端（结构化输出、服务端 refusal fallback）、JSON 修复、费用、配置、错误 payload、密钥测试；**下半**：概念 → 场景程序（模拟 AI 的题材配方；真模型某张没写成时的**补位**按那张概念自己搭——terrain_idea 落成抬起 / 坑 / 环 / 湖 / 峡谷，key_structures 逐条出形体并按词挑排法（环 / 夹道 / 一排 / 悬浮 / 散布 / 中轴长堤），只有说到具体结构才借片段；主体 = 第一条关键结构，按数量词 / 形状词出 radial 弧形段、stack 空心塔、grid、linear、高架长台面；地下结构写成 space 的房间；三张骨架雷同时 `diversity.clones` + 警告；题材配方数据在 rules.py）。v5 第 1 轮从 rules.py 拆出 compose.py，第 2 轮验收并进本文件：后端比 v4 只多这一个文件，单文件仍 ≤ ~1200 行 |
 | `plans.py` | 场景程序 plan v2 的 schema 与工具（不联网）：读 `spec/plan.schema.json`（单一事实来源）；小校验器、夹取、清洗、给 Claude 的 schema；**语法表** `grammar()`（由 schema 生成，节点按 type、地形按 op 各一行）；场景树遍历、按 id / `towers[2]` 找元素、ops 检查与应用、根节点锚点规则、形体计数与上限 |
 | `rules.py` | 本地知识：**片段库**（14 个小结构）、词表、本地锁定（draft / revise 都锁）、**空间组织标签** `organization`（按证据强度只打主体结构的 2–4 个；带台阶边的坑 / 下沉不算台地；有地下 space 或压低 > 6 m、坑里放了东西的坑打「地下」；地形按尺度称重：< 3 m 的槽、窄沟、小池、广告墙不算；网格重复 / 三条以上的渠打「网格」）与三张差异 `diversity`。角色词（神殿 / 城堡 / 书库 / 广场 / 祭坛）在程序名字 / 概念 / 关键结构里说到了就算有，没说到给现有主体改名，不另加盒子；「空中」没满足时把主体所在的组整体抬成悬空，不往每张塞同一组浮岛 |
@@ -34,13 +34,23 @@ v4 只开放了名字，没开放结构（地形词表是台地型的、建筑�
 
 | 路由 | 请求 | 响应 |
 | --- | --- | --- |
-| `GET /api/health` | — | `{ok, version, mock, provider, provider_label, model, thinking, root}` |
+| `GET /api/health` | — | `{ok, version, mock, provider, provider_label, model, thinking, root, data_dir_custom}`（data_dir_custom = 设了 `SCENE_DIALOG_DATA_DIR`，不给路径；flow.test 据此拒绝在真实数据上跑） |
 | `GET /api/config` | — | `{provider, provider_label, mock, mock_forced, has_key, key_hint, model, key_source, thinking, providers: {anthropic, deepseek: {has_key, key_hint, model, models, key_source, thinking?}}}`，没有明文 |
 | `POST /api/config` | `{provider?, mock?, providers?: {deepseek: {api_key?, model?, thinking?, base_url?}, anthropic: {api_key?, model?}}}`，也收扁平 `api_key / model / thinking`；`api_key: ""` = 清除 | 同 GET |
 | `POST /api/config/test` | `{provider?, api_key?, model?}` | `{ok, provider, model, ms, text, usage}` 或 `{ok: false, message, status, hint}` |
 | `GET /api/plan/schema` | — | `spec/plan.schema.json` 原样 |
-| `POST /api/ai/draft` | `{intent, locked?: {plan, ids?}, variant?, force_mock?, max_calls?}`（max_calls 1–8，本次最多几次 HTTP，默认 8，超了那张由模拟 AI 补位） | 见下 |
-| `POST /api/ai/revise` | `{plan, action: "一句话" 或 {type: "text", text}, locked?: {ids} 或 [ids], force_mock?}` | 见下 |
+| `POST /api/ai/draft` | `{intent, locked?: {plan, ids?}, variant?, force_mock?, max_calls?, scene_id?}`（max_calls 1–8，本次最多几次 HTTP，默认 8，超了那张由模拟 AI 补位；scene_id 取场景级记忆） | 见下 |
+| `POST /api/ai/revise` | `{plan, action: "一句话" 或 {type: "text", text}, locked?: {ids} 或 [ids], force_mock?, scene_id?, refs?: [{kind, id, instance?, label, facts, carried?}], history?: [{role: "user"\|"ai", text, refs?, ops?, ids?, effect?}]}` | 见下 |
+| `GET /api/scenes` | `?trash=1` 列回收站 | `[{id, name, created, updated, thumb?}]`，updated 倒序（回收站多 `deleted / purge_at`，按 deleted 倒序） |
+| `POST /api/scenes` | `{name?, data?, thumb?}` | `{id, name, created, updated}`（默认名「场景 N」） |
+| `GET /api/scenes/<id>` | — | `{id, name, created, updated, data, thumb?}`；不存在 / 在回收站 → 404 |
+| `PUT /api/scenes/<id>` | `{name?, data?, thumb?}`（只改给了的） | `{id, name, updated, created_new?}`；id 不存在时按这个 id 新建；在回收站里 → 404；超 5 MB → 413 |
+| `DELETE /api/scenes/<id>` | — | `{ok, id, trash_days: 7}`（进回收站，7 天后连同场景级记忆永久删） |
+| `POST /api/scenes/<id>/duplicate` · `/restore` | `{}` | `{id, name, …}` |
+| `GET /api/memory` | — | `[item]`，新的在前 |
+| `POST /api/memory` | `{text, kind?, scope?: "global"\|"scene", scene_id?, source?: "you"\|"ai", enabled?}`（kind 缺省本地判断） | `item`；和已有的近似 → 回那条 + `duplicate: true` |
+| `PUT /api/memory/<id>` | `{text?, kind?, enabled?, scope?, scene_id?}` | `item` |
+| `DELETE /api/memory/<id>` · `POST /api/memory/clear` | clear：`{scope?: "all"\|"global"\|"scene", scene_id?}`，缺省全清 | `{ok, id}` · `{ok, removed}` |
 | `POST /api/score` | `{intent: sid, readback, map?, auto_map?}` | `tools/score_readback.py` 的比对结果 |
 | `POST /api/save` | `{name, content}` | `{ok, path}`（写到 `%LOCALAPPDATA%\ai-scene-bridge\exports\`） |
 | `POST /api/validate` | `{doc, schema: "plan" \| "sid"}` | `{ok, errors, count, engine}` |
@@ -84,6 +94,21 @@ revise 响应：
 - `force_mock: true`：这次走模拟 AI（演示 / 截图 / 测试用，不花钱）。
 - 失败：AI 回来了但不能用 → 502 `{error: "ai_<kind>", kind: refusal|truncated|empty|bad_json|schema|budget, message, errors?, usage}`（只有构思步会这样抛；展开步会补位）；服务商 HTTP / 网络错误 → 502 `{error: "ai", provider, status, type, request_id, retryable, hint}`；参数错 → 400。
 
+v6 两个响应都多：`memory_suggestions: [{text, kind}]`（模型顺手给的长期偏好建议，≤ 2 条，已和记忆库去重；没有就是 `[]`）、`_usage.memory_ids`（这次用了哪几条记忆，uses + 1）；本地存下记忆时多 `memory_saved: [item]`、`memory_note: "记住了：…"`。整句都是记忆时**不调 AI**：revise 回 `{understood: true, restatement: "记住了：…", ops: [], provider: "local", memory_saved}`，draft 回同样的字段加 `plans: [], concepts: []`。
+
+## 场景会话、用户记忆、引用（docs/07）
+
+- **数据目录**：`ai.data_dir()` = `%LOCALAPPDATA%\ai-scene-bridge`（config.json、`scenes\<id>.json`、`scenes\.trash\`、`memory.json`、exports、logs）。环境变量 `SCENE_DIALOG_DATA_DIR` 整个换掉它（测试用；`test_app.py` 指到 `build\test-data-*` 并在跑完删掉，不碰真实数据与密钥）。写文件一律先写同目录临时文件、fsync，再 `os.replace`。
+- **场景**：文件 `{id, name, created, updated, data, thumb?}`；`data` 是前端整包（程序、候选、聊天、撤销栈、视图），后端不解析，只限 5 MB。缩略图 `data:image/…` ≤ 400 KB。
+- **记忆条目**：`{id, text, kind: like|dislike|rule|fact, scope: global|scene, scene_id?, source: you|ai, enabled, created, uses, last_used?}`，最多 200 条。
+- **本地「记住」**（revise / draft 都认，不调 AI）：`记住：…`（后面整句按逗号分条）；以「以后… / 我不喜欢… / 讨厌… / 别再…」开头的分句（带「这 / 那 / 它」的不算——「我不喜欢这个塔」是这一次的改动）。kind 本地判断；句子里说「这个场景 / 本场景」→ scope=scene。句子剩下的改动照常调 AI（只发剩下那半句）。
+- **偏好进提示词**：所有 AI 调用（构思 / 展开 / 改动）的系统提示后附「用户偏好（跨场景）」：启用的、全局 + 本场景的（本场景的在前、新的在前）≤ 20 条，按 kind 分组，明说「人这句话说的优先于偏好」。DeepSeek 拼在系统提示后面（前缀缓存照样命中），Claude 是缓存断点之后的第二个系统块。模拟 AI 只读两样：喜欢的时段（夜景 → 夜里）、不要撒房子。
+- **memory_suggestions**：构思与改动的输出 schema 多一个可选字段（不额外调用）；回来后本地去重（去掉语气 / 极性词后相同、互相包含、或字二元组重合 ≥ 0.6 算近似；喜欢 vs 不喜欢不算）。
+- **refs**：一行一个 JSON（kind / id / instance / label / facts 原样），提示词说「这 / 这里 / 这块 / 它」优先指它们；有引用时不再请人在图上指。
+- **history**：只取最近 10 轮（20 条），每条压成第一句 ≤ 80 字；AI 的那条带 `ops` 数和 `effect`。上一轮 ops = 0 或 effect 说「没有看得见的变化」→ 提示「换一种改法」；生效了 → 「同方向加大力度」，且只动上一轮动过的 id（AI 那条的 `ids` →「动了 …」）、人指的那块和锚在它上面的东西。人那条的 `refs` →「（指：mark_1）」。
+- **carried**：这句没加引用、又是接着说的（还是 / 再 / 更 / 这里…），前端把上一轮的引用带上（`carried: true`，facts 重新算），提示词单列「这句没有新加引用，是接着上一轮说的；上一轮人指的是…」。
+- **marks**（人画的标记，`plan.marks`）：提示词里只给 id / 类 / 名字 / 大小（area 的外包尺寸、trace 的长度），**不给坐标**；讲清 area → `at` / `area`，trace → `along`，pin → `at`，地形操作的 `at` 也能写标记。`index()` 收标记（可当锚点，引用不报警），`check_ops` 拒绝 set / remove 标记；AI 视图与语法表里没有 `marks`，展开回来的程序里 AI 写了 `marks` 会被去掉；draft 带 `locked.plan.marks` 时标记跟着新的三张走。
+
 ## 本地锁定（不花钱、不靠模型自觉）
 
 `ai.extract(句子)` 读出说死的条件，`ai.enforce(plan, 条件)` 写死到每一张上，`ai.enforce_ops(plan, ops, 句子)` 在 revise 时补 op。补上的东西按**片段库**拼、锚到主体旁（`hall.E` + 组内偏移）或场地上没用过的方位（`site.NE`），不写全局坐标。
@@ -99,7 +124,7 @@ revise 响应：
 
 ## 模拟 AI
 
-没有密钥、勾了模拟或 `force_mock` 时用。构思按**题材配方**轮换给三个空间组织不同的概念：每个题材 4–6 个组织（学院 → 塔环 / 水网书院 / 中轴书院 / 浮空 / 环廊 / 地宫；港口 → 炮台海港 / 残垣港 / 环湾泊地 / 海蚀洞寨 / 水上棚寨；神殿 → 轴线金字塔 / 绿洲神殿 / 列柱长廊 / 峡谷崖庙 / 沉沙地宫；夜市、空中花园、山城、迷宫、城堡同理；没命中的题材用轴线 / 浮空 / 峡谷 / 湖心通用配方），一批里最多一个往上、最多一个往下，不出「上 / 水 / 地下」三分法。带片段的配方按片段库拼程序，只写概念的（auto）由 recipe_from_concept 按词搭。除了山城，不会出现台地 / 撒房子。revise 认「再高一点 / 大一点 / 小一点 / 多两座 / 少一些 / 散开 / 收拢 / 悬空 / 落地 / 换成穹顶 / 转一下 / 更陡 / 岔路多 / 去掉 X」，加 / 删词表里的结构、时段、迷宫由本地锁定补。确定性：同输入同结果，`variant` 换配方。
+没有密钥、勾了模拟或 `force_mock` 时用。构思按**题材配方**轮换给三个空间组织不同的概念：每个题材 4–6 个组织（学院 → 塔环 / 水网书院 / 中轴书院 / 浮空 / 环廊 / 地宫；港口 → 炮台海港 / 残垣港 / 环湾泊地 / 海蚀洞寨 / 水上棚寨；神殿 → 轴线金字塔 / 绿洲神殿 / 列柱长廊 / 峡谷崖庙 / 沉沙地宫；夜市、空中花园、山城、迷宫、城堡同理；没命中的题材用轴线 / 浮空 / 峡谷 / 湖心通用配方），一批里最多一个往上、最多一个往下，不出「上 / 水 / 地下」三分法。带片段的配方按片段库拼程序，只写概念的（auto）由 recipe_from_concept 按词搭。除了山城，不会出现台地 / 撒房子。revise 认「再高一点 / 大一点 / 小一点 / 多两座 / 少一些 / 散开 / 收拢 / 悬空 / 落地 / 换成穹顶 / 转一下 / 更陡 / 岔路多 / 去掉 X」，加 / 删词表里的结构、时段、迷宫由本地锁定补。v6：带引用时「这里做成夜市」→ 在引用上加一组（area 标记 → scatter + `area`，trace → along，pin / 节点 → grid + `at`）；带历史时「还是太空了 / 还不够」→ 找上一轮改的那一组（引用的、或上一轮那句话里点名的），数量 ×1.5（上一轮没生效就连尺寸一起放大），说「空 / 稀 / 少」再加一圈灯柱；「我喜欢 X / 我讨厌 X」→ `memory_suggestions`。确定性：同输入同结果，`variant` 换配方。
 
 ## 服务商
 

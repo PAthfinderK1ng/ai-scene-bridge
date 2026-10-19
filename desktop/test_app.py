@@ -6,7 +6,9 @@ test_app.py — 后端测试（进程内起服务；模拟 AI / 假 urllib / 假
 
 覆盖：plan v2 schema 与示例、语法表与片段库提示词、场景树 ops（嵌套路径 / 实例 / 加到组 / 删实例）、根节点锚点规则、本地锁定（draft / revise）、
 模拟 AI（任意题材三个结构不同的程序、revise 常见说法）、两步流程（假 DeepSeek：构思 1 次 + 展开 3 次并行、回喂、同概念重试、模拟补位、调用上限、费用合计）、
-DeepSeek 细节（请求体、JSON 修复、HTTP 错误）、Claude 假客户端、配置不泄露明文、HTTP 路由。
+DeepSeek 细节（请求体、JSON 修复、HTTP 错误）、Claude 假客户端、配置不泄露明文、HTTP 路由；
+v6（docs/07）：数据目录环境变量、场景 CRUD / 回收站 / 体积上限、记忆 CRUD / 去重、本地「记住」识别不调 AI、refs / history 进提示词、
+记忆进系统提示（DeepSeek 拼在后面、Claude 第二个系统块）、memory_suggestions 去重、模拟 AI 用 refs / history / 偏好。
 """
 from __future__ import annotations
 
@@ -29,6 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 os.environ["LOCALAPPDATA"] = tempfile.mkdtemp(prefix="scene-dialog-test-")  # 不碰真实 config.json
+os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
+os.environ["SCENE_DIALOG_DATA_DIR"] = tempfile.mkdtemp(prefix="test-data-", dir=os.path.join(ROOT, "build"))  # 场景 / 记忆 / 配置都写这里，跑完删掉
 os.environ.pop("ANTHROPIC_API_KEY", None)
 os.environ.pop("DEEPSEEK_API_KEY", None)
 
@@ -57,7 +61,7 @@ def labels(p) -> str:
 
 
 def mock_plans(intent: str, variant: int = 0) -> list:
-    return ai.draft({"intent": intent, "force_mock": True, "variant": variant})["plans"]
+    return app.draft({"intent": intent, "force_mock": True, "variant": variant})["plans"]
 
 
 def academy() -> dict:
@@ -119,8 +123,7 @@ def t_schema() -> None:
           not any(ai.has_key(s, k) for k in ("minimum", "maximum", "maxLength", "x-ui", "oneOf", "definitions", "maxItems")) and '"pattern": "^' not in J(s) and "$defs" in s and all_closed(s)
           and not any(k in J(s) for k in ('"locks"', '"skip"', '"overrides"', '"layout_seed"')))
     rs = ai.claude_schema(ai.revise_schema(), True)
-    check("Claude revise schema：add 的 value = 节点 / 地形操作 / 关系之一；set 的 value 可以是节点", "#/$defs/node" in J(rs["$defs"]["op_add"]["properties"]["value"])
-          and "#/$defs/node" in J(rs["$defs"]["op_set"]["properties"]["value"]) and all_closed(rs))
+    check("Claude revise schema：add 的 value = 节点 / 地形操作 / 关系之一；set 的 value 可以是节点", "#/$defs/node" in J(rs["$defs"]["op_add"]["properties"]["value"]) and "#/$defs/node" in J(rs["$defs"]["op_set"]["properties"]["value"]) and all_closed(rs))
     check("构思 schema：3 个概念 × {name, concept, key_structures ≤5, terrain_idea, why_different}",
           ai.CONCEPT_SCHEMA["properties"]["concepts"]["minItems"] == 3 and ai.CONCEPT_SCHEMA["properties"]["concepts"]["items"]["properties"]["key_structures"]["maxItems"] == 5
           and set(ai.CONCEPT_SCHEMA["properties"]["concepts"]["items"]["required"]) == {"name", "concept", "key_structures", "terrain_idea", "why_different"})
@@ -134,33 +137,27 @@ def t_schema() -> None:
     lib = ai.fragment_lines()
     blocks = lib.split("【")[1:]
     check(f"片段库 10–14 个、每个 3–8 行以内（实际 {len(blocks)} 个），覆盖塔群 / 轴线 / 浮岛 / 峡谷 / 地下 / 港口 / 金字塔 / 窄巷 / 城墙 / 湖心岛 / 瀑布 / 台地 / 迷宫",
-          10 <= len(blocks) <= 14 and all(3 <= b.strip().count("\n") + 1 <= 8 for b in blocks)
-          and all(w in lib for w in ("环形塔群", "轴线院落", "悬浮群岛", "峡谷栈道", "地下大厅", "港口码头", "阶梯金字塔", "窄巷", "城墙", "湖心岛", "瀑布", "台地村落", "迷宫")))
+          10 <= len(blocks) <= 14 and all(3 <= b.strip().count("\n") + 1 <= 8 for b in blocks) and all(w in lib for w in ("环形塔群", "轴线院落", "悬浮群岛", "峡谷栈道", "地下大厅", "港口码头", "阶梯金字塔", "窄巷", "城墙", "湖心岛", "瀑布", "台地村落", "迷宫")))
     check("片段都合 schema（逐个实例化成一张程序验证）", all(not valid({"name": "t", "site": {"size_m": [200, 200]}, "terrain": ai.instantiate({}, f["key"], f["demo"])[0],
                                                               "nodes": ai.instantiate({"nodes": [{"id": "hall", "type": "building"}]}, f["key"], f["demo"])[1] + [{"id": "hall", "type": "building", "at": "site.center"}]})
                                                 for f in ai.FRAGMENTS))
     sp = ai.program_system_prompt()
     check("展开系统提示：语法表 + 片段库，不给整张示例；明说不要默认台地 / 撒房子、名字随便起、组内可写米制尺寸与偏移、根节点只能用锚点",
-          g in sp and lib in sp and "不要默认用台地 / 撒房子" in sp and "名字随便起" in sp and "根节点只能用 at 锚点" in sp and "组内可以写米制" in sp
-          and '"spawn"' not in lib and '"palette"' not in sp)
+          g in sp and lib in sp and "不要默认用台地 / 撒房子" in sp and "名字随便起" in sp and "根节点只能用 at 锚点" in sp and "组内可以写米制" in sp and '"spawn"' not in lib and '"palette"' not in sp)
     cp = ai.concept_system_prompt()
     check("构思系统提示：先想题材自己的空间逻辑、三个不同设计动机、空间组织明显不同、why_different 写设计动机、不要默认台地、短（< 1500 字）",
-          "空间逻辑" in cp and "灵魂结构" in cp and "设计动机" in cp and "空间组织方式**必须明显不同" in cp and "why_different" in cp
-          and "不要默认「坡上台地 + 撒小房子」" in cp and len(cp) < 1500)
+          "空间逻辑" in cp and "灵魂结构" in cp and "设计动机" in cp and "空间组织方式**必须明显不同" in cp and "why_different" in cp and "不要默认「坡上台地 + 撒小房子」" in cp and len(cp) < 1500)
     check("构思系统提示没有固定例句 / 固定维度清单（悬崖城堡 / 浮空群岛 / 地下巨穴、「往天上走」、ORG_DIMS），明说不套「上 / 水 / 地下」三分法",
-          not any(w in cp for w in ("悬崖城堡", "浮空群岛", "地下巨穴", "往天上走", "两两至少在两个维度", "抬到云上的高台")) and not hasattr(ai, "ORG_DIMS")
-          and "三分法" in cp and "可以借鉴，不必照用" in cp)
+          not any(w in cp for w in ("悬崖城堡", "浮空群岛", "地下巨穴", "往天上走", "两两至少在两个维度", "抬到云上的高台")) and not hasattr(ai, "ORG_DIMS") and "三分法" in cp and "可以借鉴，不必照用" in cp)
     draws = [tuple(ai.draw_lenses()) for _ in range(12)]
     check(f"视角提示：≥ 16 个空间组织原则，每次随机抽 2 个不重复的（不是 3 个：三张卡会 1:1 照抄三个视角），12 次里至少 6 种组合（实际 {len(set(draws))} 种）",
           len(ai.LENSES) >= 16 and len(set(ai.LENSES)) == len(ai.LENSES) and all(len(set(d)) == 2 and set(d) <= set(ai.LENSES) for d in draws) and len(set(draws)) >= 6)
     cu = ai.concept_user_text("海盗港口", ai.extract("海盗港口"), None, 0, list(draws[0]))
     check("构思 user 文本：那句话 + 三个不同设计动机 + 随机视角（可选参考；至少一个概念不用视角、从灵魂结构出发；why_different 不引用视角名）",
-          "海盗港口" in cu and "设计动机" in cu and all(x in cu for x in draws[0]) and "不必照用" in cu and "至少一个概念不用视角" in cu and "不要引用视角名" in cu
-          and "至少一个概念不用视角" in cp and "不要写「来自某某视角」" in cp
+          "海盗港口" in cu and "设计动机" in cu and all(x in cu for x in draws[0]) and "不必照用" in cu and "至少一个概念不用视角" in cu and "不要引用视角名" in cu and "至少一个概念不用视角" in cp and "不要写「来自某某视角」" in cp
           and "视角" not in ai.concept_user_text("海盗港口", {}, None), cu)
     check("展开系统提示：环带 / 绕坑摊道写成空心圆柱（hollow + wall_m）或 radial 弧段、竖环 torus + orient upright、放射桥网 = radial 的 child 是 link；铁律不许实心圆柱当环形走道",
-          '"hollow":true,"wall_m"' in sp and '"orient":"upright"' in sp and '"child":{"type":"link"' in sp and '"pattern":"radial"' in sp and "绕坑摊道" in sp
-          and "环形的走道 / 回廊 / 摊带 / 环廊写成空心圆柱（hollow:true，wall_m = 带宽）或 radial 弧段，不要写实心圆柱" in sp)
+          '"hollow":true,"wall_m"' in sp and '"orient":"upright"' in sp and '"child":{"type":"link"' in sp and '"pattern":"radial"' in sp and "绕坑摊道" in sp and "环形的走道 / 回廊 / 摊带 / 环廊写成空心圆柱（hollow:true，wall_m = 带宽）或 radial 弧段，不要写实心圆柱" in sp)
 
 
 # ============================================================ 场景树 ops / 根节点规则 / 后处理
@@ -225,8 +222,7 @@ def t_ops() -> None:
     out, fixes, errs = ai.postprocess_plan({"plan": raw})
     pp = out["plan"]
     check("后处理：房间补 id、links 里的房间名换成 id（入口 → entry）；锚在 crag.top 又写 elev_m = 崖高 → 去掉，真悬空的（30 m）保留",
-          not errs and [r["id"] for r in pp["nodes"][2]["rooms"]] == ["r1", "r2"] and pp["nodes"][2]["links"] == [["entry", "r1"], ["r1", "r2"]]
-          and "elev_m" not in pp["nodes"][0] and pp["nodes"][1]["elev_m"] == 30, J([errs, fixes]))
+          not errs and [r["id"] for r in pp["nodes"][2]["rooms"]] == ["r1", "r2"] and pp["nodes"][2]["links"] == [["entry", "r1"], ["r1", "r2"]] and "elev_m" not in pp["nodes"][0] and pp["nodes"][1]["elev_m"] == 30, J([errs, fixes]))
 
 
 # ============================================================ 本地锁定
@@ -299,14 +295,13 @@ def t_locks() -> None:
     ps = [ai.compose(r) for r in rs]
     ops = [[t["op"] for t in p.get("terrain") or []] for p in ps]
     check("补位按概念雕地形：抬起的有 raise、挖坑的有 lower；三张结构钥匙两两不同、没有一张借浮岛片段",
-          "raise" in ops[0] and "lower" in ops[2] and not any(ai.same_structure(ai.structure_key(a), ai.structure_key(b)) for i, a in enumerate(ps) for b in ps[i + 1:])
-          and not any("sky_islands" in r["frags"] for r in rs)
+          "raise" in ops[0] and "lower" in ops[2] and not any(app.same_structure(app.structure_key(a), app.structure_key(b)) for i, a in enumerate(ps) for b in ps[i + 1:]) and not any("sky_islands" in r["frags"] for r in rs)
           and not any(valid(p) for p in ps), J([ops, [r["frags"] for r in rs], [valid(p)[:2] for p in ps]])[:400])
     chain = next(n for n in ai.all_nodes(ps[1]) if n.get("type") == "repeat" and (n.get("child") or {}).get("type") == "island")
     check("补位按概念的排法：「沿一条线」的浮洲排成一线（linear），出生点站在悬空台面上", chain["pattern"] == "linear" and ps[1]["spawn"]["at"] == "deck", J([chain, ps[1]["spawn"]])[:300])
     res = {"plans": [ai.compose(rs[0]), ai.compose(rs[0]), ps[2]], "concepts": sky_cs, "sources": ["mock"] * 3,
            "fills": [{"plan": k, "reason": "x"} for k in range(3)]}
-    out = ai.finish_draft(res, ai.extract("空中花园"))
+    out = app.finish_draft(res, ai.extract("空中花园"))
     check("补位卡结构一样 → diversity.clones + 警告「雷同」", out["diversity"].get("clones") == [[0, 1]] and out["diversity"]["org_min"] == 0 and any("雷同" in w for w in out["warnings"]), J(out["diversity"])[:300])
     # v5 第 3 轮验收：补位按关键结构的数量词与形状词出真实结构，不退回「环台 + 中央高台 + 一座塔 + 浮岛」
     acad = [{"name": "星轨环院", "concept": "一座环形魔法学院，七段弧形塔楼依次首尾相接围成中庭，学生沿圆环走廊逐层上行。",
@@ -331,8 +326,7 @@ def t_locks() -> None:
           and any(n.get("type") == "sphere" and n.get("elev_m") for n in ai.all_nodes(aps[0])), J([n for n in ai.all_nodes(aps[0]) if n.get("type") == "sphere"]))
     sp = next((n for n in ai.all_nodes(aps[2]) if n.get("type") == "space"), {})
     check("地下学窟：地下的关键结构写成地下空间的房间（钟形大厅 / 廊道 / 实验窟 / 栈桥 / 禁书室），「栈桥」不借港口片段、不出海岸",
-          aps[2]["site"]["ground"] != "coast" and len(sp.get("rooms") or []) == 5 and any("禁书室" in r["label"] for r in sp["rooms"])
-          and not any(n.get("label") in ("码头", "防波堤") for n in ai.all_nodes(aps[2])), J([aps[2]["site"], sp])[:400])
+          aps[2]["site"]["ground"] != "coast" and len(sp.get("rooms") or []) == 5 and any("禁书室" in r["label"] for r in sp["rooms"]) and not any(n.get("label") in ("码头", "防波堤") for n in ai.all_nodes(aps[2])), J([aps[2]["site"], sp])[:400])
     check("补位不再出 32 × 18 × 24 的默认主楼", not any(n.get("size_m") == [32, 18, 24] for q in aps for n in ai.all_nodes(q)))
     cyb = {"name": "铁笼接龙", "concept": "沿废弃高架桥悬空串起的一列铁笼摊档，脚下是车流和雾，往上和往外挂。",
            "key_structures": ["高架桥面主摊台", "桥侧外挂的吊笼摊", "跨桥的钢索串灯", "桥墩下的小吃摊"], "terrain_idea": "没有平地，只有一道断头高架桥横在半空"}
@@ -345,9 +339,9 @@ def t_locks() -> None:
     old = [{"name": "a", "site": {"size_m": [200, 200], "ground": g}, "terrain": [{"op": "raise", "shape": "ring", "edge": "slope"}, {"op": "raise", "shape": "circle", "edge": "terraced"}],
             "nodes": [{"id": "core", "type": "group", "at": "site.center", "children": [{"id": "main", "type": "tower", "roof": "cone", "role": "landmark"}]},
                       {"id": "isl", "type": "repeat", "pattern": "radial", "count": 3, "at": "core", "child": {"type": "island"}}]} for g in ("lake", "flat")]
-    out = ai.finish_draft({"plans": old + [aps[2]], "concepts": acad, "sources": ["mock"] * 3, "fills": [{"plan": k, "reason": "x"} for k in range(3)]}, ai.extract("我要生成魔法学院"))
+    out = app.finish_draft({"plans": old + [aps[2]], "concepts": acad, "sources": ["mock"] * 3, "fills": [{"plan": k, "reason": "x"} for k in range(3)]}, ai.extract("我要生成魔法学院"))
     check("雷同按骨架比（地形操作序列 + 主体形体 + 重复签名），不比地面：湖上和平地上的同一副「环台 + 塔 + 浮岛」认成雷同；本轮三张补位两两不雷同",
-          out["diversity"].get("clones") == [[0, 1]] and not any(ai.same_structure(ai.structure_key(a), ai.structure_key(b)) for i, a in enumerate(aps) for b in aps[i + 1:]),
+          out["diversity"].get("clones") == [[0, 1]] and not any(app.same_structure(app.structure_key(a), app.structure_key(b)) for i, a in enumerate(aps) for b in aps[i + 1:]),
           J(out["diversity"])[:300])
     lane = {"name": "雨巷", "site": {"size_m": [140, 140]}, "terrain": [{"op": "lower", "shape": "rect", "size_m": [26, 140], "depth_m": 1.6, "edge": "terraced", "steps": 2}], "nodes": [{"id": "x", "type": "box", "at": "site.center"}]}
     pit = {"name": "坑", "site": {"size_m": [200, 200], "layer_m": 4}, "terrain": [{"op": "lower", "shape": "circle", "size_m": [120, 120], "depth_m": 12, "edge": "terraced", "steps": 3}], "nodes": [{"id": "x", "type": "box", "at": "site.center"}]}
@@ -374,8 +368,7 @@ def t_locks() -> None:
           and {"axial", "scatter", "linear", "enclosed"} <= ai.organization(busy, full=True), [sorted(ob), ai.org_scores(busy)])
     vale = lambda **t: {"name": "x", "site": {"size_m": [200, 200]}, "terrain": [{"op": "lower", "id": "v", "at": "site.center", "shape": "ellipse", **t}], "nodes": []}  # noqa: E731
     check("压低 > 6 m：宽缓的谷（160 × 100 深 8、坡边）不算地下；崖边 / 台阶边、或深 ≥ 短边 15% 的坑才算",
-          "underground" not in ai.organization(vale(size_m=[160, 100], depth_m=8, edge="slope"), full=True)
-          and "underground" in ai.organization(vale(size_m=[60, 60], depth_m=12, edge="slope"), full=True)
+          "underground" not in ai.organization(vale(size_m=[160, 100], depth_m=8, edge="slope"), full=True) and "underground" in ai.organization(vale(size_m=[60, 60], depth_m=12, edge="slope"), full=True)
           and "underground" in ai.organization(vale(size_m=[160, 100], depth_m=8, edge="terraced"), full=True),
           [sorted(ai.organization(vale(size_m=[160, 100], depth_m=8, edge="slope"), full=True))])
     S = {"size_m": [200, 200], "layer_m": 4}
@@ -403,7 +396,7 @@ def t_locks() -> None:
 # ============================================================ 模拟 AI
 def t_mock() -> None:
     for t in ACCEPT + ["地下有个矿洞，是个两层的迷宫", "未来感的科技园区"]:
-        r = ai.draft({"intent": t, "force_mock": True})
+        r = app.draft({"intent": t, "force_mock": True})
         ps = r["plans"]
         bad = [valid(p)[:2] for p in ps if valid(p)]
         presets = [ai.preset_flags(p) for p in ps]
@@ -412,7 +405,7 @@ def t_mock() -> None:
               len(ps) == 3 and not bad and r["diversity"]["org_min"] >= 2 and (old <= 1 if "山城" in t else old == 0) and len({p["name"] for p in ps}) == 3
               and all(p.get("concept") for p in ps) and len(r["concepts"]) == 3 and not r["warnings"], J([bad, r["diversity"], presets, r["warnings"]])[:400])
     for v in range(4):  # 模拟配方轮换：每批最多一个往上（塔 / 崖 / 浮空）、最多一个往下，不是「上 / 浮空 / 地下」三分法
-        rv = ai.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": v})
+        rv = app.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": v})
         kinds = [ai.organization(p) for p in rv["plans"]]
         dirs = [c.get("_recipe", {}).get("dir") for c in rv["concepts"]] if all("_recipe" in c for c in rv["concepts"]) else []
         triad = any("vertical" in k for k in kinds) and any("sky" in k for k in kinds) and any("underground" in k for k in kinds)
@@ -421,25 +414,25 @@ def t_mock() -> None:
               J([[p["name"] for p in rv["plans"]], [sorted(k) for k in kinds]]))
     names = {n for v in range(4) for n in (r["name"] for r in ai.recipes_for("我要生成魔法学院", v))}
     check("学院的模拟配方有 ≥ 5 个组织轮换着出", len(names) >= 5, sorted(names))
-    r = ai.draft({"intent": "我要生成魔法学院", "force_mock": True})
+    r = app.draft({"intent": "我要生成魔法学院", "force_mock": True})
     check("模拟构思：每个概念有 name / concept / key_structures / terrain_idea / why_different，且合构思 schema", not ai.validate(ai.CONCEPT_SCHEMA, {"concepts": r["concepts"]}), J(r["concepts"])[:300])
-    r2 = ai.draft({"intent": "我要生成魔法学院", "force_mock": True})
+    r2 = app.draft({"intent": "我要生成魔法学院", "force_mock": True})
     check("确定性：同输入同结果", J(r["plans"]) == J(r2["plans"]))
-    r3 = ai.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": 1})
+    r3 = app.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": 1})
     check("换一批（variant=1）：概念换了", [p["name"] for p in r3["plans"]] != [p["name"] for p in r["plans"]] and not any(valid(p) for p in r3["plans"]), [p["name"] for p in r3["plans"]])
-    r = ai.draft({"intent": "我要生成魔法学院，七座法师塔，夜里", "force_mock": True})
+    r = app.draft({"intent": "我要生成魔法学院，七座法师塔，夜里", "force_mock": True})
     check("锁定在三张上都生效（七座法师塔、夜里）", all(p["lighting"]["time_of_day"] == "night" and "法师塔" in labels(p) for p in r["plans"]) and "7 个法师塔" in r["constraints"], J(r["constraints_fixed"]))
     p = academy()
-    lk = ai.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": 1, "locked": {"plan": p, "ids": ["hall"]}})
+    lk = app.draft({"intent": "我要生成魔法学院", "force_mock": True, "variant": 1, "locked": {"plan": p, "ids": ["hall"]}})
     check("锁住主殿再换一批：三张都原样带着主殿（locks 记下）", all(any(n.get("id") == "hall" and {k: v for k, v in n.items() if k != "at"} == ai.index(p)["hall"][1] for n in ai.all_nodes(q)) and q.get("locks") == ["hall"] for q in lk["plans"])
           and not any(valid(q) for q in lk["plans"]), J([valid(q)[:2] for q in lk["plans"]]))
     for text, want in (("法师塔再高一点", lambda o: o[0]["field"] == "child.size_m"), ("多两座塔", lambda o: o[0]["value"] == 8), ("主殿大一点", lambda o: o[0]["id"] == "hall"),
                        ("主殿换成尖顶", lambda o: o[0]["value"] == "spire"), ("塔散开一点", lambda o: o[0]["field"] == "radius_m"), ("崖台更陡", lambda o: o[0]["id"] == "crag"),
                        ("主殿悬空", lambda o: o[0]["field"] == "elev_m"), ("去掉环崖石阶", lambda o: o[0] == {"op": "remove", "id": "crag_stair"}),
                        ("加一座城墙", lambda o: any(x["op"] == "add" and x["value"]["type"] == "wall" for x in o)), ("夜里", lambda o: o[0]["value"] == "night")):
-        rv = ai.revise({"plan": p, "action": text, "force_mock": True})
+        rv = app.revise({"plan": p, "action": text, "force_mock": True})
         check(f"模拟 revise「{text}」→ 合法 ops + 复述", rv["ops"] and want(rv["ops"]) and rv["restatement"] and not valid(ai.apply_ops(p, rv["ops"])), J(rv)[:300])
-    rv = ai.revise({"plan": p, "action": "让它更有感觉", "force_mock": True})
+    rv = app.revise({"plan": p, "action": "让它更有感觉", "force_mock": True})
     check("模拟 revise 翻不了 → 请人在图上指", rv["ops"] == [] and rv["ask_to_point"] and rv["question"])
 
 
@@ -531,7 +524,7 @@ def t_two_step() -> None:
     log: list = []
     d = make_ds(router(delay=0.3), log)
     t0 = time.time()
-    r = ai.draft({"intent": "我要生成魔法学院"}, d)
+    r = app.draft({"intent": "我要生成魔法学院"}, d)
     wall = time.time() - t0
     kinds = [which(x[2]) for x in log]
     check("两步：构思 1 次 + 展开 3 次（一张一次）", [k for k, _ in kinds].count("concepts") == 1 and sorted(k for kk, k in kinds if kk == "expand") == [0, 1, 2] and len(log) == 4, kinds)
@@ -555,24 +548,24 @@ def t_two_step() -> None:
           and not any(k.startswith("_") for c in r["concepts"] for k in c) and r["provider"] == "deepseek")
 
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(router({1: 1}), log))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(router({1: 1}), log))
     exp1 = [x for x in log if which(x[2]) == ("expand", 1)]
     check("第 2 张第一次不合 schema → 把错误回喂一次（同一次对话）后成功，usage 累加", len(exp1) == 2 and exp1[1][2]["messages"][-1]["role"] == "user" and "问题" in exp1[1][2]["messages"][-1]["content"]
           and r["sources"][1] == "deepseek" and r["_steps"][2]["feedback"] and r["_steps"][2]["usage"]["calls"] == 2, J(r["_steps"])[:300])
     check("回喂前那一轮的 schema 错记进 _steps[k].first_errors（看模型反复错在哪个字段）", r["_steps"][2].get("first_errors") and all(isinstance(x, str) for x in r["_steps"][2]["first_errors"]),
           J(r["_steps"][2])[:300])
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(router({2: 2}), log))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(router({2: 2}), log))
     exp2 = [x for x in log if which(x[2]) == ("expand", 2)]
     check("第 3 张回喂后仍不合格 → 用同一概念重新调一次（新对话）→ 成功，attempts=2", len(exp2) == 3 and len(exp2[2][2]["messages"]) == 2 and r["sources"][2] == "deepseek"
           and r["_steps"][3]["attempts"] == 2 and r["_steps"][3]["usage"]["calls"] == 3, J(r["_steps"][3])[:300])
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(router({0: 9}), log))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(router({0: 9}), log))
     check("第 1 张两轮都不行 → 模拟 AI 用同一概念补那一张并标注（sources / fills / warnings），其余两张照常；花掉的钱照算",
           r["sources"] == ["mock", "deepseek", "deepseek"] and r["fills"][0]["plan"] == 0 and any("补位" in w for w in r["warnings"]) and not valid(r["plans"][0])
           and r["plans"][0]["name"] == MOCK_CONCEPTS[0]["name"] and r["_usage"]["calls"] == 1 + 4 + 2, J([r["fills"], r["_usage"]["calls"]]))
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(router({0: 9, 1: 9, 2: 9}), log, max_calls=4))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(router({0: 9, 1: 9, 2: 9}), log, max_calls=4))
     check("调用上限 4 次：构思 1 + 展开 3 后不再发请求，坏的那几张模拟补位", len(log) == 4 and r["sources"] == ["mock"] * 3 and len(r["fills"]) == 3, J([len(log), r["fills"]]))
     check("调用上限撞上时第一轮的 schema 错与回包开头照样带出来（_steps[k].first_errors / first_sample），不只是「budget」",
           all(st.get("first_errors") and st.get("first_sample") for st in r["_steps"][1:]) and any("$.nodes" in x for x in r["_steps"][1]["first_errors"]), J(r["_steps"][1])[:400])
@@ -587,15 +580,14 @@ def t_two_step() -> None:
         return ds_resp(J({"plan": pl}), prompt=5000, hit=4000, completion=1500)
     log = []
     logdir = tempfile.mkdtemp(prefix="ds-logs-")
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(nearly, log, max_calls=4, log_dir=logdir))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(nearly, log, max_calls=4, log_dir=logdir))
     check("没有回喂预算、只错一个节点 → 本地去掉它（连到它的桥一并去掉）后通过，不补位；_steps 标 salvaged 并留着第一轮的错",
           len(log) == 4 and r["sources"] == ["deepseek"] * 3 and not r["fills"] and all(st.get("salvaged") and st.get("first_errors") for st in r["_steps"][1:])
           and all("oops" not in J(pl) for pl in r["plans"]) and not any(valid(pl) for pl in r["plans"]), J([r["sources"], r["_steps"][1]])[:400])
     files = sorted(os.listdir(logdir))
     raw = "".join(open(os.path.join(logdir, f), encoding="utf-8").read() for f in files)
     check("每次 HTTP 的原样回包落盘（log_dir），不含密钥、不含系统提示全文（只记长度）",
-          len(files) == 4 and "sk-test-deepseek" not in raw and "Bearer" not in raw and "flying_castle" in raw and '"system_chars"' in raw
-          and ai.program_system_prompt()[:200] not in raw, [len(files), len(raw)])
+          len(files) == 4 and "sk-test-deepseek" not in raw and "Bearer" not in raw and "flying_castle" in raw and '"system_chars"' in raw and ai.program_system_prompt()[:200] not in raw, [len(files), len(raw)])
     check("get_ai 给 DeepSeek 配上 %LOCALAPPDATA%/ai-scene-bridge/logs", ai.get_ai({"provider": "deepseek", "api_key": "sk-test"}).log_dir == os.path.join(ai.data_dir(), "logs"))
     big = copy.deepcopy(GOOD_PLANS[0])
     big["nodes"] += [{"id": f"bad{i}", "type": "flying_castle", "at": "site.N"} for i in range(4)]
@@ -612,7 +604,7 @@ def t_two_step() -> None:
             return http_error(500, "boom")
         return router()(body)
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(http_fail, log))
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(http_fail, log))
     check("某张展开遇 HTTP 500（内部已重试一次）→ 同概念再来一次 → 还不行就模拟补位", r["sources"][1] == "mock" and len([x for x in log if which(x[2]) == ("expand", 1)]) == 4 and "500" in r["fills"][0]["reason"] + "500", J(r["fills"]))
 
     def bad_concepts(body):
@@ -620,16 +612,15 @@ def t_two_step() -> None:
             return ds_resp(J({"concepts": [{"name": "只有一个"}]}))
         return router()(body)
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院"}, make_ds(bad_concepts, log))
-    check("构思两轮都不合格 → 概念改用模拟 AI 的，展开照样走模型（_concepts_fallback 标注）", r.get("_concepts_fallback") and r["sources"] == ["deepseek"] * 3
-          and len([x for x in log if which(x[2])[0] == "concepts"]) == 2, J([r.get("_fixes"), r["sources"]])[:300])
+    r = app.draft({"intent": "我要生成魔法学院"}, make_ds(bad_concepts, log))
+    check("构思两轮都不合格 → 概念改用模拟 AI 的，展开照样走模型（_concepts_fallback 标注）", r.get("_concepts_fallback") and r["sources"] == ["deepseek"] * 3 and len([x for x in log if which(x[2])[0] == "concepts"]) == 2, J([r.get("_fixes"), r["sources"]])[:300])
     try:
-        ai.draft({"intent": "我要生成魔法学院"}, make_ds(lambda b: http_error(401, "Authentication Fails"), []))
+        app.draft({"intent": "我要生成魔法学院"}, make_ds(lambda b: http_error(401, "Authentication Fails"), []))
         check("构思遇 401 → 抛出（不悄悄用模拟）", False)
     except ai.DeepSeekAPIError as e:
         check("构思遇 401 → 抛出（不悄悄用模拟）", e.status_code == 401)
     log = []
-    r = ai.draft({"intent": "我要生成魔法学院，七座法师塔，夜里"}, make_ds(router(), log))
+    r = app.draft({"intent": "我要生成魔法学院，七座法师塔，夜里"}, make_ds(router(), log))
     check("真模型路径也锁定：句子里说死的（七座法师塔、夜里）三张都补上", all(p["lighting"]["time_of_day"] == "night" for p in r["plans"])
           and all(sum(n.get("count", 0) for n in ai.all_nodes(p) if n.get("type") == "repeat" and "塔" in str((n.get("child") or {}).get("label"))) == 7 for p in r["plans"])
           and "七座法师塔" in log[0][2]["messages"][1]["content"], J(r["constraints_fixed"])[:300])
@@ -683,8 +674,7 @@ def t_deepseek() -> None:
     out = make_ds([ds_resp(raw[:k + 2] + raw[k + 4:])], log).expand("x", {}, cpt, 0, None)  # stack 后面少了 ]}（真机：悬台叠翠）
     p = out["plan"]
     check("括号少一截（修括号补在末尾）→ 落进 nodes[0] 的 spawn / relations 挪回根上，跟着进去的根节点挪回 plan.nodes",
-          len(log) == 1 and p.get("spawn", {}).get("look_at") == "core" and len(p.get("relations") or []) == 1
-          and [n.get("id") or n.get("label") for n in p["nodes"]] == ["core", "pav", "绿径"] and len(p["nodes"][0]["children"]) == 2
+          len(log) == 1 and p.get("spawn", {}).get("look_at") == "core" and len(p.get("relations") or []) == 1 and [n.get("id") or n.get("label") for n in p["nodes"]] == ["core", "pav", "绿径"] and len(p["nodes"][0]["children"]) == 2
           and any("挪回根上" in f for f in out.get("_fixes") or []), J(out.get("_fixes"))[:300])
     log = []
     make_ds([ds_resp("这不是 json"), ds_resp(J({"plan": GOOD_PLANS[0]}))], log).expand("x", {}, cpt, 0, None)
@@ -704,9 +694,9 @@ def t_deepseek() -> None:
     r = make_ds([ds_resp(J({"understood": True, "restatement": "改成迷宫", "ops": [{"op": "set", "id": "mine", "field": "layout", "value": "maze"}]}), completion=80)], log).revise(mp, {"type": "text", "text": "矿洞是个迷宫"}, set())
     check("revise：漏了 ask_to_point → 由 understood 推出，不回喂；max_tokens 2000；系统提示与展开共用（缓存）", len(log) == 1 and r["ask_to_point"] is False and log[0][2]["max_tokens"] == 2000
           and log[0][2]["messages"][0]["content"] == ai.program_system_prompt() and "当前场景程序" in log[0][2]["messages"][1]["content"])
-    r = ai.revise({"plan": mp, "action": "矿洞是个迷宫"}, make_ds([ds_resp(J({"understood": True, "restatement": "矿洞内部布局改成迷宫平面，其余不动。", "ops": [{"op": "set", "id": "mine", "field": "layout", "value": "maze"}], "ask_to_point": False}))], []))
+    r = app.revise({"plan": mp, "action": "矿洞是个迷宫"}, make_ds([ds_resp(J({"understood": True, "restatement": "矿洞内部布局改成迷宫平面，其余不动。", "ops": [{"op": "set", "id": "mine", "field": "layout", "value": "maze"}], "ask_to_point": False}))], []))
     check("revise 复述：模型已经说了「迷宫平面」就不再补一遍", r["restatement"].count("迷宫平面") == 1 and r["constraints_fixed"] == [], r["restatement"])
-    r = ai.revise({"plan": mp, "action": "矿洞是个迷宫"}, make_ds([ds_resp(J({"understood": True, "restatement": "好的。", "ops": [], "ask_to_point": False}))], []))
+    r = app.revise({"plan": mp, "action": "矿洞是个迷宫"}, make_ds([ds_resp(J({"understood": True, "restatement": "好的。", "ops": [], "ask_to_point": False}))], []))
     check("revise 锁（DeepSeek 路径）：模型漏了 → 本地补 set layout=maze，复述补「矿洞改成迷宫平面」", r["ops"] == [{"op": "set", "id": "mine", "field": "layout", "value": "maze"}] and r["restatement"].startswith("矿洞改成迷宫平面"), J(r)[:300])
     log = []
     badops = {"understood": True, "restatement": "加像", "ops": [{"op": "set", "id": "ghost", "field": "label", "value": "x"}], "ask_to_point": False}
@@ -784,7 +774,7 @@ def t_claude() -> None:
                 return fake_resp(J({"plan": GOOD_PLANS[int(m.group(1)) - 1]}))
             return fake_resp(J({"understood": True, "restatement": "改成迷宫平面", "ops": [{"op": "set", "id": "mine", "field": "layout", "value": "maze"}], "ask_to_point": False}))
         return f
-    r = ai.draft({"intent": "黄昏的魔法学院"}, make_claude(rec("beta"), rec("plain")))
+    r = app.draft({"intent": "黄昏的魔法学院"}, make_claude(rec("beta"), rec("plain")))
     kw = calls[0][1]
     check("Claude 两步：构思 1 + 展开 3，都走 beta.messages.create + server-side-fallback + fallbacks=default", len(calls) == 4 and all(n == "beta" for n, _ in calls)
           and kw["betas"] == ["server-side-fallback-2026-07-01"] and kw["fallbacks"] == "default" and r["provider"] == "claude" and r["sources"] == ["claude"] * 3)
@@ -839,7 +829,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def t_http(base: str) -> None:
     st, h = call(base, "GET", "/api/health")
-    check("health 200，无密钥 → mock", st == 200 and h["ok"] and h["mock"] is True)
+    check("health 200，无密钥 → mock；data_dir_custom 只说换没换数据目录（测试页据此拒绝在真实数据上跑），不给路径",
+          st == 200 and h["ok"] and h["mock"] is True and h["data_dir_custom"] is True and os.environ["SCENE_DIALOG_DATA_DIR"] not in J(h))
     st, s = call(base, "GET", "/api/plan/schema")
     check("GET /api/plan/schema = spec/plan.schema.json", st == 200 and s == ai.plan_schema())
     st, d = call(base, "POST", "/api/ai/draft", {"intent": "我要生成魔法学院"})
@@ -898,8 +889,7 @@ def t_http(base: str) -> None:
         st, d = call(base, "POST", "/api/ai/draft", {"intent": "我要生成魔法学院，湖边，地下有个两层的迷宫"})
         check("draft 走 DeepSeek（打桩）→ 4 次调用、思考开、cost_cny；锁定把湖 / 迷宫补进了三张",
               st == 200 and d["provider"] == "deepseek" and len(sent) == 4 and d["_usage"]["cost_cny"] is not None and sent[-1]["thinking"] == {"type": "enabled"}
-              and all(any(n.get("type") == "space" and n.get("layout") == "maze" and n.get("sublevels") == 2 for n in ai.all_nodes(p)) for p in d["plans"])
-              and d["constraints_fixed"], J(d.get("constraints_fixed"))[:300])
+              and all(any(n.get("type") == "space" and n.get("layout") == "maze" and n.get("sublevels") == 2 for n in ai.all_nodes(p)) for p in d["plans"]) and d["constraints_fixed"], J(d.get("constraints_fixed"))[:300])
         st, t = call(base, "POST", "/api/config/test", {})
         check("config/test 按当前服务商发最短请求", st == 200 and t["ok"] and t["provider"] == "deepseek" and sent[-1]["max_tokens"] == 8)
 
@@ -923,6 +913,236 @@ def t_http(base: str) -> None:
     check("清除密钥 → has_key=false、mock=true", not c["providers"]["deepseek"]["has_key"] and c["mock"] is True)
 
 
+# ============================================================ v6：场景会话、用户记忆、引用与历史（docs/07）
+class CountingAI(ai.MockAI):
+    """记下每次 revise 调用（文字与 ctx）的模拟 AI"""
+
+    def __init__(self):
+        self.calls, self.ctx = [], []
+
+    def revise(self, plan, action, locked_ids, ctx=None):
+        self.calls.append(("revise", action.get("text")))
+        self.ctx.append(ctx)
+        return super().revise(plan, action, locked_ids, ctx)
+
+
+def market_plan() -> dict:
+    """有一块圈选 mark_1、一笔手绘线 mark_2、一个图钉 mark_3 的程序"""
+    return {**copy.deepcopy(academy()), "marks": [{"id": "mark_1", "type": "area", "label": "圈选 1", "polygon_m": [[-40, -24], [41, -24], [41, 24], [-40, 24]]},
+                                                  {"id": "mark_2", "type": "trace", "label": "手绘线 1", "path_m": [[-60, 50], [0, 52], [60, 50]]},
+                                                  {"id": "mark_3", "type": "pin", "label": "图钉 1", "point_m": [17.37, -33.29]}]}
+
+
+def no_marks(p: dict) -> dict:
+    """schema 还没有 marks 时也能校验其余部分（引擎任务给 schema 加 marks[]）"""
+    return p if "marks" in (ai.plan_schema().get("properties") or {}) else {k: v for k, v in p.items() if k != "marks"}
+
+
+def raises(fn, exc) -> str | None:
+    try:
+        fn()
+    except exc as e:
+        return str(e) or exc.__name__
+    return None
+
+
+REF_MARK = {"kind": "mark", "id": "mark_1", "label": "圈选 1", "facts": {"size_m": [81, 48], "area_m2": 2950, "ground_y": [3, 7], "contains": ["main_house"], "near": ["gate"]}}
+MARK_REVS: list = []
+RV_EMPTY = {"understood": True, "restatement": "好", "ops": [], "ask_to_point": False}
+
+
+def t_scenes() -> None:
+    d = os.environ["SCENE_DIALOG_DATA_DIR"]
+    check("SCENE_DIALOG_DATA_DIR 换掉数据目录（场景 / 记忆 / 配置都在 build/ 下的临时目录）", ai.data_dir() == d and str(app.scenes_dir()).startswith(d)
+          and str(app.memory_path()).startswith(d) and ai.config_path().startswith(d) and os.path.abspath(d).startswith(os.path.join(ROOT, "build")))
+    a = app.scene_create({"name": "场景 A", "data": {"plan": academy(), "chat": [{"role": "user", "text": "你好"}]}})
+    time.sleep(0.01)
+    b = app.scene_create({"data": {"plan": None}})
+    rows = app.scene_list()
+    check("新建两个场景：列表按 updated 倒序、默认名「场景 N」", [r["id"] for r in rows[:2]] == [b["id"], a["id"]] and b["name"].startswith("场景 "), J(rows)[:300])
+    time.sleep(0.01)
+    u = app.scene_put(a["id"], {"name": "  学院  ", "data": {"plan": academy(), "chat": []}})
+    check("PUT 改名 + 存数据 → 名字去空白、排到最前；原子写不留临时文件", u["name"] == "学院" and app.scene_list()[0]["id"] == a["id"] and app.scene_get(a["id"])["data"]["chat"] == [] and not [p for p in app.scenes_dir().iterdir() if p.name.endswith(".tmp")])
+    big = raises(lambda: app.scene_put(a["id"], {"data": {"big": "x" * (app.SCENE_MAX_BYTES + 10)}}), app.TooLarge)
+    check("数据超过 5 MB → 拒绝并说明（原文件不动）", big and "5 MB" in big and app.scene_get(a["id"])["name"] == "学院", big)
+    dup = app.scene_duplicate(a["id"])
+    check("复制 → 新 id、名字带「副本」、数据一样", dup["id"] != a["id"] and dup["name"] == "学院 副本" and app.scene_get(dup["id"])["data"] == app.scene_get(a["id"])["data"])
+    app.scene_delete(b["id"])
+    trash = app.scene_list(trash=True)
+    check("删除 → 进回收站（列表里没有、GET 提示在回收站、回收站 purge_at = 7 天后）", b["id"] not in [r["id"] for r in app.scene_list()]
+          and "回收站" in (raises(lambda: app.scene_get(b["id"]), app.NotFound) or "") and trash[0]["id"] == b["id"] and trash[0]["purge_at"] - trash[0]["deleted"] == 7 * 86400_000)
+    app.scene_restore(b["id"])
+    check("恢复 → 回到列表", b["id"] in [r["id"] for r in app.scene_list()] and not app.scene_list(trash=True))
+    m = app.memory_add({"text": "这个场景要有雾", "scope": "scene", "scene_id": b["id"]})
+    app.scene_delete(b["id"])
+    tp = app.trash_dir() / f"{b['id']}.json"
+    doc = json.load(open(tp, encoding="utf-8"))
+    doc["deleted"] -= 8 * 86400_000
+    json.dump(doc, open(tp, "w", encoding="utf-8"))
+    check("回收站超过 7 天 → 永久删，场景级记忆一起删", app.purge_trash() == [b["id"]] and not tp.exists() and m["id"] not in [x["id"] for x in app.memory_list()])
+    check("场景 id 不合法（路径穿越）→ NotFound", raises(lambda: app.scene_get("../config"), app.NotFound))
+    n = app.scene_put("sOffline01", {"name": "离线建的", "data": {"x": 1}})
+    check("PUT 不存在的 id → 按这个 id 新建（前端离线时起的 id）", n.get("created_new") and app.scene_get("sOffline01")["data"] == {"x": 1})
+    for r in app.scene_list():
+        app.scene_delete(r["id"])
+
+
+def t_memory() -> None:
+    app.memory_clear({})
+    a = app.memory_add({"text": "喜欢夜景", "kind": "like"})
+    dup = app.memory_add({"text": "我喜欢夜景。"})
+    check("记忆新增 → 条目（kind / scope=global / source=you / enabled / uses=0）；近似的不重复存（duplicate）",
+          a["kind"] == "like" and a["scope"] == "global" and a["source"] == "you" and a["enabled"] and a["uses"] == 0 and dup.get("duplicate") and dup["id"] == a["id"] and len(app.memory_list()) == 1)
+    check("喜欢 vs 不喜欢 不算重复", not app.memory_similar({"text": "喜欢对称", "kind": "like"}, {"text": "不喜欢对称", "kind": "dislike"}))
+    u = app.memory_update(a["id"], {"enabled": False, "text": "喜欢夜景和霓虹"})
+    app.memory_delete(a["id"])
+    for t in ("a1", "b2", "c3"):
+        app.memory_add({"text": "规矩" + t})
+    check("改文字 / 关掉、删一条、清空", u["enabled"] is False and u["text"] == "喜欢夜景和霓虹" and len(app.memory_list()) == 3 and app.memory_clear({})["removed"] == 3)
+    sp = app.split_memory("记住：我喜欢夜景，不要撒小房子")
+    check("本地识别「记住：…」→ 两条（like / dislike），没有剩下的话", [(m["text"], m["kind"]) for m in sp[0]] == [("喜欢夜景", "like"), ("不要撒小房子", "dislike")] and sp[1] == "", J(sp))
+    sp = app.split_memory("把塔加高一点，以后都用穹顶")
+    check("「…，以后都…」→ 记忆一条 rule + 剩下的改动交给 AI", [(m["text"], m["kind"]) for m in sp[0]] == [("以后都用穹顶", "rule")] and sp[1] == "把塔加高一点", J(sp))
+    nots = [t for t in ("我不喜欢这个塔", "还是没改", "这里做成夜市", "我喜欢夜景") if app.split_memory(t)[0]]
+    check("「我不喜欢这个塔 / 还是没改 / 这里做成夜市 / 我喜欢夜景」不是本地记忆（交给 AI）", not nots, nots)
+    check("「别再加塔了」「我讨厌对称」→ dislike", [m["kind"] for s in ("别再加塔了", "我讨厌对称") for m in app.split_memory(s)[0]] == ["dislike", "dislike"])
+
+    c = CountingAI()
+    r = app.revise({"plan": academy(), "action": "记住：我喜欢夜景，不要撒小房子"}, c)
+    check("revise「记住：…」→ 不调 AI、ops 空、回「记住了：…」、记忆里两条", c.calls == [] and r["ops"] == [] and r["restatement"].startswith("记住了：喜欢夜景；不要撒小房子")
+          and r["provider"] == "local" and len(app.memory_list()) == 2 and r["_usage"]["calls"] == 0 and len(r["memory_saved"]) == 2, J(r)[:300])
+    r = app.revise({"action": "记住：我做的是赛博朋克游戏"}, c)
+    check("还没有程序也能「记住」（kind=fact）", c.calls == [] and r["memory_saved"][0]["kind"] == "fact", J(r)[:200])
+    r = app.revise({"plan": academy(), "action": "塔再高一点，以后都用穹顶"}, c)
+    check("带改动的「…以后都…」→ 存一条 + 只拿改动那半句调 AI 一次", c.calls == [("revise", "塔再高一点")] and r["ops"] and r["memory_note"] == "记住了：以后都用穹顶", J(r)[:300])
+    r = app.draft({"intent": "记住：不要对称布局"}, c)
+    check("draft「记住：…」→ 不调 AI，plans 空 + memory_saved", r["plans"] == [] and r["memory_saved"] and len(c.calls) == 1, J(r)[:200])
+
+    other = app.memory_add({"text": "只在别的场景用的偏好", "scope": "scene", "scene_id": "sOther"})
+    mine = app.memory_add({"text": "本场景都用红色屋顶", "scope": "scene", "scene_id": "sMine"})
+    off = app.memory_update(app.memory_add({"text": "关掉的偏好不该出现"})["id"], {"enabled": False})
+    log: list = []
+    rv = J({**RV_EMPTY, "memory_suggestions": [{"text": "夜景优先", "kind": "rule"}, {"text": "讨厌雨天的场景", "kind": "dislike"}, {"text": "讨厌雨天", "kind": "dislike"}]})
+    r = app.revise({"plan": academy(), "action": "主殿换成穹顶", "scene_id": "sMine"}, make_ds([ds_resp(rv)], log))
+    sysmsg = log[0][2]["messages"][0]["content"]
+    ids = r["_usage"]["memory_ids"]
+    check("记忆进系统提示：在稳定前缀之后、按 kind 分组、全局 + 本场景、不含别的场景 / 关掉的，并说明这句话优先",
+          sysmsg.startswith(ai.program_system_prompt()) and "用户偏好（跨场景" in sysmsg and "人这句话说的优先于偏好" in sysmsg and "喜欢：\n- 喜欢夜景" in sysmsg
+          and "不喜欢 / 别做：" in sysmsg and "本场景都用红色屋顶（本场景）" in sysmsg and "别的场景" not in sysmsg and "关掉的" not in sysmsg, sysmsg[-600:])
+    check("_usage.memory_ids = 用到的 6 条（本场景的在前）；uses + 1", ids[0] == mine["id"] and other["id"] not in ids and off["id"] not in ids and len(ids) == 6 and {m["id"]: m for m in app.memory_list()}[mine["id"]]["uses"] == 1, J(r["_usage"]))
+    check("memory_suggestions 去重：和已有记忆近似的（夜景优先 ≈ 喜欢夜景）、彼此近似的不提", r["memory_suggestions"] == [{"text": "讨厌雨天的场景", "kind": "dislike"}], J(r["memory_suggestions"]))
+    log2: list = []
+    app.draft({"intent": "我要生成魔法学院", "scene_id": "sMine"}, make_ds(router(), log2))
+    check("draft 的构思 / 展开调用系统提示后面也附偏好", len(log2) == 4 and all("用户偏好（跨场景" in x[2]["messages"][0]["content"] for x in log2))
+    calls = []
+    app.revise({"plan": academy(), "action": "x"}, make_claude(lambda **kw: calls.append(kw) or fake_resp(J(RV_EMPTY)), None))
+    blocks = calls[0]["system"]
+    check("Claude：偏好是第二个系统块（在 cache_control 断点之后，前缀照样命中缓存）",
+          len(blocks) == 2 and blocks[0]["cache_control"] == {"type": "ephemeral"} and "cache_control" not in blocks[1] and "用户偏好" in blocks[1]["text"])
+    rs = ai.revise_schema()
+    check("revise / 构思的输出 schema 有可选 memory_suggestions（≤ 2 条），构思提示词说明了它；构思要把相关偏好写进概念（夜景 → 夜里的什么景）", "memory_suggestions" in rs["properties"] and "memory_suggestions" not in rs["required"]
+          and ai.CONCEPT_SCHEMA["properties"]["memory_suggestions"]["maxItems"] == 2 and "memory_suggestions" in ai.concept_system_prompt() and "夜里的什么景" in ai.concept_system_prompt())
+
+    app.memory_clear({})  # 模拟 AI 读偏好：新场景三张都是夜里、没有撒房子；关掉后不再生效
+    app.revise({"action": "记住：我喜欢夜景，不要撒小房子"})
+    houses = lambda d: [n for p in d["plans"] for n in ai.all_nodes(p) if n.get("type") == "scatter_houses"]  # noqa: E731
+    d = app.draft({"intent": "山城村庄", "force_mock": True})
+    check("偏好生效（模拟）：三张都是夜里、都没有撒房子", all(p["lighting"]["time_of_day"] == "night" for p in d["plans"]) and not houses(d) and len(d["_usage"]["memory_ids"]) == 2,
+          J([(p["lighting"], [n.get("type") for n in p["nodes"]]) for p in d["plans"]])[:300])
+    for m in app.memory_list():
+        app.memory_update(m["id"], {"enabled": False})
+    d = app.draft({"intent": "山城村庄", "force_mock": True})
+    check("关掉后不再生效", d["_usage"]["memory_ids"] == [] and (any(p["lighting"]["time_of_day"] != "night" for p in d["plans"]) or houses(d)))
+    app.memory_clear({})
+
+
+def t_refs_history() -> None:
+    p = market_plan()
+    hist = [{"role": "user", "text": f"第 {i} 句" + "很长" * 60} if i % 2 == 0 else {"role": "ai", "text": f"回 {i}", "ops": 1, "effect": "加了 1 个"} for i in range(30)]
+    hist += [{"role": "user", "text": "把谷仓弧墙连起来"}, {"role": "ai", "text": "连好了", "ops": 0, "effect": "没有看得见的变化"}]
+    log: list = []
+    app.revise({"plan": p, "action": "这里做成夜市", "refs": [REF_MARK, {"kind": "node", "id": "towers", "instance": 2, "label": "法师塔[2]", "facts": {"type": "tower"}}],
+                "history": hist}, make_ds([ds_resp(J(RV_EMPTY))], log))
+    user = log[0][2]["messages"][1]["content"]
+    check("refs 进提示词：一行一个 JSON（facts 原样）+「这 / 这里 / 这块 / 它」优先指 refs", '"instance":2' in user and "优先指这些" in user and J({k: REF_MARK[k] for k in ("kind", "id", "label", "facts")}).replace(" ", "") in user.replace(" ", ""), user[:1500])
+    check("marks：提示词讲清 area / trace / pin 怎么用（at / area / along）、锚到圈选要放得下、方位照 from_landmark，只给大小、不给坐标",
+          'area:"mark_1"' in user and 'along:"mark_2"' in user and 'at:"mark_3"' in user and '"size_m":[81,48]' in user and "17.37" not in user and "-33.29" not in user and "要放得下" in user and "from_landmark" in user)
+    check("history：只带最近 10 轮、长的压成一句；上一轮没生效 → 提示换一种改法", "人：把谷仓弧墙连起来" in user and "AI：连好了（ops 0；效果：没有看得见的变化）" in user and "第 10 句" not in user and "第 12 句" in user and "很长" * 41 not in user and "换一种改法" in user, user[-1200:])
+    log = []
+    app.revise({"plan": p, "action": "还不够", "history": [{"role": "ai", "text": "加了夜市", "ops": 2, "effect": "新增 夜市 ×12"}]}, make_ds([ds_resp(J(RV_EMPTY))], log))
+    check("上一轮生效了 → 提示同方向加大力度", "加大力度" in log[0][2]["messages"][1]["content"])
+    log = []
+    app.revise({"plan": p, "action": "还是太空了", "refs": [{**REF_MARK, "carried": True}],
+                "history": [{"role": "user", "text": "这里做成夜市（引用：圈选 1）", "refs": ["mark_1"]},
+                            {"role": "ai", "text": "加了夜市", "ops": 2, "ids": ["night_market", "night_light"], "effect": "改了：夜市 新增"}]}, make_ds([ds_resp(J(RV_EMPTY))], log))
+    user = log[0][2]["messages"][1]["content"]
+    check("没加引用的接着说（carried）：提示词写「接着上一轮…上一轮人指的是」+ 那块的事实；历史里人那条带「指：mark_1」、AI 那条带「动了 …」；只动上一轮动过的，别处不顺手改；加个数要缩间距",
+          "接着上一轮" in user and "上一轮人指的是" in user and '"size_m":[81,48]' in user and "优先指这些" not in user and "（指：mark_1）" in user
+          and "动了 night_market, night_light" in user and "别的部分不要顺手改" in user and "间距跟着缩" in user, user[-1600:])
+    check("标记只能引用：set / remove 标记 → 错误", len(ai.check_ops(p, [{"op": "set", "id": "mark_1", "field": "label", "value": "x"}, {"op": "remove", "id": "mark_2"}])[1]) == 2)
+    pos = ai.plan_out_schema()
+    check("AI 视图 / 语法表里没有 marks（坐标由人给）", "marks" not in (pos.get("definitions") or pos.get("$defs"))["plan"].get("properties", {}) and "marks" not in ai.grammar().split("\n")[0])
+    out, fx, _ = ai.postprocess_plan({"plan": {**academy(), "marks": [{"id": "mark_9", "type": "pin", "point_m": [1, 2]}]}})
+    check("展开回来的程序里 AI 写了 marks → 去掉", "marks" not in out["plan"] and any("marks" in x for x in fx))
+
+    c = CountingAI()  # 模拟 AI：引用 → 在标记上放夜市；历史「还是太空了」→ 同一处加密度 + 加东西；「我喜欢夜景」→ 建议记住
+    r = app.revise({"plan": p, "action": "这里做成夜市", "refs": [REF_MARK]}, c)
+    add = next((o["value"] for o in r["ops"] if o["op"] == "add"), {})
+    p2 = ai.apply_ops(p, r["ops"])
+    check("模拟 revise 用 refs：「这里做成夜市」→ 加一组夜市，范围锚在 mark_1；ctx 带 refs", add.get("area") == "mark_1" and add.get("label") == "夜市" and c.ctx[0]["refs"] == [REF_MARK] and not valid(no_marks(p2)) and "圈选 1" in r["restatement"], J(r)[:400])
+    hist = [{"role": "user", "text": "这里做成夜市"}, {"role": "ai", "text": r["restatement"], "ops": len(r["ops"]), "effect": "新增 夜市 ×12"}]
+    r2 = app.revise({"plan": p2, "action": "还是太空了", "history": hist, "refs": [REF_MARK]}, c)
+    cnt = next((o["value"] for o in r2["ops"] if o.get("field") == "count" and o.get("id") == add["id"]), None)
+    check("模拟 revise 用 history：「还是太空了」→ 同一组夜市加密度（12 → 18）+ 加灯柱，复述写清", cnt == 18 and "18" in r2["restatement"]
+          and any(o["op"] == "add" and o["value"].get("area") == "mark_1" for o in r2["ops"]) and not valid(no_marks(ai.apply_ops(p2, r2["ops"]))), J(r2)[:400])
+    r3 = app.revise({"plan": p, "action": "我喜欢夜景"}, c)
+    app.memory_add({"text": "喜欢夜景", "kind": "like"})
+    r4 = app.revise({"plan": p, "action": "我喜欢夜景"}, c)
+    check("模拟 revise：「我喜欢夜景」→ 建议记住一条 like（同一次调用带回）；已经记住的不再建议",
+          r3["memory_suggestions"] == [{"text": "喜欢夜景", "kind": "like"}] and c.calls.count(("revise", "我喜欢夜景")) == 2 and r4["memory_suggestions"] == [], J(r3)[:300])
+    d = app.draft({"intent": "我喜欢雨天，来个海盗港口", "force_mock": True})
+    check("draft 构思回包里的 memory_suggestions 带出来（模拟）", d["memory_suggestions"] == [{"text": "喜欢雨天", "kind": "like"}], J(d.get("memory_suggestions")))
+    lk = app.draft({"intent": "海盗港口", "force_mock": True, "locked": {"plan": p, "ids": []}})
+    check("换一批：人画的标记跟着新的三张走", all(q.get("marks") == p["marks"] for q in lk["plans"]))
+    app.memory_clear({})
+    MARK_REVS.extend([{"text": "这里做成夜市", "base": p, "ops": r["ops"], "plan": p2}, {"text": "还是太空了", "base": p2, "ops": r2["ops"], "plan": ai.apply_ops(p2, r2["ops"])}])
+
+
+def t_http_v6(base: str) -> None:
+    st, s = call(base, "POST", "/api/scenes", {"name": "HTTP 场景", "data": {"plan": academy()}})
+    sid = s.get("id")
+    lst = call(base, "GET", "/api/scenes")[1]
+    g = call(base, "GET", f"/api/scenes/{sid}")[1]
+    check("POST /api/scenes → {id}；GET 列表 [{id, name, updated}]（不带 data）；GET /api/scenes/<id> → {id, name, data}", st == 200 and sid and lst[0]["id"] == sid
+          and lst[0]["name"] == "HTTP 场景" and "data" not in lst[0] and g["data"]["plan"]["name"] == academy()["name"])
+    st, u = call(base, "PUT", f"/api/scenes/{sid}", {"name": "改名了", "data": {"plan": None, "chat": [1]}})
+    st2, e = call(base, "PUT", f"/api/scenes/{sid}", {"data": {"big": "x" * (5 * 1024 * 1024 + 1)}})
+    check("PUT /api/scenes/<id> 改名 + 存数据；超过 5 MB → 413 + 说明", st == 200 and u["name"] == "改名了" and call(base, "GET", f"/api/scenes/{sid}")[1]["data"]["chat"] == [1] and st2 == 413 and "5 MB" in e["message"], J(e)[:200])
+    st, dp = call(base, "POST", f"/api/scenes/{sid}/duplicate", {})
+    st1, _ = call(base, "DELETE", f"/api/scenes/{sid}")
+    st2, _ = call(base, "GET", f"/api/scenes/{sid}")
+    tr = call(base, "GET", "/api/scenes?trash=1")[1]
+    st3, _ = call(base, "POST", f"/api/scenes/{sid}/restore", {})
+    check("duplicate → 新 id；DELETE → 回收站（GET 404，?trash=1 列出来）；restore → 回来；id 路径穿越 → 404",
+          st == 200 and dp["id"] != sid and st1 == 200 and st2 == 404 and tr[0]["id"] == sid and st3 == 200 and call(base, "GET", f"/api/scenes/{sid}")[0] == 200 and call(base, "GET", "/api/scenes/..%2F..%2Fconfig")[0] == 404)
+    st, m = call(base, "POST", "/api/memory", {"text": "喜欢夜景", "kind": "like", "scope": "global"})
+    ms = call(base, "GET", "/api/memory")[1]
+    st2, u = call(base, "PUT", f"/api/memory/{m['id']}", {"enabled": False})
+    st3, _ = call(base, "POST", "/api/memory", {"text": "x", "scope": "scene"})
+    st4, _ = call(base, "DELETE", f"/api/memory/{m['id']}")
+    check("/api/memory：POST → 条目、GET → 数组、PUT 关掉、参数不对 400、DELETE 200 再删 404", st == 200 and ms[0]["id"] == m["id"] and st2 == 200 and u["enabled"] is False and st3 == 400 and st4 == 200 and call(base, "DELETE", f"/api/memory/{m['id']}")[0] == 404)
+    st, r = call(base, "POST", "/api/ai/revise", {"plan": academy(), "action": "记住：我喜欢夜景，不要撒小房子", "_memory": [{"id": "fake", "text": "注入"}]})
+    check("POST /api/ai/revise「记住：…」→ 本地存两条、provider=local", st == 200 and r["provider"] == "local" and len(call(base, "GET", "/api/memory")[1]) == 2)
+    st, r = call(base, "POST", "/api/ai/revise", {"plan": market_plan(), "action": "这里做成夜市", "refs": [REF_MARK], "scene_id": sid, "force_mock": True,
+                                                  "_memory": [{"id": "fake", "text": "注入"}]})
+    check("POST /api/ai/revise 带 refs → 夜市锚在 mark_1；_usage.memory_ids 用了 2 条；客户端塞的 _memory 不算", st == 200 and len(r["_usage"]["memory_ids"]) == 2
+          and any(o["op"] == "add" and o["value"].get("area") == "mark_1" for o in r["ops"]) and "fake" not in r["_usage"]["memory_ids"], J(r)[:300])
+    st, c = call(base, "POST", "/api/memory/clear", {})
+    check("POST /api/memory/clear", st == 200 and c["removed"] == 2 and call(base, "GET", "/api/memory")[1] == [])
+    for row in call(base, "GET", "/api/scenes")[1]:
+        call(base, "DELETE", f"/api/scenes/{row['id']}")
+
+
 MOCK_FIXTURE = os.path.join(ROOT, "build", "eval", "mock-drafts.json")
 
 
@@ -932,7 +1152,7 @@ def t_engine_fixture() -> None:
     plans, revs = [], []
     for t in ACCEPT + ["地下有个矿洞，是个两层的迷宫", "湖心岛上的城堡"]:
         for variant in (0, 1):
-            plans += ai.draft({"intent": t, "force_mock": True, "variant": variant})["plans"]
+            plans += app.draft({"intent": t, "force_mock": True, "variant": variant})["plans"]
     frags = []
     for f in ai.FRAGMENTS:
         p = {"name": f["name"][:16], "site": {"size_m": [220, 220], "ground": f.get("ground", "flat")}, "terrain": [], "nodes": [], "spawn": {"at": "site.S"}}
@@ -945,13 +1165,13 @@ def t_engine_fixture() -> None:
         frags.append(p)
     for p in plans[:4]:
         for text in ("塔再高一点", "加一座桥", "多加几座塔", "加一个地下迷宫", "加一圈城墙"):
-            r = ai.revise({"plan": copy.deepcopy(p), "action": text, "force_mock": True})
+            r = app.revise({"plan": copy.deepcopy(p), "action": text, "force_mock": True})
             if r.get("ops"):
                 revs.append({"text": text, "base": p, "ops": r["ops"], "plan": ai.apply_ops(copy.deepcopy(p), r["ops"])})
     bad = [(p["name"], valid(p)[:2]) for p in plans + frags + [r["plan"] for r in revs] if valid(p)]
     os.makedirs(os.path.dirname(MOCK_FIXTURE), exist_ok=True)
     with open(MOCK_FIXTURE, "w", encoding="utf-8") as fh:
-        json.dump({"plans": plans + frags, "revisions": revs}, fh, ensure_ascii=False)
+        json.dump({"plans": plans + frags, "revisions": revs, "mark_revisions": MARK_REVS}, fh, ensure_ascii=False)  # mark_revisions：带 marks 的（schema 有 marks 后引擎可编）
     check(f"模拟输出存给引擎编译：{len(plans)} 张 draft + {len(frags)} 个片段 + {len(revs)} 次 revise，全部合 schema（build/eval/mock-drafts.json）",
           not bad and len(frags) == len(ai.FRAGMENTS) and len(revs) >= 8, J(bad)[:400])
 
@@ -960,20 +1180,22 @@ def main() -> int:
     for s in (sys.stdout, sys.stderr):
         if s is not None and hasattr(s, "reconfigure"):
             s.reconfigure(encoding="utf-8", errors="replace")
-    for fn in (t_schema, t_ops, t_locks, t_mock, t_two_step, t_deepseek, t_claude, t_engine_fixture):
+    for fn in (t_schema, t_ops, t_locks, t_mock, t_two_step, t_deepseek, t_claude, t_scenes, t_memory, t_refs_history, t_engine_fixture):
         try:
             fn()
         except Exception:  # noqa: BLE001  一组炸了不影响别的组
             import traceback
             check(f"{fn.__name__} 没有异常", False, traceback.format_exc()[-1500:])
     srv, port = app.start_server(ROOT, 0)
-    try:
-        t_http(f"http://127.0.0.1:{port}")
-    except Exception:  # noqa: BLE001
-        import traceback
-        check("t_http 没有异常", False, traceback.format_exc()[-1500:])
-    finally:
-        srv.shutdown()
+    for fn in (t_http, t_http_v6):
+        try:
+            fn(f"http://127.0.0.1:{port}")
+        except Exception:  # noqa: BLE001
+            import traceback
+            check(f"{fn.__name__} 没有异常", False, traceback.format_exc()[-1500:])
+    srv.shutdown()
+    import shutil
+    shutil.rmtree(os.environ["SCENE_DIALOG_DATA_DIR"], ignore_errors=True)
     failed = [r for r in results if not r[1]]
     print(f"\nDONE passed={len(results) - len(failed)} failed={len(failed)}")
     return 1 if failed else 0

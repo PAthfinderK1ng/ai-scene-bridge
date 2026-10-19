@@ -1,6 +1,7 @@
 // views/map.js — 俯视图：渲染 + 图层 + 标签避让 + 手势（v4，docs/05 §6；吸收原 maplayers / maplabels / mapgestures）。
 // v5（docs/06 §5）：每种形体画真实轮廓（矩形 / 椭圆 / n 边形 / 环 / 拱的两腿），屋顶纹样，悬空虚线 + 「↑18 m」，路按 style 画；
-// 形体约定（shapeOf / volDims / roofOf / volumeBase / footprintPolygon …）在这里导出，剖面 / 第一眼 / 3D 共用。
+// 形体约定（shapeOf / volDims / roofOf / volumeBase / footprintPolygon …）在 engine/layout.js，这里转出，剖面 / 第一眼 / 3D 共用。
+// v6（docs/07）：标记（圈选 / 手绘线 / 图钉）、地形操作的中心 / 高度把手、「高度」工具（随意选点上下拖）、图钉手势（右键 / Ctrl+点）。
 // 纯函数：数据进（ctx）、SVG 出、回调出；不 import app.js / ui.js，不调 AI。
 // 坐标：viewBox 直接用米（x 向右 = 东，y 向下 = +z 南），北在上；字号按图宽缩放（u = 图宽 / 120）。
 // 图上每个可点的东西带 data-type / data-plan-id / data-sid-id（空间内部另带 data-part / data-sublevel），
@@ -8,6 +9,8 @@
 // （通道按真实宽度、房间填色、入口 / 终点、层间连接），当前内部层实画、其它内部层淡画。
 import { pointInPolygon, polygonCentroid, polygonArea, clamp, distToPolygon } from "../engine/terrain.js";
 import { sectionPath, widthClamp } from "../engine/section.js";
+// 高度笔刷 / 把手数值（heightBrush、heightStroke、drawHeightBrush、OP_RANGE、opValueText）在 profile.js：剖面和俯视图共用；这里只在函数里用（两文件互相引用，顶层不取值）
+import { heightBrush, heightStroke, drawHeightBrush, brushStep, HEIGHT_M_PER_PX, OP_RANGE, opValueText } from "./profile.js";
 import { ringOf, footRects } from "../engine/layout.js";
 export { ringOf };
 import { levelsOf, entryLevel, goalLevel, VIA_LABEL, ROLE_LABEL, LAYOUT_LABEL, SKY_LAYOUT_LABEL } from "../engine/interior.js";
@@ -58,83 +61,9 @@ export function paletteOf(sid) {
   for (const p of (sid.style && sid.style.palette) || []) if (p && p.role) m[p.role] = p.hex;
   return Object.assign({ roof: "#4A4A4A", wall: "#D9C9A3", stone: "#9A9890", foliage: "#4F6B3A", mist: "#DDE6F0" }, m);
 }
-// ------------------------------------------------------------ 形体（v5 SID 体块约定，docs/06 §4.8；四个视图共用）
-/** 体块形体 */
-export const SHAPES = Object.freeze(["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"]);
-/** 路的样式 */
-export const PATH_STYLES = Object.freeze(["path", "road", "stairs", "ramp", "bridge", "rope_bridge", "tunnel", "canal", "portal"]);
-/** 屋顶（building / tower 才有） */
-export const ROOFS = Object.freeze(["gable", "hip", "flat", "dome", "spire", "none"]);
-const SHAPE_ALIAS = { cube: "box", block: "box", hemisphere: "dome", ring: "torus", ball: "sphere", ramp: "wedge", hex: "prism", polygon: "prism", cyl: "cylinder" };
-const ROOF_ALIAS = { cone: "spire", pointed: "spire", conical: "spire", pyramid: "hip", hipped: "hip", gabled: "gable", onion: "dome", dome: "dome", flat: "flat", none: "none", gable: "gable", hip: "hip", spire: "spire" };
-/** 俯视是圆的形体（占地按椭圆） */
-export const ROUND_SHAPES = new Set(["cylinder", "cone", "dome", "sphere", "torus", "prism"]);
-/** 规范化形体名（缺省 box） */
-export function shapeOf(v) { const s = String((v && v.shape) || "box").toLowerCase(); return SHAPES.includes(s) ? s : SHAPE_ALIAS[s] || "box"; }
-/** SID 原始尺寸 [宽, 总高（含屋顶）, 深] */
-function rawDims(v) {
-  const s = (v && Array.isArray(v.size)) ? v.size : [];
-  const w = Math.max(0.1, Number(s[0]) || 1), h = Math.max(0.05, Number(s[1]) || 1), d = Number(s[2]) > 0 ? Number(s[2]) : w;
-  return [w, h, d];
-}
-/**
- * 体块三维尺寸 [宽 x, 墙身高 y, 深 z]：圆形体 size = [直径, 高, (直径 z)]、prism = [直径, 高]，深缺省 = 宽。
- * SID v0.5：size[1] 是总高（含屋顶 roof_h），这里返回的 y 是去掉屋顶的墙身高——视图「墙身 + 屋顶」叠起来正好 = size[1]。
- */
-export function volDims(v) {
-  const [w, h, d] = rawDims(v), r = roofOf(v);
-  return [w, r ? Math.max(0.05, h - r.h) : h, d];
-}
-/** prism 的边数（3–12，缺省 6） */
-export const prismSides = (v) => clamp(Math.round(Number(v && v.sides) || 6), 3, 12);
-/** 拱的腿厚（缺省宽的 18%，至少 0.6 m，最多宽的 45%） */
-export function archThickness(v) { const [w] = volDims(v); return clamp(Number(v.thickness) > 0 ? Number(v.thickness) : Math.max(0.6, w * 0.18), 0.2, w * 0.45); }
-/** 环的管径（平放 = 高；立起来 orient upright = 厚 size[2]；夹在直径的 6%–35%） */
-export function torusTube(v) { const [w, h, d] = volDims(v); return clamp(v && v.orient === "upright" ? d : h, w * 0.06, w * 0.35); }
-/** 立起来的环（torus + orient upright）：环面竖着，按 rotation_y 朝向 */
-export const isUpright = (v) => !!v && v.orient === "upright" && shapeOf(v) === "torus";
-/**
- * 屋顶：只有 kind building / tower 有。缺省 building = gable、tower = spire；别名 cone → spire、pyramid → hip。
- * SID v0.5：屋顶在 size[1]（总高）之内、顶部那一段，高 h = v.roof_h（引擎给）；没给时按引擎同一规则估：
- * spire min(长边, 0.45 总高)、dome min(短边 / 2, 0.45 总高)、gable / hip min(0.35 短边, 0.4 总高)、flat min(0.5, 0.1 总高)（压顶板）、none 0。
- * @returns {{type: string, h: number} | null}
- */
-export function roofOf(v) {
-  if (!v || (v.kind !== "building" && v.kind !== "tower")) return null;
-  const raw = v.roof == null ? (v.kind === "tower" ? "spire" : "gable") : String(v.roof).toLowerCase(), type = ROOF_ALIAS[raw] || "gable";
-  const [w, h, d] = rawDims(v), mn = Math.min(w, d), mx = Math.max(w, d);
-  let rh = { gable: Math.min(mn * 0.35, h * 0.4), hip: Math.min(mn * 0.35, h * 0.4), dome: Math.min(mn / 2, h * 0.45), spire: Math.min(mx, h * 0.45), flat: Math.min(0.5, h * 0.1), none: 0 }[type];
-  if (Number(v.roof_h) >= 0 && v.roof_h != null) rh = Number(v.roof_h);
-  return { type, h: clamp(rh, 0, h * 0.9) };
-}
-/** 离地高度（米）：v.elev（底面离地，> 0 = 悬空） */
-export const elevOf = (v) => Math.max(0, Number(v && v.elev) || 0);
-/**
- * 体块底面的世界高度：position[1] 是底面绝对高度；悬空（elev > 0）时至少是中心地面 + elev（引擎只给 elev 没抬 position[1] 时也对）。
- * @param {object} v SID volume
- * @param {object} [T] buildTerrain 结果
- */
-export function volumeBase(v, T) {
-  const y = Number(v.position[1]), e = elevOf(v);
-  if (!T) return Number.isFinite(y) ? y : e;
-  const g = T.heightAt(v.position[0], v.position[2]);
-  if (!Number.isFinite(y)) return g + e;
-  return e > 0 ? Math.max(y, g + e) : y;
-}
-/** 体块最高点（墙身 + 屋顶） */
-export function volumeTop(v, T) { const r = roofOf(v); return volumeBase(v, T) + volDims(v)[1] + (r ? r.h : 0); }
-/** 局部 (lx, lz) → 世界 [x, z]（rotation_y 度，俯视逆时针为正；与 layout.boxCorners 同一约定） */
-export function volToWorld(v, lx, lz) {
-  const t = ((v.rotation_y || 0) * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
-  return [v.position[0] + lx * c + lz * s, v.position[2] - lx * s + lz * c];
-}
-/** 体块俯视占地多边形（世界坐标）：圆形体 = 椭圆 20 点、prism = n 边形、其它 = 旋转矩形；pad 向外扩 */
-export function footprintPolygon(v, pad = 0) {
-  const sh = shapeOf(v), [w, , d] = volDims(v), rx = w / 2 + pad, rz = d / 2 + pad;
-  if (sh === "prism") { const n = prismSides(v); return Array.from({ length: n }, (_, k) => { const a = (2 * Math.PI * k) / n - Math.PI / 2; return volToWorld(v, rx * Math.cos(a), rx * Math.sin(a)); }); }
-  if (ROUND_SHAPES.has(sh)) return Array.from({ length: 20 }, (_, k) => { const a = (2 * Math.PI * k) / 20; return volToWorld(v, rx * Math.cos(a), rz * Math.sin(a)); });
-  return [[-rx, -rz], [rx, -rz], [rx, rz], [-rx, rz]].map(([x, z]) => volToWorld(v, x, z));
-}
+// 形体约定（shapeOf / volDims / roofOf / volumeBase / footprintPolygon …）在 engine/layout.js（纯几何），这里转出，剖面 / 第一眼 / 3D 照旧从 map.js 拿。
+import { SHAPES, PATH_STYLES, ROOFS, ROUND_SHAPES, shapeOf, volDims, prismSides, archThickness, torusTube, isUpright, roofOf, elevOf, volumeBase, volumeTop, volToWorld, footprintPolygon } from "../engine/layout.js";
+export { SHAPES, PATH_STYLES, ROOFS, ROUND_SHAPES, shapeOf, volDims, prismSides, archThickness, torusTube, isUpright, roofOf, elevOf, volumeBase, volumeTop, volToWorld, footprintPolygon };
 /** 图上的点选类型：地标 → landmark；撒出来的房子（有 zone_id / generated / 没有 plan_id 的 building）→ house；其余形体 → shape */
 export function volumeType(v) {
   if (v.importance === "landmark") return "landmark";
@@ -162,51 +91,14 @@ export function streamOf(sid) { return (sid.paths || []).find((p) => p.kind === 
 export function terraceLevelAt(T, p) { const t = T && T.terraceAt(p[0], p[1]); return t ? t.level : null; }
 export { pointInPolygon };
 
-// ------------------------------------------------------------ 空间内部层（interiorLevel：0 = 入口层，往里数）
-/** 内部层序号（0 = 入口层）→ 空间的 sublevel（地下入口在最上层，往下数；空中入口在最下层，往上数） */
-export function sublevelOf(space, k) { const n = levelsOf(space), kk = clamp(Math.round(Number(k) || 0), 0, n - 1); return space.stratum === "sky" ? kk : n - 1 - kk; }
-/** sublevel → 内部层序号 */
-export function interiorIndexOf(space, s) { const n = levelsOf(space); return space.stratum === "sky" ? s : n - 1 - s; }
-/** 「内部第 2 层」/「内部第 1 层（入口层）」 */
-export function interiorLevelName(space, s) { const k = interiorIndexOf(space, s); return `内部第 ${k + 1} 层${k === 0 ? "（入口层）" : ""}`; }
-/**
- * 空间离地面几层——和构成清单的「深 / 高」同一口径（interior.js fitFloor）：地下 = 最上层顶板在外轮廓质心处地面下几层，
- * 空中 = 最下层底面在地面上几层。没被迫下沉 / 抬高时就等于 plan 的 depth_layers / height_layers。
- */
-export function spaceDepth(space, sid, T) {
-  const layer = Number(sid && sid.meta && sid.meta.layer_height_m) || (T && T.layer) || 3;
-  const c = polygonCentroid(space.polygon), g = T ? T.heightAt(c[0], c[1]) : 0, n = levelsOf(space);
-  const step = (Number(space.height) || 3) + (space.stratum === "sky" ? 1 : 2);
-  const v = space.stratum === "underground" ? (g - (space.floor_y + (n - 1) * step + space.height)) / layer : (space.floor_y - g) / layer;
-  return Math.max(0, Math.round(v));
-}
-/** 空间标高文案：「深 2 层」/「高 3 层」（同构成清单） */
-export function spaceLevelTag(space, sid, T) { return `${space.stratum === "underground" ? "深" : "高"} ${spaceDepth(space, sid, T)} 层`; }
+// 空间内部层换算（sublevelOf / interiorLevelName / spaceDepth …）在 engine/interior.js，这里转出
+import { sublevelOf, interiorIndexOf, interiorLevelName, spaceDepth, spaceLevelTag } from "../engine/interior.js";
+export { sublevelOf, interiorIndexOf, interiorLevelName, spaceDepth, spaceLevelTag };
 const layoutName = (sp) => (sp.stratum === "sky" ? SKY_LAYOUT_LABEL : LAYOUT_LABEL)[sp.layout] || "";
 
-/** 特征的俯视多边形：有 polygon 用它；穹顶（hill / ridge 带 rx / rz）按椭圆采 24 点；只有半径的用圆 */
-export function featurePolygon(f) {
-  if (validPoly(f.polygon)) return f.polygon;
-  const c = Array.isArray(f.center) ? [f.center[0], f.center[2]] : null;
-  if (!c) return null;
-  const rx = f.rx > 0 ? f.rx : f.radius, rz = f.rz > 0 ? f.rz : f.radius, A = f.angle || 0, ca = Math.cos(A), sa = Math.sin(A);
-  if (!(rx > 0 && rz > 0)) return null;
-  const out = [];
-  for (let k = 0; k < 24; k++) { const t = (2 * Math.PI * k) / 24, u = rx * Math.cos(t), v = rz * Math.sin(t); out.push([r2(c[0] + u * ca - v * sa), r2(c[1] + u * sa + v * ca)]); }
-  return out;
-}
-/** 构成图元素在地图上的中心（地形块 / 区域 / 空间等；拖动结果 = 它 + 平移量）：所有构件外接框的中心 */
-export function planCenter(sid, T, planId) {
-  const ps = [];
-  for (const f of (sid.terrain && sid.terrain.features) || []) if (f.plan_id === planId) { const p = featurePolygon(f); if (p) ps.push(...p); }
-  for (const r of sid.regions || []) if (r.plan_id === planId && validPoly(r.polygon)) ps.push(...r.polygon);
-  for (const s of sid.spaces || []) if ((s.plan_id || s.id) === planId && validPoly(s.polygon)) ps.push(...s.polygon);
-  for (const v of sid.volumes || []) if (v.plan_id === planId && v.importance === "landmark") ps.push([v.position[0], v.position[2]]);
-  if (!ps.length) for (const v of sid.volumes || []) if (v.plan_id === planId && Array.isArray(v.position)) ps.push(...footprintPolygon(v)); // 形体组（v5）：整组占地
-  if (!ps.length) return null;
-  const xs = ps.map((p) => p[0]), zs = ps.map((p) => p[1]);
-  return [r2((Math.min(...xs) + Math.max(...xs)) / 2), r2((Math.min(...zs) + Math.max(...zs)) / 2)];
-}
+// SID 元素占地（featurePolygon / planCenter / sidIdsOf）在 engine/layout.js，这里转出
+import { featurePolygon, planCenter, sidIdsOf, contentBox } from "../engine/layout.js";
+export { featurePolygon, planCenter, sidIdsOf };
 /** plan 里某个 id 的名字（构成清单里的 label）；没有 plan 时 null */
 function planLabel(plan, id) {
   if (!plan || !id) return null;
@@ -216,14 +108,6 @@ function planLabel(plan, id) {
   const walk = (ns) => { for (const n of ns || []) { if (!n || typeof n !== "object") continue; if (n.id === id) return n; const r = walk(n.children) || (n.child ? walk([n.child]) : null); if (r) return r; } return null; };
   const n = walk(plan.nodes);
   return n ? n.label || null : null;
-}
-/** 一个 plan_id 对应的全部 SID id（有 index 用 index，否则扫 SID） */
-export function sidIdsOf(sid, index, planId) {
-  if (index && index[planId] && Array.isArray(index[planId].sid_ids)) return index[planId].sid_ids;
-  const out = [], hit = (o) => o && (o.plan_id === planId || o.zone_id === planId);
-  for (const f of (sid.terrain && sid.terrain.features) || []) if (hit(f)) out.push(f.id);
-  for (const k of ["regions", "volumes", "paths", "markers", "spaces"]) for (const o of sid[k] || []) if (hit(o)) out.push(o.id);
-  return out;
 }
 
 // ============================================================ 渲染
@@ -260,38 +144,17 @@ export function renderMap(ctx, opts = {}) {
   drawPortals(R);
   drawSpaces(R);
   drawConnectors(R);
+  if (!small) drawMarks(R);
   if (!small && onGround) drawTrailHandles(R);
   if (!small) drawDiffs(R);
   if (!small && ctx.section) drawSectionHandles(R, ctx.section, opts.sectionHandles !== false);
   if (!small && ctx.selected) drawSelection(R, ctx.selected);
+  if (!small && onGround && ctx.selected) drawOpHandles(R);
   if (!onGround) for (const t of groundLabels.querySelectorAll("text")) if (!["landmark", "spawn"].includes(t.getAttribute("data-type"))) t.remove();
   if (!small) { drawChrome(R, footer, PAD, W, H); placeLabels(R); }
   svg.append(labels);
   if (small) { const fb = contentBox(sid, b, u); if (fb) svg.setAttribute("viewBox", fb.map(fmt1).join(" ")); } // 缩略图：取景框贴着内容（形体 + 路 + 出生点），不画整块场地
   return svg;
-}
-/** 内容的取景框 [x, z, w, h]：形体底面 + 路 + 空间 + 出生点的包围盒，四周留 8% / 至少 6 m，不出场地边；内容太少（< 1/6 场地）时放大到 1/6，免得只剩一个点 */
-function contentBox(sid, b, u) {
-  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-  const put = (x, z) => { if (!Number.isFinite(x) || !Number.isFinite(z)) return; x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); };
-  for (const v of sid.volumes || []) {
-    if (!v.position || !v.size) continue;
-    const r = Math.hypot(v.size[0], v.size[2]) / 2;
-    put(v.position[0] - r, v.position[2] - r); put(v.position[0] + r, v.position[2] + r);
-  }
-  for (const p of sid.paths || []) for (const q of p.points || []) put(q[0], q[q.length - 1]);
-  for (const s of sid.spaces || []) for (const q of s.polygon || s.outline || []) put(q[0], q[1]);
-  for (const m of sid.markers || []) if (m.position) put(m.position[0], m.position[2]);
-  if (!Number.isFinite(x0)) return null;
-  const BW = b.max[0] - b.min[0], BH = b.max[2] - b.min[2];
-  let w = x1 - x0, h = z1 - z0;
-  const pad = Math.max(6, 0.08 * Math.max(w, h)), minS = Math.max(BW, BH) / 6;
-  let cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
-  w = Math.max(minS, w + 2 * pad); h = Math.max(minS, h + 2 * pad);
-  const PAD = 4 * u;
-  w = Math.min(w, BW + 2 * PAD); h = Math.min(h, BH + 2 * PAD);
-  cx = clamp(cx, b.min[0] - PAD + w / 2, b.max[0] + PAD - w / 2); cz = clamp(cz, b.min[2] - PAD + h / 2, b.max[2] + PAD - h / 2);
-  return [cx - w / 2, cz - h / 2, w, h];
 }
 
 /** 通用属性：可点、可拖的东西都带这些 */
@@ -339,7 +202,7 @@ function drawTerrain(R) {
   for (const t of terraces) {
     if (lv.has(t.level)) continue; lv.add(t.level);
     const x = Math.min(...t.polygon.map((p) => p[0])) + 2.5 * u;
-    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": t.level }, `${t.level} 层 ${t.level < 0 ? "−" : "+"}${fmt1(Math.abs(t.level * layer))} m`, { rank: 8, optional: true }));
+    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": t.level }, `${t.level} 层 ${(Number.isFinite(t.height) ? t.height : t.level * layer) < 0 ? "−" : "+"}${fmt1(Math.abs(Number.isFinite(t.height) ? t.height : t.level * layer))} m`, { rank: 8, optional: true }));
   }
 }
 
@@ -791,6 +654,93 @@ function drawDiffs(R) {
   R.svg.append(ds);
 }
 
+// ------------------------------------------------------------ 标记（docs/07 §1.1）：人画的几何——圈选 area / 手绘线 trace / 图钉 pin，坐标相对场地中心（x 东 z 南，米）
+/** 场地中心的世界坐标 [x, z]（v5 程序的 bounds 以场地中心为原点，所以通常是 [0, 0]） */
+export function siteCenterOf(sid) { const b = sid && sid.bounds; return b ? [(b.min[0] + b.max[0]) / 2, (b.min[2] + b.max[2]) / 2] : [0, 0]; }
+/** 世界 [x, z] → 场地坐标（米，保留 2 位） */
+export const toSitePoint = (sid, p) => { const c = siteCenterOf(sid); return [r2(p[0] - c[0]), r2(p[1] - c[1])]; };
+export const MARK_LABEL = { area: "圈选", trace: "手绘线", pin: "图钉" };
+const MARK_COLOR = "#1f6feb";
+/** 当前标记：ctx.marks（界面直接给）> plan.marks > sid.meta.marks；每个多一个 world（世界坐标点列，pin 是一个点） */
+export function marksOf(ctx) {
+  const sid = ctx.sid, plan = ctx.plan || (sid && sid.meta && sid.meta.plan) || null;
+  const src = Array.isArray(ctx.marks) ? ctx.marks : plan && Array.isArray(plan.marks) ? plan.marks : (sid && sid.meta && sid.meta.marks) || [];
+  const c = siteCenterOf(sid), W = (q) => [q[0] + c[0], q[1] + c[1]], out = [];
+  for (const m of src) {
+    if (!m || !m.id) continue;
+    const g = m.type === "area" && validPoly(m.polygon_m) ? m.polygon_m : m.type === "trace" && Array.isArray(m.path_m) && m.path_m.length >= 2 && m.path_m.every(isPt) ? m.path_m : m.type === "pin" && isPt(m.point_m) ? [m.point_m] : null;
+    if (g) out.push(Object.assign({}, m, { world: g.map(W) }));
+  }
+  return out;
+}
+const markSelected = (sel, id) => !!sel && (sel.mark_id === id || (sel.type === "mark" && sel.id === id));
+/** 标记盖在最上层（不参与避让、不进导出几何）：圈选 = 虚线多边形，手绘线 = 虚线，图钉 = 水滴；选中的描橙色并给一个 × */
+function drawMarks(R) {
+  const { u, label, labels, ctx } = R, ms = marksOf(Object.assign({}, ctx, { plan: R.plan }));
+  if (!ms.length) return;
+  const g = svgel("g", { class: "marks" }), dash = `${fmt1(1.6 * u)} ${fmt1(0.9 * u)}`;
+  for (const m of ms) {
+    const on = markSelected(ctx.selected, m.id), col = on ? SELECT_COLOR : MARK_COLOR, P = m.world, xs = P.map((q) => q[0]), zs = P.map((q) => q[1]);
+    const c = m.type === "area" ? polygonCentroid(P) : m.type === "trace" ? P[Math.floor(P.length / 2)] : P[0], cs = `${fmt1(c[0])} ${fmt1(c[1])}`;
+    const base = { "data-type": "mark", "data-mark-id": m.id, "data-mark-type": m.type, "data-for": `mark:${m.id}`, style: "cursor:pointer" }, sw = fmt1((on ? 0.7 : 0.5) * u);
+    if (m.type === "area") g.append(svgel("polygon", Object.assign({}, base, { points: pts(P), fill: col, "fill-opacity": on ? 0.12 : 0.06, stroke: col, "stroke-width": sw, "stroke-dasharray": dash, "stroke-linejoin": "round", "data-center": cs, class: "mark mark-area" })));
+    else if (m.type === "trace") g.append(svgel("g", Object.assign({}, base, { "data-center": cs, class: "mark mark-trace" }),
+      svgel("polyline", { points: pts(P), fill: "none", stroke: "#000", "stroke-opacity": 0, "stroke-width": fmt1(2.6 * u), "stroke-linecap": "round", "stroke-linejoin": "round" }),
+      svgel("polyline", { points: pts(P), fill: "none", stroke: col, "stroke-width": sw, "stroke-dasharray": dash, "stroke-linecap": "round", "stroke-linejoin": "round", "pointer-events": "none" })));
+    else {
+      const s = 0.9 * u, f = (v) => fmt1(v * s); // 水滴：尖端在点上，圆头在上
+      g.append(svgel("g", Object.assign({}, base, { transform: `translate(${cs})`, "data-pos": cs, class: "mark mark-pin" }),
+        svgel("path", { d: `M0 0L${f(-1.15)} ${f(-2.3)}A${f(1.45)} ${f(1.45)} 0 1 1 ${f(1.15)} ${f(-2.3)}Z`, fill: col, stroke: "#fff", "stroke-width": fmt1(0.3 * u) }),
+        svgel("circle", { cy: f(-3.2), r: f(0.6), fill: "#fff", "pointer-events": "none" })));
+      R.obs.ground.push([c[0] - 1.6 * u, c[1] - 4.6 * u, c[0] + 1.6 * u, c[1], ICON_W]); R.obs.strata.push([c[0] - 1.6 * u, c[1] - 4.6 * u, c[0] + 1.6 * u, c[1], ICON_W]);
+    }
+    const ly = m.type === "pin" ? c[1] - 5 * u : m.type === "area" ? Math.min(...zs) - 1 * u : c[1] - 1.6 * u;
+    labels.append(label(Object.assign({}, base, { x: fmt1(c[0]), y: fmt1(ly), "font-size": fmt1(2.3 * u), "text-anchor": "middle", fill: col, "font-weight": on ? 700 : null }), m.label || MARK_LABEL[m.type], { rank: 1.5 }));
+    if (!on) continue;
+    const q = m.type === "area" ? [Math.max(...xs), Math.min(...zs)] : m.type === "pin" ? [c[0] + 2.6 * u, c[1] - 4.4 * u] : P[P.length - 1], k = fmt1(0.55 * u);
+    g.append(svgel("g", { "data-type": "mark_remove", "data-mark-id": m.id, "data-for": `mark:${m.id}`, transform: `translate(${fmt1(q[0])} ${fmt1(q[1])})`, style: "cursor:pointer", class: "mark-remove" },
+      svgel("circle", { r: fmt1(1.3 * u), fill: "#fff", stroke: col, "stroke-width": fmt1(0.3 * u) }),
+      svgel("path", { d: `M-${k} -${k}L${k} ${k}M${k} -${k}L-${k} ${k}`, stroke: col, "stroke-width": fmt1(0.35 * u), "pointer-events": "none" }), svgel("title", {}, "删掉这个标记")));
+  }
+  R.svg.append(g);
+}
+
+// ------------------------------------------------------------ 地形操作的把手（docs/07 §4）：选中一个地形操作 → 中心把手（拖 = 挪位置）+ 高度把手（上下拖 = 改高 / 深）
+/** 地形操作 → 高度字段 [字段, 缺省值]（ramp 之类没有单一高度的不给把手） */
+const OP_FIELD = { raise: ["height_m", 12], cliff: ["height_m", 12], flatten: ["height_m", 0], lower: ["depth_m", 4], lake: ["depth_m", 4], carve: ["depth_m", 4], river: ["depth_m", 4], dune: ["amplitude_m", 3], noise: ["amplitude_m", 2], terrace: ["step_h_m", 3] };
+/**
+ * 一个地形操作的把手信息（俯视图与剖面共用）：{ id, op, label, center: [x, z]（世界）, top: 目标绝对高度 | null, field, value, text }；
+ * 不是地形操作（plan.terrain 里没有、SID 也没有带 op 的 feature）→ null。field 为 null = 没有单一高度（不给高度把手）。
+ */
+export function opHeightInfo(plan, sid, id) {
+  if (!id) return null;
+  const op = plan && Array.isArray(plan.terrain) ? plan.terrain.find((t) => t && t.id === id) : null;
+  const f = ((sid && sid.terrain && sid.terrain.features) || []).find((x) => x && x.plan_id === id && x.op);
+  if (!f || !Array.isArray(f.center) || (plan && Array.isArray(plan.terrain) && !op)) return null;
+  const kind = (op && op.op) || f.op, spec = OP_FIELD[kind] || null, field = spec ? spec[0] : null;
+  const value = field ? (op && Number.isFinite(Number(op[field])) && op[field] != null ? Number(op[field]) : spec[1]) : null;
+  return { id, op: kind, label: (op && op.label) || f.label || id, center: [f.center[0], f.center[2]], radius: Number(f.radius) || 0, top: Number.isFinite(f.height) ? f.height : null, field, value, text: field ? opValueText(field, value) : "" };
+}
+function drawOpHandles(R) {
+  const { ctx, u } = R, id = ctx.selected.plan_id;
+  if (!(ctx.tool == null || ["move", "select", "pin", "height"].includes(ctx.tool))) return;
+  const I = opHeightInfo(R.plan, R.sid, id);
+  if (!I) return;
+  const [cx, cz] = I.center, key = `feature:${id}`, g = svgel("g", { class: "op-handles" }), k = fmt1(0.7 * u);
+  g.append(svgel("g", { "data-type": "op_center", "data-plan-id": id, "data-for": key, "data-pos": `${fmt1(cx)} ${fmt1(cz)}`, transform: `translate(${fmt1(cx)} ${fmt1(cz)})`, style: "cursor:move", class: "op-center" },
+    svgel("circle", { r: fmt1(1.5 * u), fill: "#fff", stroke: SELECT_COLOR, "stroke-width": fmt1(0.45 * u) }),
+    svgel("path", { d: `M-${k} 0H${k}M0 -${k}V${k}`, stroke: SELECT_COLOR, "stroke-width": fmt1(0.3 * u), "pointer-events": "none" }), svgel("title", {}, `${I.label}：拖动 = 挪位置`)));
+  if (I.field) {
+    const a = fmt1(1.7 * u), b = fmt1(0.9 * u), w = fmt1(0.6 * u);
+    g.append(svgel("g", { "data-type": "op_height", "data-plan-id": id, "data-for": key, "data-field": I.field, "data-value": I.value, transform: `translate(${fmt1(cx + 3.4 * u)} ${fmt1(cz)})`, style: "cursor:ns-resize", class: "op-height" },
+      svgel("rect", { x: fmt1(-1.1 * u), y: fmt1(-2.7 * u), width: fmt1(2.2 * u), height: fmt1(5.4 * u), rx: fmt1(1.1 * u), fill: SELECT_COLOR, stroke: "#fff", "stroke-width": fmt1(0.25 * u) }),
+      svgel("path", { d: `M-${w} -${b}L0 -${a}L${w} -${b}M-${w} ${b}L0 ${a}L${w} ${b}`, fill: "none", stroke: "#fff", "stroke-width": fmt1(0.3 * u), "pointer-events": "none" }),
+      svgel("text", { x: fmt1(1.7 * u), y: fmt1(0.8 * u), "font-size": fmt1(2.4 * u), fill: SELECT_COLOR, "font-weight": 700, stroke: "#fff", "stroke-width": fmt1(0.6 * u), "paint-order": "stroke", "pointer-events": "none", class: "op-height-text" }, I.text),
+      svgel("title", {}, `${I.label}：上下拖 = 改${I.field === "depth_m" ? "深度" : "高度"}`)));
+  }
+  R.svg.append(g);
+}
+
 // ------------------------------------------------------------ 剖切线：宽度带（盖在地面上、空间之下）+ 中心线与把手
 function drawSectionBand(R, section) {
   const path = sectionPath(section, R.sid);
@@ -951,10 +901,10 @@ export function snapAngle(from, to, step = 15) {
   const t = (a * Math.PI) / 180;
   return { angle_deg: Math.round(a * 10) / 10, length_m: Math.round(L * 10) / 10, to: step > 0 ? [from[0] + Math.cos(t) * L, from[1] - Math.sin(t) * L] : [to[0], to[1]] };
 }
-const DRAG_TYPES = new Set(["landmark", "spawn", "house", "shape", "portal", "trail_vertex", "section_a", "section_b", "section_mid", "space", "connector", "feature"]);
-const POINT_TYPES = new Set(["landmark", "spawn", "shape", "portal", "connector", "trail_vertex", "section_a", "section_b", "section_mid", "entrance", "goal", "link"]);
+const DRAG_TYPES = new Set(["landmark", "spawn", "house", "shape", "portal", "trail_vertex", "section_a", "section_b", "section_mid", "space", "connector", "feature", "mark", "op_center"]);
+const POINT_TYPES = new Set(["landmark", "spawn", "shape", "portal", "connector", "trail_vertex", "section_a", "section_b", "section_mid", "entrance", "goal", "link", "mark", "op_center"]);
 const parsePos = (s) => { const a = String(s || "").split(" ").map(Number); return a.length === 2 && a.every(Number.isFinite) ? a : null; };
-/** DOM 节点 → 手势目标 {type, plan_id?, sid_id?, part?, sublevel?, index?, zone_id?}；淡显层里的不算 */
+/** DOM 节点 → 手势目标 {type, plan_id?, sid_id?, part?, sublevel?, index?, zone_id?, mark_id?, mark_type?}；淡显层里的不算 */
 export function targetOf(n) {
   const el = n && n.closest && n.closest("[data-type]");
   if (!el || el.closest("[data-inactive]")) return null;
@@ -966,28 +916,40 @@ export function targetOf(n) {
   if (d.index != null) t.index = Number(d.index);
   if (d.zoneId) t.zone_id = d.zoneId;
   if (d.level != null) t.level = Number(d.level);
+  if (d.markId) { t.mark_id = t.id = d.markId; if (d.markType) t.mark_type = d.markType; }
   return t;
 }
-const keyOf = (t) => `${t.type}|${t.sid_id || ""}|${t.plan_id || ""}|${t.part || ""}|${t.index ?? ""}`;
-/** 拖动这组节点用的 data-for 键：地形块 / 空间按 plan_id 整组走，其余按 sid_id */
-const dragKey = (t) => (t.type === "trail_vertex" ? `trail_vertex:${t.index}` : t.type.startsWith("section_") ? "section" : t.type === "feature" || t.type === "space" ? `${t.type}:${t.plan_id}` : `${t.type}:${t.sid_id}`);
+const keyOf = (t) => `${t.type}|${t.sid_id || ""}|${t.plan_id || ""}|${t.part || ""}|${t.index ?? ""}|${t.mark_id || ""}`;
+/** 拖动这组节点用的 data-for 键：地形块 / 空间 / 地形操作中心按 plan_id 整组走，标记按 mark_id，其余按 sid_id */
+const dragKey = (t) => (t.type === "trail_vertex" ? `trail_vertex:${t.index}` : t.type.startsWith("section_") ? "section" : t.type === "mark" ? `mark:${t.mark_id}` : t.type === "op_center" ? `feature:${t.plan_id}` : t.type === "feature" || t.type === "space" ? `${t.type}:${t.plan_id}` : `${t.type}:${t.sid_id}`);
+
 
 /**
  * 绑定手势（全部本地，不调 AI）。handlers（都可选）：
- *  tool() → move | path | region | section | erase；canDrag(target) → bool（没给时 DRAG_TYPES 都能拖）
+ *  tool() → move | path | region | section | erase | height | pin；canDrag(target) → bool（没给时 DRAG_TYPES 都能拖）
  *  onDrag(target, p, info) 拖动中（图已移动预览，不要重建）；onDragEnd(target, p, info) 松手；onDragCancel() Esc / pointercancel
  *  onSelect(target, p, ev) 点一下：同一处再点一下轮到下面一层（区域 → 地形块 → …）；空白处 target = {type: "ground"}
  *  onPath(points, ev) / onRegion(points, ev) / onSection([a, b], info) / onErase(target, p) / onDiff(id, ev) / onInteriorLevel(k) / onGesture(on)
- * target = {type, plan_id?, sid_id?, part?, sublevel?, index?, zone_id?}；type ∈ landmark | spawn | house | trail_vertex | feature | zone | path | water |
- *   space | passage | room | entrance | goal | link | connector | section_a | section_b | section_mid。按住通道 / 房间拖 = 拖整个空间。
- * p：拖动后的新位置 [x, z]——点状的东西是它的新坐标，地形块 / 空间是新中心（UI 用 atFromPoint 反算 at，或用 info.delta 改 offset_m / nudge_m）。
+ *  —— docs/07：
+ *  onPin(p, { target, point_m, ev })：右键 / Ctrl+点（任何工具）或 pin 工具下点一下；target = 指针下最上面的东西（{type:"ground"} = 空地），point_m = 场地坐标
+ *  标记（target.type = "mark"，带 mark_id / mark_type）：点 → onSelect；拖 → onMarkMove(markId, p, info)（没给就走 onDrag / onDragEnd，受 canDrag 管）；
+ *    onMarkMoveLive(markId, p, info) 拖动中；选中时的 × → onMarkRemove(markId)（没给走 onErase({type:"mark", mark_id})）；擦除工具点它 → onErase
+ *  地形操作（选中后才有把手）：中心把手拖 → onOpMove(opId, p, info)（p = 新中心，info.delta）、拖动中 onOpMoveLive(opId, p, info)；
+ *    高度把手上下拖 → onOpHeight(opId, value, { field })（value = 字段的新值：height_m / depth_m / amplitude_m / step_h_m）、拖动中 onOpHeightLive(opId, value, { field })
+ *  高度工具 tool() = "height"：onHeightStart(p, { target, mark_id, point_m }) → false 表示不接；onHeightDrag(p, { delta_m, radius_m, mode, point_m, mark_id })（实时，只在数值变了时调）；
+ *    onHeightEnd(p, 同上)（松手：|delta| ≥ 0.5 或 Shift 削平）；onHeightCancel()（Esc / 拖回 0 / pointercancel）。p = 按下的点（按在图钉上时吸到图钉）。
+ *    上下拖 = 抬高 / 压低（每 px 0.1 m，吸附 0.5 m），Shift = flatten，Alt = 只压低；滚轮或 [ ] 调半径（heightBrush.radius_m，2–80 m）。
+ * target = {type, plan_id?, sid_id?, part?, sublevel?, index?, zone_id?, mark_id?}；type ∈ landmark | spawn | house | trail_vertex | feature | zone | path | water |
+ *   space | passage | room | entrance | goal | link | connector | section_a | section_b | section_mid | mark。按住通道 / 房间拖 = 拖整个空间。
+ * p：拖动后的新位置 [x, z]（世界坐标）——点状的东西是它的新坐标，地形块 / 空间 / 圈选 / 手绘线是新中心（UI 用 atFromPoint 反算 at，或用 info.delta 改 offset_m / 平移标记）。
  * info：{ delta: [dx, dz], pos?, orig?, index?, line?, angle_deg?, length_m? }；剖切端点 15° 吸附，按住 Alt 不吸附。
  * @returns {() => void} 解绑
  */
 export function bindMap(svg, ctx, handlers = {}) {
   const H = handlers, sid = ctx.sid, b = sid.bounds;
-  let drawing = null, live = null, drag = null, lastClick = null, active = false;
-  const toolNow = () => { const t = H.tool ? H.tool() : "move"; return t === "select" || t === "pin" ? "move" : t; };
+  let drawing = null, live = null, drag = null, lastClick = null, active = false, hd = null, hop = null, brushEl = null, hover = null;
+  const rawTool = () => (H.tool ? H.tool() : "move");
+  const toolNow = () => { const t = rawTool(); return t === "select" || t === "pin" ? "move" : t; };
   const q = (sel) => svg.querySelector(sel);
   const inB = (p) => [clamp(p[0], b.min[0], b.max[0]), clamp(p[1], b.min[2], b.max[2])];
   const u = () => Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) / 120;
@@ -996,14 +958,14 @@ export function bindMap(svg, ctx, handlers = {}) {
     let els = [];
     try { els = document.elementsFromPoint(ev.clientX, ev.clientY).filter((n) => svg.contains(n)); } catch { /* 老浏览器 */ }
     if (!els.length && ev.target) els = [ev.target];
-    const direct = els.map(targetOf).filter((t) => t && t.type !== "interior_level");
+    const direct = els.map(targetOf).filter((t) => t && !["interior_level", "mark_remove", "op_height"].includes(t.type));
     let ppm = 1; try { ppm = Math.abs(svg.getScreenCTM().a) || 1; } catch { /* 没布局 */ }
     const Rr = Math.max(2, 14 / ppm);
     let near = null, bd = Infinity;
     for (const n of svg.querySelectorAll("[data-pos]")) {
       const t = targetOf(n); if (!t || !POINT_TYPES.has(t.type)) continue;
       const c = parsePos(n.getAttribute("data-pos")); if (!c) continue;
-      const d = Math.hypot(c[0] - p[0], c[1] - p[1]) + (t.type.startsWith("section") ? 0 : t.type === "trail_vertex" ? 0.01 : 0.02);
+      const d = Math.hypot(c[0] - p[0], c[1] - p[1]) + (t.type.startsWith("section") || t.type === "op_center" ? 0 : t.type === "trail_vertex" ? 0.01 : 0.02);
       if (d <= Rr && d < bd) { bd = d; near = t; }
     }
     const out = [], seen = new Set(), push = (t) => { const k = keyOf(t); if (!seen.has(k)) { seen.add(k); out.push(t); } };
@@ -1011,7 +973,9 @@ export function bindMap(svg, ctx, handlers = {}) {
     direct.forEach(push);
     return out;
   };
-  const canDrag = (t) => DRAG_TYPES.has(t.type) && (!H.canDrag || !!H.canDrag(t));
+  /** 标记 / 地形操作中心有专用回调时不问 canDrag（界面的 canDrag 只认节点） */
+  const OWN = { mark: "onMarkMove", op_center: "onOpMove" };
+  const canDrag = (t) => DRAG_TYPES.has(t.type) && ((OWN[t.type] && H[OWN[t.type]]) || !H.canDrag || !!H.canDrag(t.type === "op_center" ? { type: "feature", plan_id: t.plan_id } : t));
   const dragTargetOf = (stack) => {
     for (const t0 of stack) {
       const t = ["passage", "room", "entrance", "goal", "link"].includes(t0.type) ? { type: "space", plan_id: t0.plan_id, sid_id: t0.sid_id } : t0;
@@ -1021,8 +985,15 @@ export function bindMap(svg, ctx, handlers = {}) {
   };
   const origOf = (t) => {
     if (t.type === "feature" || t.type === "space") { const n = q(`[data-for="${esc(dragKey(t))}"][data-center]`); return n ? parsePos(n.getAttribute("data-center")) : planCenter(sid, ctx.T, t.plan_id); }
-    const n = t.type === "trail_vertex" ? q(`[data-type="trail_vertex"][data-index="${t.index}"]`) : q(`[data-type="${t.type}"][data-sid-id="${esc(t.sid_id)}"][data-pos]`);
+    if (t.type === "mark") { const n = q(`[data-type="mark"][data-mark-id="${esc(t.mark_id)}"][data-pos], [data-type="mark"][data-mark-id="${esc(t.mark_id)}"][data-center]`); return n ? parsePos(n.getAttribute("data-pos") || n.getAttribute("data-center")) : null; }
+    const n = t.type === "trail_vertex" ? q(`[data-type="trail_vertex"][data-index="${t.index}"]`) : t.type === "op_center" ? q(`[data-type="op_center"][data-pos]`) : q(`[data-type="${t.type}"][data-sid-id="${esc(t.sid_id)}"][data-pos]`);
     return n ? parsePos(n.getAttribute("data-pos")) : null;
+  };
+  /** 拖动回调：标记 / 地形操作中心有专用回调就走专用的，否则走 onDrag / onDragEnd（地形操作中心当成地形块） */
+  const emit = (t, r, end) => {
+    if (t.type === "op_center" && H.onOpMove) { const f = end ? H.onOpMove : H.onOpMoveLive; if (f) f(t.plan_id, r.p, r.info); return; }
+    if (t.type === "mark" && H.onMarkMove) { const f = end ? H.onMarkMove : H.onMarkMoveLive; if (f) f(t.mark_id, r.p, r.info); return; }
+    const f = end ? H.onDragEnd : H.onDrag; if (f) f(t.type === "op_center" ? { type: "feature", plan_id: t.plan_id } : t, r.p, r.info);
   };
   // ---------- DOM 预览（只改属性，结束 / 取消时还原，交给回调重建）
   const saved = [];
@@ -1068,18 +1039,67 @@ export function bindMap(svg, ctx, handlers = {}) {
     Object.assign(info, { pos: pos.map(r2) }, d.orig ? { orig: d.orig } : {});
     return { p: info.pos, info };
   };
+  // ---------- 高度笔刷（画法在 profile.js drawHeightBrush）
+  const drawBrush = (p, st) => { brushEl = drawHeightBrush(svg, brushEl, p, st, u()); };
+  const heightInfo = (st) => Object.assign({}, st, { point_m: hd.meta.point_m, mark_id: hd.meta.mark_id });
+  const heightUpdate = (mods) => {
+    if (!hd) return;
+    const st = heightStroke(hd.dy, mods);
+    if (!hd.moved && Math.abs(hd.dy) < 3 && st.mode !== "flatten") { drawBrush(hd.p0, st); return; }
+    hd.moved = true; hd.st = st; drawBrush(hd.p0, st);
+    const sig = `${st.delta_m}|${st.radius_m}|${st.mode}`;
+    if (sig !== hd.sent) { hd.sent = sig; if (H.onHeightDrag) H.onHeightDrag(hd.p0, heightInfo(st)); }
+  };
+  const resizeBrush = (dir) => {
+    heightBrush.radius_m = brushStep(heightBrush.radius_m, dir);
+    if (hd) heightUpdate(hd.mods); else if (hover) drawBrush(hover, null);
+  };
+  // ---------- 地形操作的高度把手（竖拖）
+  const opHeightAt = (dy) => { const [lo, hi] = OP_RANGE[hop.field] || [-60, 150], k = hop.field === "depth_m" ? 1 : -1; return clamp(Math.round((hop.v0 + k * dy * HEIGHT_M_PER_PX) * 2) / 2, lo, hi); };
   const endDrag = (cancel) => { const d = drag; drag = null; if (!d) return null; untranslate(d.nodes || []); restoreAll(); return cancel ? null : d; };
   const gesture = (on) => { if (on === active) return; active = on; if (H.onGesture) H.onGesture(on); if (on) window.addEventListener("keydown", onEsc, true); else window.removeEventListener("keydown", onEsc, true); };
-  const cancelAll = () => { const moved = !!(drag && drag.moved); drawing = null; if (live) live.remove(); live = null; endDrag(true); gesture(false); if (moved && H.onDragCancel) H.onDragCancel(); };
-  function onEsc(ev) { if (ev.key !== "Escape" || (!drawing && !drag)) return; ev.preventDefault(); ev.stopPropagation(); cancelAll(); }
+  const cancelAll = () => {
+    const moved = !!(drag && drag.moved), hadH = !!(hd && hd.moved), hadOp = !!(hop && hop.moved);
+    drawing = null; if (live) live.remove(); live = null; endDrag(true);
+    if (hop) { hop.txt && (hop.txt.textContent = hop.text0); hop = null; }
+    hd = null; drawBrush(hover, null); gesture(false);
+    if (hadH) { if (H.onHeightCancel) H.onHeightCancel(); else if (H.onDragCancel) H.onDragCancel(); }
+    if ((moved || hadOp) && H.onDragCancel) H.onDragCancel();
+  };
+  function onEsc(ev) { if (ev.key !== "Escape" || (!drawing && !drag && !hd && !hop)) return; ev.preventDefault(); ev.stopPropagation(); cancelAll(); }
+  /** [ ] 调笔刷半径；Shift / Alt 按下松开时刷新拖动中的数值（只在高度工具、焦点不在输入框时） */
+  const onKey = (ev) => {
+    if (!svg.isConnected) { unbind(); return; }
+    if (toolNow() !== "height" || (ev.target && ev.target.closest && ev.target.closest("input, textarea, select, [contenteditable]"))) return;
+    if (ev.type === "keydown" && (ev.key === "[" || ev.key === "]")) { ev.preventDefault(); resizeBrush(ev.key === "]" ? 1 : -1); return; }
+    if (ev.key === "Alt") ev.preventDefault(); // 别让 Alt 去激活菜单栏
+    if (hd && (ev.key === "Shift" || ev.key === "Alt")) { hd.mods = { shiftKey: ev.shiftKey, altKey: ev.altKey }; heightUpdate(hd.mods); }
+  };
+  const onWheel = (ev) => { if (toolNow() !== "height") return; ev.preventDefault(); resizeBrush(ev.deltaY < 0 ? 1 : -1); };
+  const onMenu = (ev) => { if (H.onPin) ev.preventDefault(); };
+  const onLeave = () => { hover = null; if (!hd) drawBrush(null); };
+  const toSite = (p) => toSitePoint(sid, p);
 
   const down = (ev) => {
-    if (ev.button != null && ev.button > 0) return;
     const p = svgPoint(svg, ev, sid), n = ev.target, tool = toolNow();
+    if (H.onPin && (ev.button === 2 || (ev.button === 0 && (ev.ctrlKey || ev.metaKey)))) { // 图钉：右键或 Ctrl+点
+      ev.preventDefault();
+      return H.onPin(p.map(r2), { target: stackAt(ev, p)[0] || { type: "ground" }, point_m: toSite(p), ev });
+    }
+    if (ev.button != null && ev.button > 0) return;
     if (n.dataset && n.dataset.diff !== undefined) return H.onDiff && H.onDiff(n.dataset.diff, ev);
     const lvl = n.closest && n.closest("[data-type=interior_level]");
     if (lvl) return H.onInteriorLevel && H.onInteriorLevel(Number(lvl.dataset.level));
+    const rm = n.closest && n.closest("[data-type=mark_remove]");
+    if (rm) { const id = rm.getAttribute("data-mark-id"); return H.onMarkRemove ? H.onMarkRemove(id) : H.onErase && H.onErase({ type: "mark", mark_id: id, id }, p); }
     try { svg.setPointerCapture(ev.pointerId); } catch { /* 合成事件没有活动指针 */ }
+    const oh = n.closest && n.closest("[data-type=op_height]");
+    if (oh && H.onOpHeight) {
+      const txt = oh.querySelector(".op-height-text");
+      hop = { id: oh.getAttribute("data-plan-id"), field: oh.getAttribute("data-field"), v0: Number(oh.getAttribute("data-value")) || 0, y0: ev.clientY, txt, text0: txt ? txt.textContent : "", moved: false };
+      hop.v = hop.v0;
+      return;
+    }
     if (tool === "path" || tool === "region") {
       drawing = { pts: [p], tool };
       live = svgel("polyline", { points: pts([p]), fill: tool === "region" ? "rgba(31,111,235,.12)" : "none", stroke: "#1f6feb", "stroke-width": 1, "stroke-dasharray": "1.5 1", "pointer-events": "none" });
@@ -1090,6 +1110,13 @@ export function bindMap(svg, ctx, handlers = {}) {
       svg.append(live); gesture(true);
     } else if (tool === "erase") {
       if (H.onErase) H.onErase(stackAt(ev, p)[0] || { type: "ground" }, p);
+    } else if (tool === "height") {
+      // 按在图钉上，或按在选中的地形操作的中心把手上（刚松手的手调高度就是它）= 接着改同一个操作：笔刷对准那一点（docs/07 §4）
+      const top = stackAt(ev, p)[0] || { type: "ground" }, isPinT = top.type === "mark" && top.mark_type === "pin", c = isPinT || top.type === "op_center" ? origOf(top) : null, p0 = (c || p).map(r2);
+      const meta = { target: top, mark_id: isPinT && c ? top.mark_id : null, op_id: top.type === "op_center" ? top.plan_id : null, point_m: toSite(p0) };
+      if (H.onHeightStart && H.onHeightStart(p0, meta) === false) return;
+      hd = { p0, y0: ev.clientY, dy: 0, meta, mods: { shiftKey: ev.shiftKey, altKey: ev.altKey }, st: null, moved: false, sent: null };
+      gesture(true); heightUpdate(hd.mods);
     } else {
       const stack = stackAt(ev, p), t = dragTargetOf(stack);
       const d = { stack, target: t, start: p, client: [ev.clientX, ev.clientY], moved: false, can: !!t, nodes: [] };
@@ -1102,6 +1129,16 @@ export function bindMap(svg, ctx, handlers = {}) {
     }
   };
   const move = (ev) => {
+    if (hop) {
+      const dy = ev.clientY - hop.y0;
+      if (!hop.moved && Math.abs(dy) < 3) return;
+      if (!hop.moved) gesture(true);
+      hop.moved = true; const v = opHeightAt(dy);
+      if (v !== hop.v) { hop.v = v; if (hop.txt) hop.txt.textContent = opValueText(hop.field, v); if (H.onOpHeightLive) H.onOpHeightLive(hop.id, v, { field: hop.field }); }
+      return;
+    }
+    if (hd) { hd.dy = ev.clientY - hd.y0; hd.mods = { shiftKey: ev.shiftKey, altKey: ev.altKey }; heightUpdate(hd.mods); return; }
+    if (!drawing && !drag && toolNow() === "height") { hover = svgPoint(svg, ev, sid); drawBrush(hover, null); return; }
     if (drawing && live) {
       const p = svgPoint(svg, ev, sid);
       if (drawing.tool === "section") {
@@ -1120,10 +1157,17 @@ export function bindMap(svg, ctx, handlers = {}) {
     drag.moved = true;
     const r = preview(drag, svgPoint(svg, ev, sid), ev);
     drag.last = r;
-    if (H.onDrag) H.onDrag(drag.target, r.p, r.info);
+    emit(drag.target, r, false);
   };
   const up = (ev) => {
     gesture(false);
+    if (hop) { const o = hop; hop = null; if (o.moved && o.v !== o.v0) H.onOpHeight(o.id, o.v, { field: o.field }); else if (o.txt) o.txt.textContent = o.text0; return; }
+    if (hd) {
+      const d = hd; hd = null; drawBrush(hover, null);
+      if (d.st && ((d.moved && d.st.delta_m !== 0) || d.st.mode === "flatten")) { if (H.onHeightEnd) H.onHeightEnd(d.p0, Object.assign({}, d.st, { point_m: d.meta.point_m, mark_id: d.meta.mark_id })); }
+      else if (d.moved && H.onHeightCancel) H.onHeightCancel();
+      return;
+    }
     if (drawing) {
       const d = drawing; drawing = null; if (live) live.remove(); live = null;
       if (d.tool === "section") { const [a, b2] = d.pts; if (Math.hypot(b2[0] - a[0], b2[1] - a[1]) >= 4 && H.onSection) H.onSection([a, b2].map((x) => [r2(x[0]), r2(x[1])]), d.info || snapAngle(a, b2, 0)); return; }
@@ -1133,18 +1177,22 @@ export function bindMap(svg, ctx, handlers = {}) {
     }
     if (!drag) return;
     const d = drag;
-    if (d.moved && d.can) { const r = preview(d, svgPoint(svg, ev, sid), ev); endDrag(false); if (H.onDragEnd) H.onDragEnd(d.target, r.p, r.info); return; }
+    if (d.moved && d.can) { const r = preview(d, svgPoint(svg, ev, sid), ev); endDrag(false); emit(d.target, r, true); return; }
     endDrag(false);
+    const p = svgPoint(svg, ev, sid);
+    if (rawTool() === "pin" && H.onPin) return H.onPin(p.map(r2), { target: d.stack[0] || { type: "ground" }, point_m: toSite(p), ev });
     // 点一下：同一处（3 px 内、同一叠目标）再点轮到下一层
     const sig = d.stack.map(keyOf).join(";");
     let i = 0;
     if (lastClick && lastClick.sig === sig && Math.hypot(ev.clientX - lastClick.x, ev.clientY - lastClick.y) < 3 && d.stack.length > 1) i = (lastClick.i + 1) % d.stack.length;
     lastClick = { sig, x: ev.clientX, y: ev.clientY, i };
-    if (H.onSelect) H.onSelect(d.stack[i] || { type: "ground" }, svgPoint(svg, ev, sid), ev);
+    if (H.onSelect) H.onSelect(d.stack[i] || { type: "ground" }, p, ev);
   };
-  svg.addEventListener("pointerdown", down);
-  svg.addEventListener("pointermove", move);
-  svg.addEventListener("pointerup", up);
-  svg.addEventListener("pointercancel", cancelAll);
-  return () => { cancelAll(); svg.removeEventListener("pointerdown", down); svg.removeEventListener("pointermove", move); svg.removeEventListener("pointerup", up); svg.removeEventListener("pointercancel", cancelAll); };
+  const L = [["pointerdown", down], ["pointermove", move], ["pointerup", up], ["pointercancel", cancelAll], ["pointerleave", onLeave], ["contextmenu", onMenu]];
+  for (const [k, f] of L) svg.addEventListener(k, f);
+  svg.addEventListener("wheel", onWheel, { passive: false });
+  window.addEventListener("keydown", onKey, true); window.addEventListener("keyup", onKey, true);
+  if (toolNow() === "height") svg.style.cursor = "crosshair";
+  function unbind() { cancelAll(); for (const [k, f] of L) svg.removeEventListener(k, f); svg.removeEventListener("wheel", onWheel); window.removeEventListener("keydown", onKey, true); window.removeEventListener("keyup", onKey, true); }
+  return unbind;
 }

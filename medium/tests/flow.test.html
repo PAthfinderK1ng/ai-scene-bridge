@@ -1,12 +1,14 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8" /><title>界面流程测试（v5 场景程序）</title></head>
+<head><meta charset="utf-8" /><title>界面流程测试（v5 场景程序 + v6 加到对话 / 场景会话 / 记忆 / 高度）</title></head>
 <body>
 <!-- 需要本地服务（模拟 AI）：.venv\Scripts\python -X utf8 desktop\app.py --no-window --port 8791，再用无头 Edge 打开
      http://127.0.0.1:8791/medium/tests/flow.test.html --dump-dom。结果写在 #out：PASS / FAIL 每行一条，最后 DONE。
-     ?demo=pick 让页面一律走模拟 AI（force_mock），不花钱；之后打开本地示例「星穹学院」做编辑测试（不调 AI）。 -->
+     ?demo=pick 让页面一律走模拟 AI（force_mock），不花钱；之后打开本地示例「星穹学院」做编辑测试（不调 AI）。
+     &store=server：场景与记忆走本地服务的 /api/scenes、/api/memory——服务要用临时数据目录起（SCENE_DIALOG_DATA_DIR=build/tmp-flow-data），不碰真实数据。
+     测试会清空记忆、新建 / 删除场景：先问 /api/health，服务没换数据目录（data_dir_custom 不是 true）就拒绝跑，iframe 也不打开。 -->
 <pre id="out"></pre>
-<iframe id="f" src="../?demo=pick" style="width:1440px;height:900px;border:0"></iframe>
+<iframe id="f" style="width:1440px;height:900px;border:0"></iframe>
 <script type="module">
 const out = document.getElementById("out");
 let passed = 0, failed = 0;
@@ -17,7 +19,11 @@ const f = document.getElementById("f");
 const near = (a, b, tol = 1.5) => Math.abs(a - b) <= tol;
 
 try {
-  await new Promise((r) => f.addEventListener("load", r, { once: true }));
+  const hz = await fetch("/api/health").then((r) => r.json()).catch(() => null);
+  if (!hz || hz.data_dir_custom !== true) { ok("服务用临时数据目录起（SCENE_DIALOG_DATA_DIR）", false, "这个服务用的是真实数据目录：测试会清空记忆、增删场景，拒绝在上面跑"); throw new Error("拒绝在真实数据上跑"); }
+  const loaded = new Promise((r) => f.addEventListener("load", r, { once: true }));
+  f.src = "../?demo=pick&store=server";
+  await loaded;
   const W = f.contentWindow, D = f.contentDocument;
   let aiCalls = 0;
   const realFetch = W.fetch.bind(W);
@@ -210,14 +216,16 @@ try {
   const hv = vol("hall"), lv = vol("library"), nN = S.plan.nodes.length;
   const line = [...Array(6).keys()].map((i) => [hv.position[0] + (lv.position[0] - hv.position[0]) * i / 5, hv.position[2] + (lv.position[2] - hv.position[2]) * i / 5]);
   MH.onPath(line, null);
+  const linkBtn = await until(() => [...D.querySelectorAll("#popup button.chip")].find((b) => b.textContent === "直接连起来"));
+  ok("画一笔弹两个选择：加到对话 / 直接连起来", !!linkBtn && [...D.querySelectorAll("#popup button.chip")].some((b) => b.textContent === "加到对话"));
+  if (linkBtn) linkBtn.click();
   const nl = S.plan.nodes[S.plan.nodes.length - 1];
   ok("画路 = 加一条连接，两头吸到最近的节点", S.plan.nodes.length === nN + 1 && nl.type === "link" && ["hall", "spire"].includes(nl.from) && ["library", "stacks"].includes(nl.to), JSON.stringify(nl));
   const sq = [[-95, 70], [-80, 70], [-65, 70], [-65, 85], [-65, 100], [-80, 100], [-95, 100], [-95, 85], [-95, 70]];
   MH.onRegion(sq, null);
-  const grove = await until(() => [...D.querySelectorAll("#popup button.chip")].find((b) => b.textContent === "树林"));
-  if (grove) grove.click();
-  const gn = S.plan.nodes[S.plan.nodes.length - 1];
-  ok("圈区域 → 树林：加一个生成器，锚在场地、偏移到圈的地方", gn.type === "grove" && gn.at === "site.C" && Array.isArray(gn.offset_m) && near(gn.offset_m[0], -80, 4) && near(gn.offset_m[1], 85, 4), JSON.stringify(gn));
+  const gm = (S.plan.marks || [])[(S.plan.marks || []).length - 1];
+  ok("圈区域（地面）→ 一个圈选标记，场地坐标，中心在圈的地方（不再加预设的生成器）", gm && gm.type === "area" && near(gm.polygon_m.reduce((a, q) => a + q[0], 0) / gm.polygon_m.length, -80, 6) && near(gm.polygon_m.reduce((a, q) => a + q[1], 0) / gm.polygon_m.length, 85, 6) && S.plan.nodes.length === nN + 1, JSON.stringify(gm));
+  D.querySelector("#popup").hidden = true; D.querySelector("#input").blur();
   T.setStratum("underground");
   MH.onRegion(sq.map((q) => [q[0] + 120, q[1] - 160]), null);
   const mzb = await until(() => [...D.querySelectorAll("#popup button.chip")].find((b) => b.textContent === "迷宫"));
@@ -376,6 +384,284 @@ try {
   ok("7 个示例：同 plan + seed → 同结果", !nondet.length, nondet.join(","));
   ok("7 个示例：编译 < 500 ms", !slow.length, slow.join(","));
   ok(`7 个示例的 SID 全过 schema（${engine}）`, !bad.length, bad.join(" | "));
+  // ============================================================ v6（docs/07）：加到对话 / 改动摘要 / 随意选点调高度 / 场景会话 / 记忆
+  const bodies = [];
+  W.fetch = (u, o) => { const s = String(u); if (s.includes("/api/ai/")) aiCalls++; if (/\/api\/(ai|scenes|memory)/.test(s)) { let b = null; try { b = o && o.body ? JSON.parse(o.body) : null; } catch { b = null; } bodies.push({ url: s, method: (o && o.method) || "GET", body: b }); } return realFetch(u, o); };
+  W.confirm = () => true;
+  const lastReq = (re) => bodies.filter((b) => re.test(b.url) && b.method !== "GET").pop() || {};
+  const lastAI = () => ([...D.querySelectorAll("#log .msg.ai")].pop() || { textContent: "" }).textContent;
+  const popBtn = (re) => [...D.querySelectorAll("#popup button")].find((b) => re.test(b.textContent));
+  const hands = () => S.plan.terrain.filter((t) => /^hand_/.test(t.id));
+  await T.loadExample("academy"); T.setView("map"); await sleep(40);
+  aiCalls = 0;
+
+  // ---------- 工具条「高度」
+  ok("v6 工具条有「高度」", !!D.querySelector('.tool[data-tool="height"]'));
+  key("h");
+  ok("H = 高度工具，自动打开 3D 小窗", S.tool === "height" && S.insetOn && !D.querySelector("#inset3d").hidden);
+  ok("没开着的 3D 小窗先开成收起的一条（不挡图上要按的地方）", S.insetMin && D.querySelector("#inset3d").classList.contains("min"));
+  key("Escape");
+
+  // ---------- 圈区域 → 标记 + 加到对话（弹窗只剩「已加到对话」+ 清空 / 算了）
+  const sqr = [[-95, 70], [-80, 66], [-62, 70], [-58, 86], [-62, 102], [-80, 106], [-98, 100], [-100, 85], [-95, 70]];
+  const u0 = S.undo.length;
+  MH.onRegion(sqr, null);
+  const mk = (S.plan.marks || []).slice(-1)[0];
+  ok("圈一块 → plan.marks 里一个 area（场地坐标，人给的）", !!mk && mk.type === "area" && mk.polygon_m.length >= 3 && /^圈选 \d+$/.test(mk.label), JSON.stringify(mk));
+  const popTxt = D.querySelector("#popup").textContent;
+  ok("圈完不再弹固定菜单：只有「已加到对话…」「清空这块里的东西」「算了」", /已加到对话/.test(popTxt) && !/树林|撒房子|水池|平台/.test(popTxt) && !!popBtn(/清空这块/) && !!popBtn(/^算了$/), popTxt);
+  ok("圈的这块自动加到对话：输入框上方一张引用卡片", S.refs.length === 1 && S.refs[0].kind === "mark" && !!D.querySelector(`#refs .ref[data-ref-id="${mk.id}"]`) && !D.querySelector("#refs").hidden);
+  const rt = (D.querySelector("#refs .ref .rt") || {}).textContent || "";
+  ok("卡片上一句事实（尺寸 · 地面高度）", /\d+×\d+ m/.test(rt) && /地面/.test(rt), rt);
+  ok("输入框占位「这块要做成什么？」并聚焦", D.querySelector("#input").placeholder === "这块要做成什么？" && D.activeElement === D.querySelector("#input"));
+  ok("标记是一步可撤销的本地改动", S.undo.length === u0 + 1);
+  popBtn(/^算了$/).click();
+  ok("「算了」：标记和卡片都撤掉，撤销栈也不留", !(S.plan.marks || []).some((m) => m.id === mk.id) && !S.refs.length && S.undo.length === u0 && D.querySelector("#refs").hidden);
+
+  // ---------- 清空这块里的东西（本地、可撤销）
+  const hc = vol("hall").position, circ = [...Array(13).keys()].map((i) => [hc[0] + 16 * Math.cos((i / 12) * 2 * Math.PI), hc[2] + 16 * Math.sin((i / 12) * 2 * Math.PI)]);
+  MH.onRegion(circ, null);
+  const mk2 = S.plan.marks.slice(-1)[0], inside = (T.describe({ kind: "mark", id: mk2.id }).facts.contains || []);
+  ok("describeRef：圈住主殿的这块「含 …」", inside.length >= 1, JSON.stringify(T.describe({ kind: "mark", id: mk2.id })));
+  popBtn(/清空这块/).click();
+  ok("「清空这块里的东西」删掉里面的节点", inside.length && inside.every((id) => !node(id)), JSON.stringify(inside));
+  key("z", { ctrlKey: true });
+  ok("清空可撤销", inside.every((id) => !!node(id)));
+  D.querySelector("#refs .ref .rx").click();
+  ok("卡片的 × = 不带它了", !S.refs.length && D.querySelector("#refs").hidden);
+
+  // ---------- 画一笔 → 加到对话（手绘线）；Ctrl+点 = 图钉；右键菜单；场景树「＋对话」；@ 补全
+  const hv3 = vol("hall"), lv3 = vol("library");
+  MH.onPath([...Array(6).keys()].map((i) => [hv3.position[0] + (lv3.position[0] - hv3.position[0]) * i / 5, hv3.position[2] + (lv3.position[2] - hv3.position[2]) * i / 5 + 6]), null);
+  popBtn(/^加到对话$/).click();
+  const tr = S.plan.marks.slice(-1)[0];
+  ok("画一笔「加到对话」= 手绘线标记 + 引用卡片，占位改成「沿这条线做什么？」", tr.type === "trace" && tr.path_m.length >= 2 && S.refs.some((r) => r.id === tr.id) && D.querySelector("#input").placeholder === "沿这条线做什么？");
+  MH.onPin([12, -8], { target: { type: "ground" }, point_m: [12, -8], ev: { button: 0, ctrlKey: true } });
+  const pn = S.plan.marks.slice(-1)[0];
+  ok("Ctrl+点地面 = 放图钉（point_m 场地坐标）并加到对话", pn.type === "pin" && pn.point_m[0] === 12 && pn.point_m[1] === -8 && S.refs.some((r) => r.id === pn.id));
+  MH.onPin([0, 0], { target: { type: "shape", plan_id: "towers[1]", sid_id: "towers_1" }, point_m: [0, 0], ev: { button: 2, clientX: 400, clientY: 300 } });
+  ok("右键：菜单「把…加到对话」「在这放个图钉」", !D.querySelector("#popup").hidden && !!popBtn(/加到对话/) && !!popBtn(/放个图钉/));
+  popBtn(/^把/).click();
+  ok("右键加到对话：重复里的一个实例（instance = 1）", S.refs.some((r) => r.id === "towers" && r.instance === 1) && D.querySelector("#popup").hidden);
+  item("hall").querySelector(".addref").click();
+  ok("场景树每行「＋对话」", S.refs.some((r) => r.id === "hall" && r.kind === "node"));
+  ok("场景树里多了「标记」一组（圈选 / 手绘线 / 图钉）", !!D.querySelector('#comp section[data-group="marks"]') && !!item(pn.id));
+  const inp = D.querySelector("#input");
+  inp.focus(); inp.value = "@法师"; inp.setSelectionRange(3, 3); inp.dispatchEvent(new W.Event("input", { bubbles: true }));
+  ok("输入 @ 弹出名字补全", !D.querySelector("#at-list").hidden && /法师塔/.test(D.querySelector("#at-list").textContent), D.querySelector("#at-list").textContent);
+  inp.dispatchEvent(new W.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  ok("回车选中：输入框写成「@名字 」，并加成引用", /^@法师塔\S* $/.test(inp.value) && S.refs.some((r) => r.id === "towers" && r.instance == null) && D.querySelector("#at-list").hidden, inp.value);
+  inp.value = "";
+  const hallRef = [...D.querySelectorAll("#refs .ref")].find((r) => r.dataset.refId === "hall");
+  hallRef.querySelector(".rpin").click();
+  ok("卡片可以钉住", S.refs.find((r) => r.id === "hall").pinned === true);
+  ok("引用 / 标记 / 图钉这些本地操作 0 次 AI", aiCalls === 0, aiCalls);
+
+  // ---------- 发送：refs + history 进请求体；改动摘要
+  const nRefs = S.refs.length, nn0 = S.plan.nodes.length;
+  sendText("这里做成夜市");
+  await until(() => S.busy === 0 && aiCalls === 1, 30000);
+  const rq = lastReq(/\/api\/ai\/revise/).body || {};
+  ok("revise 请求带 refs（kind / id / label / facts）", Array.isArray(rq.refs) && rq.refs.length === nRefs && rq.refs.every((r) => r.kind && r.id && r.label && r.facts && typeof r.facts === "object"), JSON.stringify(rq.refs || null).slice(0, 300));
+  ok("refs 里实例带 instance、手绘线带长度、图钉带地面高", rq.refs.some((r) => r.id === "towers" && r.instance === 1) && rq.refs.some((r) => r.id === tr.id && r.facts.length_m > 0) && rq.refs.some((r) => r.id === pn.id && typeof r.facts.ground_y === "number"));
+  ok("revise 请求带 history（role / text）与 scene_id", Array.isArray(rq.history) && rq.history.length > 0 && rq.history.every((h) => (h.role === "user" || h.role === "ai") && h.text) && typeof rq.scene_id === "string", `scene_id=${rq.scene_id} 坏的=${JSON.stringify((rq.history || []).filter((h) => !((h.role === "user" || h.role === "ai") && h.text)))}`);
+  ok("两次说话之间的本地改动作为一条历史带上", rq.history.some((h) => h.role === "user" && /在图上改了/.test(h.text)));
+  ok("聊天里「你」的那句带引用小标", ([...D.querySelectorAll("#log .msg.user")].pop().querySelectorAll(".refchip").length === nRefs));
+  ok("发完：没钉住的卡片清空，钉住的留着", S.refs.length === 1 && S.refs[0].id === "hall" && S.refs[0].pinned);
+  const nm = S.plan.nodes.slice(nn0)[0];
+  ok("AI 用引用当锚点：新的一组锚在手绘线上（along: mark）", S.plan.nodes.length > nn0 && !!nm && nm.along === tr.id, JSON.stringify(nm));
+  const eff = [...D.querySelectorAll("#log .msg.ai")].pop().querySelector(".effect");
+  ok("聊天里写改动摘要「改了：…」", !!eff && /^改了：/.test(eff.textContent) && !eff.classList.contains("none"), eff && eff.textContent);
+  const hAI = S.history.slice(-1)[0];
+  ok("history 记下 AI 这一轮：ops 数 + effect", hAI.role === "ai" && hAI.ops > 0 && /^改了/.test(hAI.effect), JSON.stringify(hAI));
+  sendText("还是太空了");
+  await until(() => S.busy === 0 && aiCalls === 2, 30000);
+  const rb2 = lastReq(/\/api\/ai\/revise/).body || {};
+  ok("「还是太空了」：请求带上一轮（原话 + 复述 + ops + effect）", rb2.history.some((h) => h.role === "user" && /夜市/.test(h.text)) && rb2.history.some((h) => h.role === "ai" && h.ops > 0 && /改了/.test(h.effect || "")), JSON.stringify(rb2.history.slice(-3)));
+  ok("钉住的引用下一句还在", rb2.refs.length === 1 && rb2.refs[0].id === "hall");
+  ok("AI 看历史接着改（同一组加数量 / 加灯柱），摘要写了", /改了：/.test(([...D.querySelectorAll("#log .msg.ai")].pop().querySelector(".effect") || {}).textContent || ""), lastAI());
+  { const e2 = [...D.querySelectorAll("#log .msg.ai")].pop().querySelector(".effect"), m2 = /等 (\d+) 处/.exec(e2.textContent), lis = e2.querySelectorAll(".fx-all li").length;
+    ok("摘要「等 N 处」省略的能点开看全部（悬停也有）", !m2 || (lis >= Number(m2[1]) && e2.title.includes("\n")), `${e2.textContent} · ${lis} 行`); }
+  // 没加引用、接着说（「再密一点」）：上一轮的引用带上（carried，事实重新算）；历史里人那条记着指的 id，AI 那条记着动了哪些 id
+  D.querySelector('#refs .ref[data-ref-id="hall"] .rx').click();
+  ok("取掉钉住的卡片：这句没有引用", !S.refs.length);
+  sendText("再密一点");
+  await until(() => S.busy === 0 && aiCalls === 3, 30000);
+  const rb3 = lastReq(/\/api\/ai\/revise/).body || {};
+  ok("没加引用的接着说：请求带上一轮的引用（carried: true，带事实）", (rb3.refs || []).length === 1 && rb3.refs[0].id === "hall" && rb3.refs[0].carried === true && !!rb3.refs[0].facts, JSON.stringify(rb3.refs));
+  ok("历史：人那条带 refs（指的 id），AI 那条带 ids（动了的 id）", rb3.history.some((h) => h.role === "user" && (h.refs || []).includes("hall")) && rb3.history.some((h) => h.role === "ai" && (h.ids || []).length > 0), JSON.stringify(rb3.history.slice(-4)));
+  ok("聊天历史里这句写「接着上一轮：…」", /接着上一轮：主殿/.test((S.history.filter((h) => h.role === "user").pop() || {}).text || ""), JSON.stringify(S.history.slice(-2)));
+  const fx = T.applyRevise({ understood: true, restatement: "主殿改个名。", ops: [{ op: "set", id: "hall", field: "label", value: "主殿二" }] }, "主殿改个名");
+  ok("没有看得见的变化（只改名）：visible=false，聊天写「这次没有看得见的变化」", fx && fx.visible === false && /这次没有看得见的变化/.test(lastAI()) && /没有看得见/.test(S.history.slice(-1)[0].effect), JSON.stringify(fx));
+  S.refs = []; T.render();
+
+  // ---------- 随意选点调高度：俯视图「高度」工具
+  T.setView("map"); key("h"); await sleep(30);
+  const P0 = [40, -20], g0 = S.T.heightAt(40, -20), uH = S.undo.length, planH = JSON.stringify(S.plan), live0 = S.liveN, ai0 = aiCalls;
+  ok("onHeightStart 在地面层接手", MH.onHeightStart(P0, { target: { type: "ground" }, mark_id: null, point_m: P0 }) !== false);
+  ok("按下开始拖：3D 小窗展开当实时预览", !S.insetMin && !D.querySelector("#inset3d").classList.contains("min") && !D.querySelector("#inset3d").hidden);
+  const tool0 = S.tool; D.querySelector("#inset3d").style.transition = "none"; S.tool = "height"; MH.onGesture(true); await sleep(50);
+  ok("调高度拖动中 3D 小窗不变淡（别的拖动才变淡）", D.body.classList.contains("height-live") && W.getComputedStyle(D.querySelector("#inset3d")).opacity === "1", `${D.body.className} · ${S.tool} · ${W.getComputedStyle(D.querySelector("#inset3d")).opacity}`);
+  MH.onGesture(false); S.tool = tool0;
+  { const ins = D.querySelector("#inset3d"); MH.onGesture(true); await sleep(50); const op = W.getComputedStyle(ins).opacity; MH.onGesture(false); ins.style.transition = ""; ok("别的拖动：3D 小窗照旧变淡", S.tool !== "height" && Number(op) < 0.5, op); }
+  MH.onHeightDrag(P0, { delta_m: 3, radius_m: 12, mode: "raise", point_m: P0, mark_id: null }); await sleep(160);
+  MH.onHeightDrag(P0, { delta_m: 6, radius_m: 12, mode: "raise", point_m: P0, mark_id: null }); await sleep(300);
+  ok("拖动中：临时编译给 3D 小窗（节流），程序和撤销栈都不变", S.liveN > live0 && JSON.stringify(S.plan) === planH && S.undo.length === uH, `${live0} → ${S.liveN}`);
+  MH.onHeightEnd(P0, { delta_m: 6, radius_m: 12, mode: "raise", point_m: P0, mark_id: null });
+  const hop = hands()[0], hpin = hop && S.plan.marks.find((m) => m.id === hop.at);
+  ok("松手：图钉 + 人给的地形操作（raise +6 · circle · slope · 锚在图钉）", !!hop && hop.op === "raise" && hop.height_m === 6 && hop.shape === "circle" && hop.edge === "slope" && !!hpin && hpin.type === "pin", JSON.stringify(hop));
+  ok("名字「手调高度 1」（AI 下一轮能看到）", hop.label === "手调高度 1");
+  ok("地面真的抬高了约 6 m", near(S.T.heightAt(40, -20) - g0, 6, 1.2), `${g0} → ${S.T.heightAt(40, -20)}`);
+  ok("提交 = 一步撤销", S.undo.length === uH + 1);
+  ok("提交后选中它：俯视图出中心把手与高度把手", S.sel && S.sel.plan_id === hop.id && !!D.querySelector('#view-map [data-type="op_center"]') && !!D.querySelector('#view-map [data-type="op_height"]'));
+  MH.onHeightStart(P0, { target: { type: "mark", mark_id: hpin.id, mark_type: "pin" }, mark_id: hpin.id, point_m: hpin.point_m });
+  MH.onHeightEnd(P0, { delta_m: 3, radius_m: 12, mode: "raise", point_m: hpin.point_m, mark_id: hpin.id });
+  ok("同一个图钉再拖 = 改同一个操作（+6 再 +3 = 9，不堆新的）", hands().length === 1 && hands()[0].height_m === 9, JSON.stringify(hands()));
+  MH.onHeightStart([-30, 30], { target: { type: "ground" }, mark_id: null, point_m: [-30, 30] });
+  MH.onHeightEnd([-30, 30], { delta_m: 0, radius_m: 10, mode: "flatten", point_m: [-30, 30], mark_id: null });
+  ok("Shift = 削平到按下点（flatten · target at_point）", hands().length === 2 && hands()[1].op === "flatten" && hands()[1].target === "at_point");
+  key("z", { ctrlKey: true });
+  ok("撤销能回去", hands().length === 1);
+  MH.onOpHeight(hop.id, 12, { field: "height_m" });
+  ok("高度把手 = 改 height_m", hands()[0].height_m === 12);
+  const px0 = S.plan.marks.find((m) => m.id === hpin.id).point_m[0];
+  MH.onOpMove(hop.id, [50, -20], { delta: [10, 0] });
+  ok("中心把手：手调的那个 = 挪它的图钉", near(S.plan.marks.find((m) => m.id === hpin.id).point_m[0], px0 + 10, 0.2));
+  const rock0 = ((S.plan.terrain.find((t) => t.id === "rock") || {}).offset_m || [0, 0])[0];
+  MH.onOpMove("rock", [0, 0], { delta: [5, 0] });
+  ok("中心把手：AI 的地形操作 = 改 offset_m", near(S.plan.terrain.find((t) => t.id === "rock").offset_m[0], rock0 + 5, 0.2));
+  T.setView("profile"); await sleep(60);
+  ok("剖面：地面线任意一点可抓", !!D.querySelector('#view-profile [data-type="ground_line"]'));
+  ok("剖面：选中的地形操作有高度把手", !!D.querySelector('#view-profile [data-type="op_height"]'));
+  const nh = hands().length, lv0 = S.liveN;
+  PH.onGroundDrag({ d: 20, x: -60, z: 10 }, 4, { live: true, mode: "raise", radius_m: 10 }); await sleep(300);
+  ok("剖面拖动中：只预览、不提交", hands().length === nh && S.liveN > lv0);
+  PH.onGroundDrag({ d: 20, x: -60, z: 10 }, 4, { live: false, mode: "raise", radius_m: 10 });
+  ok("剖面松手：在那一点加手调高度 +4", hands().length === nh + 1 && hands()[nh].height_m === 4 && S.plan.marks.find((m) => m.id === hands()[nh].at).point_m[0] === -60);
+  T.setView("map");
+  MH.onMarkMove(hpin.id, [0, 0], { delta: [0, 5] });
+  ok("拖图钉 = 挪标记", near(S.plan.marks.find((m) => m.id === hpin.id).point_m[1], -15, 0.2));
+  MH.onMarkRemove(hpin.id);
+  ok("删图钉 = 连同它上面的手调高度", !S.plan.marks.some((m) => m.id === hpin.id) && !S.plan.terrain.some((t) => t.id === hop.id));
+  // 真指针事件（不直接调 mapHandlers）：同一点连拖两次 = 改同一个操作——第二次按下时点中的是选中操作的中心把手（op_center），不是图钉
+  if (D.activeElement && D.activeElement.blur) D.activeElement.blur();
+  key("Escape"); key("h"); await sleep(40);
+  const svgM = () => [...D.querySelectorAll("#view-map svg")].sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+  const scr = (x, z) => { const sv = svgM(), pt = sv.createSVGPoint(); pt.x = x; pt.y = z; const q = pt.matrixTransform(sv.getScreenCTM()); return [q.x, q.y]; };
+  const pdrag = async (x, z, dyPx, mods = {}) => {
+    const [cx, cy] = scr(x, z), o = Object.assign({ bubbles: true, cancelable: true, pointerId: 7, button: 0, buttons: 1, isPrimary: true, pointerType: "mouse" }, mods);
+    const tgt = D.elementFromPoint(cx, cy), sv = svgM();
+    (tgt && sv.contains(tgt) ? tgt : sv).dispatchEvent(new W.PointerEvent("pointerdown", Object.assign({ clientX: cx, clientY: cy }, o)));
+    for (let k = 1; k <= 4; k++) { sv.dispatchEvent(new W.PointerEvent("pointermove", Object.assign({ clientX: cx, clientY: cy + (dyPx * k) / 4 }, o))); await sleep(30); }
+    sv.dispatchEvent(new W.PointerEvent("pointerup", Object.assign({ clientX: cx, clientY: cy + dyPx }, o, { buttons: 0 })));
+    await sleep(80);
+  };
+  const nh2 = hands().length, pins0 = S.plan.marks.filter((m) => m.type === "pin").length;
+  await pdrag(-70, 40, -40);
+  const hh1 = hands().slice(nh2);
+  ok("真指针拖（高度工具）：+4 m → 一个图钉 + 一个手调操作", S.tool === "height" && hh1.length === 1 && hh1[0].op === "raise" && hh1[0].height_m === 4 && S.plan.marks.filter((m) => m.type === "pin").length === pins0 + 1, JSON.stringify(hh1));
+  ok("松手后选中它，中心把手就在按下的那一点上", S.sel && S.sel.plan_id === (hh1[0] || {}).id && !!D.querySelector('#view-map [data-type="op_center"]'));
+  await pdrag(-70, 40, -40);
+  const hh2 = hands().slice(nh2);
+  ok("真指针在同一点再拖 = 改同一个操作（+4 再 +4 = 8，不堆新的图钉 / 操作）", hh2.length === 1 && hh2[0].id === (hh1[0] || {}).id && hh2[0].height_m === 8 && S.plan.marks.filter((m) => m.type === "pin").length === pins0 + 1, JSON.stringify(hh2));
+  await pdrag(20, 60, 30, { shiftKey: true });
+  const hf = hands().slice(nh2)[1];
+  ok("真指针 Shift+拖 = 纯削平到按下点（竖拖不叠加偏移）", !!hf && hf.op === "flatten" && hf.target === "at_point" && hf.height_m == null && hf.depth_m == null, JSON.stringify(hf));
+  key("z", { ctrlKey: true }); key("z", { ctrlKey: true });
+  ok("撤销两步：回到只拖了一次的 +4", hands().slice(nh2).length === 1 && hands().slice(nh2)[0].height_m === 4, JSON.stringify(hands().slice(nh2)));
+  ok("高度工具 / 剖面拖 / 把手：0 次 AI", aiCalls === ai0, aiCalls - ai0);
+  key("Escape");
+
+  // ---------- 场景会话
+  await T.S.flushSave();
+  const A_id = S.sceneId, planA = S.plan.name;
+  ok("场景自动存到 /api/scenes（带 data 与缩略图）", !!A_id && bodies.some((b) => (b.method === "PUT" || b.method === "POST") && /\/api\/scenes/.test(b.url) && b.body && b.body.data && b.body.data.plan && /^data:image\//.test(b.body.thumb || "")));
+  const srvA = await (await realFetch(`/api/scenes/${A_id}`)).json();
+  ok("存下的有程序、聊天（含摘要）、历史、撤销栈（≤ 30）", srvA.data.plan.name === planA && srvA.data.chat.some((c) => c.effect) && srvA.data.history.length > 0 && srvA.data.undo.length > 0 && srvA.data.undo.length <= 30);
+  const chatA = S.chat.length, undoA = S.undo.length;
+  D.querySelector("#btn-scenes").click(); await sleep(30);
+  ok("顶栏「场景」打开左侧场景栏（名字、缩略图、时间）", !D.querySelector("#scenes").hidden && !!D.querySelector(`#scenes .sc-row.on[data-scene-id="${A_id}"] img.sc-thumb`));
+  [...D.querySelectorAll("#scenes .sc-head button")].find((b) => /新场景/.test(b.textContent)).click();
+  await until(() => S.sceneId && S.sceneId !== A_id, 8000);
+  const B_id = S.sceneId;
+  ok("＋ 新场景：程序清空、聊天是新的（A 的聊天不出现）", !S.plan && S.chat.length === 0 && !/法师塔/.test(logText()) && S.undo.length === 0);
+  sendText("海盗港口");
+  await until(() => S.busy === 0 && S.comparing, 40000);
+  const rbB = lastReq(/\/api\/ai\/draft/).body || {};
+  ok("B 场景的 draft 带 B 的 scene_id", rbB.scene_id === B_id);
+  D.querySelector('.cmp[data-card="1"]').click(); await sleep(40);
+  await T.S.flushSave();
+  const listB = await (await realFetch("/api/scenes")).json(), rowB = listB.find((s) => s.id === B_id);
+  ok("B 存下来了，名字换成程序名", !!rowB && rowB.name === S.plan.name, JSON.stringify(listB.map((s) => s.name)));
+  await T.S.openScene(A_id);
+  ok("切回 A：程序、聊天、撤销栈都还在", S.sceneId === A_id && S.plan.name === planA && S.chat.length === chatA && S.undo.length === Math.min(undoA, 30) && /法师塔/.test(logText()));
+  const beforeU = JSON.stringify(S.plan); T.undo();
+  ok("切回来还能撤销", JSON.stringify(S.plan) !== beforeU);
+  T.redo();
+  await T.S.renameScene(B_id, "港口 B");
+  ok("改名", ((await (await realFetch("/api/scenes")).json()).find((s) => s.id === B_id) || {}).name === "港口 B");
+  const C_id = await T.S.dupScene(B_id);
+  ok("复制 = 「X 副本」", ((await (await realFetch("/api/scenes")).json()).find((s) => s.id === C_id) || {}).name === "港口 B 副本");
+  await T.S.delScene(C_id, { ask: false });
+  const trash = await (await realFetch("/api/scenes?trash=1")).json();
+  ok("删除 = 进回收站（列表没了，回收站里有）", !(await (await realFetch("/api/scenes")).json()).some((s) => s.id === C_id) && trash.some((s) => s.id === C_id));
+  ok("场景栏列出 A、B", !!D.querySelector(`#scenes .sc-row[data-scene-id="${A_id}"]`) && !!D.querySelector(`#scenes .sc-row[data-scene-id="${B_id}"]`));
+  ok("场景栏里没有字面的「null」（服务模式）", S.storeMode === "server" && !/null/.test(D.querySelector("#scenes").textContent), D.querySelector("#scenes").textContent.slice(0, 80));
+  // 服务一时连不上：先重试一次，还不行退回浏览器（同一个 id 记下）；服务回来自动切回，补存这段时间的改动
+  const fetch1 = W.fetch; let offline = true, tries = 0;
+  W.fetch = (u, o) => { if (offline && /\/api\/(scenes|memory|health)/.test(String(u))) { tries++; return Promise.reject(new TypeError("Failed to fetch")); } return fetch1(u, o); };
+  await T.S.renameScene(A_id, "塔院 A");
+  ok("连不上：重试一次后才退回浏览器，改名照样成功（不报「没有这个场景」）", tries === 2 && S.storeMode === "local" && S.storeDegraded && S.sceneName === "塔院 A", `${tries} ${S.storeMode}`);
+  ok("场景栏写「暂时连不上」，没有字面 null", /暂时连不上/.test(D.querySelector("#scenes").textContent) && !/null/.test(D.querySelector("#scenes").textContent));
+  offline = false;
+  await T.S.probeBack({ force: true }); await T.S.flushSave();
+  ok("服务回来：切回 server，改名补存到服务上，当前场景 id 不变", S.storeMode === "server" && !S.storeDegraded && S.sceneId === A_id && ((await (await realFetch("/api/scenes")).json()).find((s) => s.id === A_id) || {}).name === "塔院 A");
+  W.fetch = fetch1;
+
+  // ---------- 记忆
+  await realFetch("/api/memory/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }); await T.S.refreshMemory();
+  D.querySelector("#btn-memory").click(); await sleep(30);
+  ok("顶栏「记忆」打开面板", !D.querySelector("#modal").hidden && /记忆/.test(D.querySelector("#modal-card h3").textContent));
+  D.querySelector("#modal-card .mem-new").value = "夜景优先";
+  [...D.querySelectorAll("#modal-card .mem-add button")].pop().click();
+  await until(() => S.memory.some((m) => m.text === "夜景优先") && D.querySelector("#modal-card .mem-row"), 5000);
+  ok("面板里加一条 → POST /api/memory", bodies.some((b) => b.method === "POST" && /\/api\/memory$/.test(b.url) && b.body.text === "夜景优先") && !!D.querySelector("#modal-card .mem-row"));
+  ok("顶栏「记忆」显示条数", D.querySelector("#btn-memory i").textContent === "1");
+  const mrow = () => D.querySelector("#modal-card .mem-row"), mid = S.memory[0].id;
+  const cb = mrow().querySelector(".mem-on"); cb.checked = false; cb.dispatchEvent(new W.Event("change", { bubbles: true }));
+  await until(() => S.memory[0] && S.memory[0].enabled === false, 5000);
+  ok("开关 = PUT enabled:false，行变淡", lastReq(/\/api\/memory\//).method === "PUT" && lastReq(/\/api\/memory\//).body.enabled === false && mrow().classList.contains("off"));
+  change(mrow().querySelector(".mem-text"), "夜景优先，灯要暖色");
+  await until(() => S.memory[0].text === "夜景优先，灯要暖色", 5000);
+  ok("编辑文字 = PUT text", S.memory[0].text === "夜景优先，灯要暖色");
+  ok("来源与用过几次", /你说的/.test(mrow().textContent) && /用过 0 次/.test(mrow().textContent));
+  mrow().querySelector(".x").click();
+  await until(() => !S.memory.some((m) => m.id === mid), 5000);
+  ok("× = DELETE", !S.memory.length && lastReq(/\/api\/memory\//).method === "DELETE");
+  key("Escape");
+  ok("Esc 关面板", D.querySelector("#modal").hidden);
+  const aiM = aiCalls;
+  sendText("记住：不要撒小房子");
+  await until(() => S.busy === 0 && S.memory.some((m) => /撒小房子/.test(m.text)), 20000);
+  ok("聊天里「记住：…」= 存成记忆、回「记住了」（服务端本地处理，不调模型）", S.memory.some((m) => /撒小房子/.test(m.text) && m.source === "you") && /记住了/.test(lastAI()), lastAI());
+  sendText("我喜欢水边的东西");
+  await until(() => S.busy === 0 && aiCalls === aiM + 2, 30000);
+  const sug = [...D.querySelectorAll("#log .msg.mem-suggest")].pop();
+  ok("AI 的 memory_suggestions →「要记住吗：… [记住] [不用]」", !!sug && /要记住吗/.test(sug.textContent) && /喜欢水边/.test(sug.textContent), lastAI());
+  ok("聊天底部那行写「用了 N 条偏好」", /用了 \d+ 条偏好/.test(logText()), [...D.querySelectorAll("#log .msg.sys")].slice(-2).map((m) => m.textContent).join(" | "));
+  [...sug.querySelectorAll("button")].find((b) => b.textContent === "记住").click();
+  await until(() => S.memory.some((m) => m.source === "ai"), 5000);
+  ok("点「记住」= 存成 AI 建议的记忆", S.memory.some((m) => m.source === "ai" && /水边/.test(m.text)));
+  const ub = [...D.querySelectorAll("#log .msg.user")].find((m) => /夜市/.test(m.textContent)).querySelector(".mem-btn"), nMem = S.memory.length;
+  ub.click();
+  await until(() => S.memory.length === nMem + 1, 5000);
+  ok("消息旁「记住这个」= 存成记忆", S.memory.length === nMem + 1 && ub.disabled);
+  D.querySelector("#btn-memory").click(); await sleep(30);
+  [...D.querySelectorAll("#modal-card .actions button")].find((b) => /清空/.test(b.textContent)).click();
+  await until(() => !S.memory.length, 5000);
+  ok("清空（要确认）", !S.memory.length && lastReq(/\/api\/memory\/clear/).method === "POST");
+  key("Escape");
+  ok("v6 新功能没有额外调 AI：/api/ai 只有 6 次说话（夜市、还是太空了、再密一点、海盗港口、记住…、水边）", aiCalls === 6, aiCalls);
   ok("没有页面脚本错误", !D.getElementById("boot-error"), D.getElementById("boot-error") && D.getElementById("boot-error").textContent);
 } catch (e) { ok("测试本身", false, (e && e.stack) || e); }
 out.textContent += `DONE passed=${passed} failed=${failed}\n`;

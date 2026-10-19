@@ -13,6 +13,7 @@
 <body>
   <header id="top">
     <div class="brand">场景对话</div>
+    <button id="btn-scenes" class="pill sc-btn" type="button" aria-pressed="false" title="场景列表：每个场景有自己的程序、聊天和撤销（自动保存）">☰ <span class="sc-cur">新场景</span></button>
     <ol id="steps">
       <li data-step="1" title="一句话说你要什么">说</li>
       <li data-step="2" title="三个空间组织不同的概念挑一个">选</li>
@@ -20,13 +21,17 @@
       <li data-step="4" title="导出给引擎，搭完读回对比">出</li>
     </ol>
     <div class="spacer"></div>
+    <button id="btn-memory" class="pill" type="button" title="跨场景的偏好">记忆 <i></i></button>
     <button id="ai-status" class="pill" type="button" title="AI 设置">AI：…</button>
   </header>
 
   <main>
+    <aside id="scenes" hidden></aside>
     <section id="chat">
       <div id="log" aria-live="polite"></div>
+      <div id="refs" hidden title="加到对话的东西：发送时一起告诉 AI（名字 + 事实）"></div>
       <form id="composer">
+        <div id="at-list" role="listbox" hidden></div>
         <input id="input" type="text" placeholder="说一句，比如「我要生成魔法学院」「海盗港口，地下有溶洞」" autocomplete="off" />
         <button type="submit" id="send" title="发送会调用一次 AI"><span id="send-label">发送</span><span class="ai-tag">调 AI</span></button>
       </form>
@@ -44,8 +49,9 @@
       </div>
       <div id="toolbar" class="disabled">
         <button type="button" data-tool="move" class="tool active" title="拖形体 / 组 / 地形块 / 空间 / 出生点 = 改它的偏移；按住 Alt 拖重复里的一个 = 只挪这一个；点一下看它是什么 (V)">移动</button>
-        <button type="button" data-tool="path" class="tool" title="从一个东西画到另一个 = 加一条连接（路 / 桥 / 台阶，样式在场景树里改） (P)">画路</button>
-        <button type="button" data-tool="region" class="tool" title="圈一块 = 加树林 / 田 / 撒房子 / 水池 / 平台；在地下 / 天上层圈 = 新建空间 (R)">圈区域</button>
+        <button type="button" data-tool="path" class="tool" title="画一笔 → 加到对话（手绘线），或直接连成一条路（两头吸到最近的东西） (P)">画路</button>
+        <button type="button" data-tool="region" class="tool" title="圈一块 = 加到对话，再说这块要做成什么；在地下 / 天上层圈 = 新建空间 (R)">圈区域</button>
+        <button type="button" data-tool="height" class="tool" title="在地面任意一点按下上下拖 = 抬高 / 压低；滚轮或 [ ] 调半径，Shift 削平，Alt 只压低 (H)">高度</button>
         <button type="button" data-tool="section" class="tool" title="在图上拉一条剖切线 (S)">剖切</button>
         <button type="button" data-tool="erase" class="tool" title="点掉一个节点 / 地形块 / 连接；点重复里的一个 = 只去掉这一个 (E)">擦除</button>
         <span class="sep"></span>

@@ -4,7 +4,8 @@
 // 屋顶按 roof 叠上，浮岛 = 倒锥 + 草顶，悬空按 elev；同几何 ≥ 3 件合成 InstancedMesh）、路（按 style：带子 / 台阶 / 桥面 + 桥墩 / 索桥 / 隧道 / 运河 / 传送门）、水面、出生点、
 // 空间内部实体（通道 = 沿折线的盒子、房间 = 多边形挤出、层间连接 = 竖梯；当前内部层实、其它层半透明）、连接点、剖切面。
 // 纯函数式挂载：数据进（ctx），回调没有；不调 AI。
-import { paletteOf, spawnY, sublevelOf, SELECT_COLOR, ROOM_FILL, shapeOf, volDims, roofOf, volumeBase, volumeTop, volumeColor, volumeType, ROUND_SHAPES, prismSides, archThickness, torusTube, pathStyleOf, pierPoints, ringOf } from "./map.js";
+import { paletteOf, spawnY, sublevelOf, SELECT_COLOR, ROOM_FILL, shapeOf, volDims, roofOf, volumeBase, volumeTop, volumeColor, volumeType, ROUND_SHAPES, prismSides, archThickness, torusTube, pathStyleOf, pierPoints, ringOf, marksOf } from "./map.js";
+import { SKY_TOD, LIGHT_TOD } from "./eye.js";
 import { sectionPath } from "../engine/section.js";
 import { CLEARANCE, levelsOf } from "../engine/interior.js";
 import { pathCrossings } from "../engine/routing.js";
@@ -36,7 +37,8 @@ const UG_COLOR = "#3b3a52", WAY_COLOR = "#cdb894", SKY_WAY = "#a0784a", SLAB_COL
  * @param {HTMLElement} container
  * @param {object} ctx { sid, T, stratum?, interiorLevel?: 0|1|2, section?: {mode, line, width_m}, selected?: {plan_id?, sid_id?} }
  * @param {{inset?: boolean}} [o] inset = 3D 小窗（不出提示文字）
- * @returns {{ ready: Promise<boolean>, offline: boolean, update(ctx), setGroundOpacity(o: number|null), setSection(section|null), snapshot(): string|null, debug(): object, dispose() }}
+ * @returns {{ ready: Promise<boolean>, offline: boolean, update(ctx), setGroundOpacity(o: number|null), setSection(section|null), setBrush(brush|null), snapshot(): string|null, debug(): object, dispose() }}
+ *   setBrush({ point: [x, z]（世界）, radius_m, delta_m?, mode? }) 画高度笔刷圈（null 收起）；ctx.marks / plan.marks 画成贴地虚线与图钉（名字 mark:<id>）。
  *   debug() = { names, groundOpacity, section, builds, volumes: { volumes, shapes: {shape: 个数}, meshes, instanced, instances }, calls }
  *   update 节流 150 ms；setGroundOpacity(null) 回到自动（地下层 35%，其它 100%）；setSection 接受 {mode, line, width_m} 或有 path 的采样结果，null 收起；
  *   ctx.section 在 update 时也会同步剖切面（显式 setSection 优先）。
@@ -44,13 +46,14 @@ const UG_COLOR = "#3b3a52", WAY_COLOR = "#cdb894", SKY_WAY = "#a0784a", SLAB_COL
 export function mountView3d(container, ctx, o = {}) {
   const inset = !!o.inset;
   container.replaceChildren();
-  let impl = null, alive = true, cur = ctx, opacity = null, section, sectionSet = false;
+  let impl = null, alive = true, cur = ctx, opacity = null, section, sectionSet = false, brush = null;
   const handle = {
     offline: false,
     ready: null,
     update(c) { if (!alive || !c) return; cur = c; if (impl) impl.update(c); },
     setGroundOpacity(op) { opacity = op == null ? null : Math.max(0.05, Math.min(1, Number(op))); if (impl) impl.setGroundOpacity(opacity); },
     setSection(sec) { section = sec || null; sectionSet = true; if (impl) impl.setSection(section); },
+    setBrush(b) { brush = b || null; if (impl) impl.setBrush(brush); },
     snapshot() { return impl ? impl.snapshot() : null; },
     debug() { return impl ? impl.debug() : { names: [], loading: !handle.offline }; },
     dispose() { alive = false; if (impl) impl.dispose(); else container.replaceChildren(); },
@@ -63,6 +66,7 @@ export function mountView3d(container, ctx, o = {}) {
     catch (e) { return note(["3D 不可用（没有 WebGL）", "这台机器的浏览器没有 WebGL，3D 预览不可用。请看俯视图 / 剖面 / 第一眼。"]); }
     if (opacity != null) impl.setGroundOpacity(opacity);
     if (sectionSet) impl.setSection(section);
+    if (brush) impl.setBrush(brush);
     return true;
   })();
   return handle;
@@ -78,12 +82,22 @@ function create(container, ctx, inset) {
   const camera = new THREE.PerspectiveCamera(50, 1, 0.5, 1000);
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8a7a, 0.9));
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8a7a, 0.9);
+  scene.add(hemi);
   const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+  /** 天色与光照按 sid.style.lighting.time_of_day（与第一眼同一张配色表）；没写时段 = 原来的浅灰白天 */
+  const applySky = (sid) => {
+    const tod = sid && sid.style && sid.style.lighting && sid.style.lighting.time_of_day, sk = tod && SKY_TOD[tod], L = (tod && LIGHT_TOD[tod]) || [0xffffff, 0x8a8a7a, 0.9, 0xffffff, 1.1];
+    scene.background = sk ? new THREE.Color(sk[0]).lerp(new THREE.Color(sk[1]), 0.55) : new THREE.Color("#eef1f2");
+    hemi.color.setHex(L[0]); hemi.groundColor.setHex(L[1]); hemi.intensity = L[2]; sun.color.setHex(L[3]); sun.intensity = L[4];
+    // 小窗只有 320×240，夜里按原光照几乎全黑、地形起伏看不出：小窗夜里提亮（天色、灯照旧，仍是夜景）
+    if (inset && tod === "night") { hemi.groundColor.setHex(0x4a5274); hemi.intensity = 0.95; sun.intensity = 0.85; }
+    container.dataset.tod = tod || "";
+  };
   sun.position.set(-60, 80, 40); scene.add(sun);
   if (!inset) { const n = document.createElement("div"); n.className = "three-note"; n.textContent = "拖动旋转 · 滚轮缩放 · 右键平移"; container.append(n); }
 
-  let volStats = null, group = new THREE.Group(), secMesh = null, groundMat = null, nBuilds = 0, alive = true, dirty = true, cur = ctx, secCfg, secExplicit = false, manualOpacity = null, lastBuild = 0, timer = null, pending = null, placed = false;
+  let volStats = null, group = new THREE.Group(), secMesh = null, brushMesh = null, brushCfg = null, groundMat = null, nBuilds = 0, alive = true, dirty = true, cur = ctx, secCfg, secExplicit = false, manualOpacity = null, lastBuild = 0, timer = null, pending = null, placed = false;
   scene.add(group);
   const resize = () => { const w = container.clientWidth || (inset ? 320 : 600), h = container.clientHeight || (inset ? 220 : 400); renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); dirty = true; };
   const ro = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
@@ -116,6 +130,7 @@ function create(container, ctx, inset) {
     scene.remove(group); disposeTree(group);
     group = new THREE.Group();
     const { sid, T } = c, pal = paletteOf(sid), b = sid.bounds, sel = c.selected || null;
+    applySky(sid);
     const isSel = (o) => !!sel && ((sel.sid_id && sel.sid_id === o.id && !sel.part) || (!sel.sid_id && sel.plan_id && (o.plan_id === sel.plan_id || o.zone_id === sel.plan_id)));
     const W = b.max[0] - b.min[0], D = b.max[2] - b.min[2], seg = inset ? 40 : 60;
     // 地形：PlaneGeometry 转到 XZ，按 heightAt 抬高；顶点色按层
@@ -157,10 +172,11 @@ function create(container, ctx, inset) {
     }
     for (const s of sid.spaces || []) { const m = spaceGroup(s, c, sel); if (m) group.add(m); }
     for (const m of sid.markers || []) if (m.kind === "connector" && Array.isArray(m.position)) group.add(connectorMesh(m));
+    group.add(markMeshes(c));
     scene.add(group);
     applyOpacity();
     if (!secExplicit) secCfg = c.section || null;
-    drawSection();
+    drawSection(); drawBrush();
     if (!placed) { fitCamera(sid); placed = true; }
     dirty = true;
   }
@@ -284,6 +300,30 @@ function create(container, ctx, inset) {
     return m;
   }
 
+  /** 高度笔刷圈（docs/07 §4）：外圈 = 半径、内圈 = 60%，贴地；界面在拖动高度工具时调 setBrush */
+  function drawBrush() {
+    if (brushMesh) { scene.remove(brushMesh); disposeTree(brushMesh); brushMesh = null; }
+    const B = brushCfg;
+    if (!B || !cur || !Array.isArray(B.point) || !(B.radius_m > 0)) { dirty = true; return; }
+    const color = B.mode === "flatten" ? SEC_COLOR : (B.delta_m || 0) < 0 ? "#2a6aa6" : "#c0392b", y0 = cur.T.heightAt(B.point[0], B.point[1]);
+    brushMesh = new THREE.Group(); brushMesh.name = "height_brush";
+    for (const k of [1, 0.6]) {
+      const pts = [];
+      for (let i = 0; i <= 48; i++) { const a = (i / 48) * Math.PI * 2, x = B.point[0] + Math.cos(a) * B.radius_m * k, z = B.point[1] + Math.sin(a) * B.radius_m * k; pts.push(new THREE.Vector3(x, cur.T.heightAt(x, z) + 0.5, z)); }
+      const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: k === 1 ? 1 : 0.6 }));
+      l.renderOrder = 7; brushMesh.add(l);
+    }
+    const pole = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(B.point[0], y0, B.point[1]), new THREE.Vector3(B.point[0], y0 + Math.max(1, Math.abs(B.delta_m || 0)) * Math.sign(B.delta_m || 1), B.point[1])]), new THREE.LineBasicMaterial({ color, depthTest: false }));
+    pole.renderOrder = 7; brushMesh.add(pole);
+    // 笔刷范围铺一层半透明的色（贴着地形起伏）：夜景、远看时也看得出鼓起 / 压低的那一块
+    const disc = new THREE.RingGeometry(0.001, B.radius_m, 48, 8), pos = disc.attributes.position;
+    for (let i = 0; i < pos.count; i++) { const x = B.point[0] + pos.getX(i), z = B.point[1] + pos.getY(i); pos.setXYZ(i, x, cur.T.heightAt(x, z) + 0.35, z); }
+    disc.computeVertexNormals();
+    const fill = new THREE.Mesh(disc, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false }));
+    fill.renderOrder = 6; brushMesh.add(fill);
+    scene.add(brushMesh); dirty = true;
+  }
+
   function loop() { if (!alive) return; controls.update(); if (dirty && renderer.domElement.clientWidth) { renderer.render(scene, camera); dirty = false; } requestAnimationFrame(loop); }
   resize(); build(ctx); loop();
   return {
@@ -295,9 +335,10 @@ function create(container, ctx, inset) {
     },
     setGroundOpacity(op) { manualOpacity = op; applyOpacity(); },
     setSection(sec) { secCfg = sec || null; secExplicit = true; drawSection(); },
+    setBrush(b) { brushCfg = b || null; drawBrush(); },
     snapshot() { renderer.render(scene, camera); return renderer.domElement.toDataURL("image/png"); },
     debug() { const names = []; scene.traverse((x) => { if (x.name) names.push(x.name); }); return { names, groundOpacity: groundMat ? groundMat.opacity : null, section: !!secMesh, builds: nBuilds, volumes: volStats, calls: renderer.info.render.calls }; },
-    dispose() { alive = false; if (timer) clearTimeout(timer); if (ro) ro.disconnect(); controls.dispose(); if (secMesh) disposeTree(secMesh); disposeTree(group); renderer.dispose(); container.replaceChildren(); },
+    dispose() { alive = false; if (timer) clearTimeout(timer); if (ro) ro.disconnect(); controls.dispose(); if (secMesh) disposeTree(secMesh); if (brushMesh) disposeTree(brushMesh); disposeTree(group); renderer.dispose(); container.replaceChildren(); },
   };
 }
 
@@ -377,16 +418,30 @@ function roofPart(v, r) {
   return { geo: "pyr", s: [w * (r.type === "spire" ? 1.02 : 1.08), rh, d * (r.type === "spire" ? 1.02 : 1.08)], p: [0, h, 0] };
 }
 
+// ---------- 夜里发光的小件
+const GLOW = "#ffd27a";
+const LIGHT_RE = /灯|烛|火|焰|萤|炬|lantern|lamp|torch|candle|fire|glow/i;
+const warmBright = (hex) => { const c = new THREE.Color(hex), hsl = {}; c.getHSL(hsl); return hsl.l >= 0.55 && hsl.s >= 0.45 && (hsl.h <= 0.17 || hsl.h >= 0.95); };
+/** 是灯：名字里有灯 / 火 / 焰…（≤ 8 m 的小件），或暖亮色的小件（≤ 3 m） */
+function isLight(v, w, h, d, color) {
+  const big = Math.max(w, h, d);
+  return (LIGHT_RE.test(String(v.label || "")) && big <= 8) || (big <= 3 && typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color) && warmBright(color));
+}
+/** 发光色：暖色的照原色提亮，其它（冷色的咒灯）也提亮一点 */
+const glowColor = (hex) => { try { return "#" + new THREE.Color(hex).lerp(new THREE.Color("#ffffff"), 0.25).getHexString(); } catch { return GLOW; } };
+
 /**
  * 体块 → 网格。每个体块拆成件（主体 / 屋顶 / 浮岛草顶 / 树干 / 吊脚柱），件的世界矩阵 = 平移(底面中心) · 转 rotation_y · 件偏移 · 缩放。
  * 同一单位几何的件 ≥ INSTANCE_MIN 个就合成一个 InstancedMesh（每实例自带颜色）；地标与选中的单独出网格（名字 landmark:id / house:id / shape:id）。
  * @returns {{ group, stats: { volumes, shapes: {shape: n}, meshes, instanced, instances } }}
  */
 function volumeMeshes(c, pal, isSel) {
-  const { sid, T } = c, out = new THREE.Group(), stats = { volumes: 0, shapes: {}, meshes: 0, instanced: 0, instances: 0 };
+  const { sid, T } = c, out = new THREE.Group(), stats = { volumes: 0, shapes: {}, meshes: 0, instanced: 0, instances: 0, lights: 0 };
   out.name = "volumes";
   const buckets = new Map(), singles = [], m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
-  const matOf = new Map(), lam = (color, alpha = 1) => { const k = color + "|" + alpha; if (!matOf.has(k)) matOf.set(k, new THREE.MeshLambertMaterial(Object.assign({ color }, alpha < 1 ? { transparent: true, opacity: alpha, depthWrite: false } : {}))); return matOf.get(k); };
+  const matOf = new Map(), lam = (color, alpha = 1, glow = false) => { const k = color + "|" + alpha + "|" + glow; if (!matOf.has(k)) matOf.set(k, glow ? new THREE.MeshBasicMaterial({ color }) : new THREE.MeshLambertMaterial(Object.assign({ color }, alpha < 1 ? { transparent: true, opacity: alpha, depthWrite: false } : {}))); return matOf.get(k); };
+  // 夜里：灯 / 灯笼 / 火这些小件自己发光（不受暗光照影响）；细高的灯柱只在顶上点一盏
+  const night = !!(sid.style && sid.style.lighting && sid.style.lighting.time_of_day === "night");
   for (const v of sid.volumes || []) {
     if (!v || !Array.isArray(v.position) || !Array.isArray(v.size)) continue;
     const sh = shapeOf(v), [w, h, d] = volDims(v), base = volumeBase(v, T), r = roofOf(v), lm = v.importance === "landmark", hot = isSel(v), type = volumeType(v);
@@ -405,21 +460,26 @@ function volumeMeshes(c, pal, isSel) {
       const rp = roofPart(v, r);
       if (rp) parts.push(Object.assign(rp, { color: hot ? SELECT_COLOR : lm ? pal.roof : pal.roof }));
     }
+    if (night && !hot && isLight(v, w, h, d, body)) {
+      if (h > 2.5 * Math.max(w, d) && h > 1.5) { const k = Math.max(0.6, Math.min(1.6, 3 * Math.max(w, d))); parts.push({ geo: "sphere", s: [k, k, k], p: [0, h, 0], color: GLOW, glow: true }); }
+      else parts[0] = Object.assign(parts[0], { color: glowColor(body), glow: true });
+      stats.lights++;
+    }
     if (v.stilt_m > 0.2) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) parts.push({ geo: "box", s: [0.3, v.stilt_m, 0.3], p: [(sx * w) / 2.3, -v.stilt_m, (sz * d) / 2.3], color: "#8a6a44" });
     const rot = ((v.rotation_y || 0) * Math.PI) / 180, origin = new THREE.Matrix4().compose(new THREE.Vector3(v.position[0], base, v.position[2]), q.setFromAxisAngle(Y, rot).clone(), new THREE.Vector3(1, 1, 1));
     const name = `${lm ? "landmark" : type === "house" ? "house" : v.kind === "prop" ? "prop" : "shape"}:${v.id}`;
     parts.forEach((p, i) => {
       const local = new THREE.Matrix4().compose(new THREE.Vector3(...(p.p || [0, 0, 0])), new THREE.Quaternion().setFromAxisAngle(Y, p.ry || 0), new THREE.Vector3(...p.s.map((x) => Math.max(0.01, x))));
-      const M = origin.clone().multiply(local), a = p.alpha || 1;
-      if (lm || hot) { singles.push({ geo: p.geo, M, color: p.color, a, name: i === 0 ? name : `${name}#${i}` }); return; }
-      const k = p.geo + "|" + a;
+      const M = origin.clone().multiply(local), a = p.alpha || 1, g = !!p.glow;
+      if (lm || hot) { singles.push({ geo: p.geo, M, color: p.color, a, g, name: i === 0 ? name : `${name}#${i}` }); return; }
+      const k = p.geo + "|" + a + "|" + (g ? "glow" : "");
       if (!buckets.has(k)) buckets.set(k, []);
-      buckets.get(k).push({ geo: p.geo, M, color: p.color, a, name: i === 0 ? name : `${name}#${i}` });
+      buckets.get(k).push({ geo: p.geo, M, color: p.color, a, g, name: i === 0 ? name : `${name}#${i}` });
     });
   }
   for (const [k, list] of buckets) {
     if (list.length < INSTANCE_MIN) { singles.push(...list); continue; }
-    const a = list[0].a, mesh = new THREE.InstancedMesh(unitGeo(list[0].geo), lam("#ffffff", a), list.length), col = new THREE.Color();
+    const a = list[0].a, mesh = new THREE.InstancedMesh(unitGeo(list[0].geo), lam("#ffffff", a, list[0].g), list.length), col = new THREE.Color();
     list.forEach((it, i) => { mesh.setMatrixAt(i, it.M); mesh.setColorAt(i, col.set(it.color)); });
     mesh.instanceMatrix.needsUpdate = true; if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
@@ -427,7 +487,7 @@ function volumeMeshes(c, pal, isSel) {
     out.add(mesh); stats.meshes++; stats.instanced++; stats.instances += list.length;
   }
   for (const it of singles) {
-    const mesh = new THREE.Mesh(unitGeo(it.geo), lam(it.color, it.a));
+    const mesh = new THREE.Mesh(unitGeo(it.geo), lam(it.color, it.a, it.g));
     mesh.matrixAutoUpdate = false; mesh.matrix.copy(it.M); mesh.name = it.name;
     out.add(mesh); stats.meshes++;
   }
@@ -546,4 +606,25 @@ function waterMeshes(c) {
     m.position.y = y; m.name = "water:" + r.id; m.renderOrder = 3; out.add(m);
   }
   return out;
+}
+/** 标记（docs/07 §1.1）：圈选 / 手绘线 = 贴地虚线（离地 0.4 m，不被地形挡），图钉 = 竖杆 + 球；选中的橙色 */
+function markMeshes(c) {
+  const g = new THREE.Group(), sel = c.selected || null;
+  g.name = "marks";
+  for (const m of marksOf(c)) {
+    const color = sel && (sel.mark_id === m.id || (sel.type === "mark" && sel.id === m.id)) ? SELECT_COLOR : "#1f6feb", k = new THREE.Group();
+    k.name = `mark:${m.id}`;
+    if (m.type === "pin") {
+      const [x, z] = m.world[0], y = c.T.heightAt(x, z), M = new THREE.MeshBasicMaterial({ color });
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 4, 6), M), head = new THREE.Mesh(new THREE.SphereGeometry(0.7, 12, 8), M);
+      pole.position.set(x, y + 2, z); head.position.set(x, y + 4.4, z); k.add(pole, head);
+    } else {
+      const P = m.type === "area" ? m.world.concat([m.world[0]]) : m.world, pts = sampleLine(P, 1.5).map((q) => new THREE.Vector3(q.x, c.T.heightAt(q.x, q.z) + 0.4, q.z));
+      if (pts.length < 2) continue;
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineDashedMaterial({ color, dashSize: 1.6, gapSize: 0.9, depthTest: false, transparent: true }));
+      line.computeLineDistances(); line.renderOrder = 6; k.add(line);
+    }
+    g.add(k);
+  }
+  return g;
 }

@@ -16,8 +16,9 @@ AI 写**场景程序**（plan v2，docs/06 §2）：形体组成组，组可以�
 - rules.py：本地知识——片段库、词表、空间组织标签与三张差异、本地锁定（draft / revise 都锁）
 - providers.py：服务商底层（DeepSeek urllib 客户端、Claude SDK 客户端、JSON 修复、费用、配置、错误、密钥测试）
   + 概念 → 场景程序（模拟 AI 的题材配方；真模型某张没写成时按概念补位，不套预设）
-- ai.py（本文件）：提示词、后处理、三个实现（MockAI / DeepSeekAI / ClaudeAI = 底层客户端 + 构思 / 展开 / 改动）、两步编排、入口 draft / revise。
-  plans.py / rules.py / providers.py 的名字在这里再导出，外部（app.py、测试、tools/）只用 ai.X。
+- ai.py（本文件）：提示词（含用户偏好 memory_context、引用 / 历史）、后处理、三个实现（MockAI / DeepSeekAI / ClaudeAI = 底层客户端 + 构思 / 展开 / 改动）、两步编排 generate。
+  plans.py / rules.py / providers.py 的名字在这里再导出，外部只用 ai.X。
+- app.py：入口 draft / revise（两步之后的收尾、本地锁定、记忆库、本地「记住」识别）与场景存储、HTTP 路由。
 """
 from __future__ import annotations
 
@@ -179,6 +180,34 @@ CONCEPT_SCHEMA = {
             "key_structures": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string", "maxLength": 24}},
             "terrain_idea": {"type": "string", "maxLength": 50, "description": "地形怎么雕"},
             "why_different": {"type": "string", "maxLength": 80, "description": "它的设计动机，以及空间上和另两个差在哪"}}}}}}
+# 记忆（docs/07 §3）：模型发现人表达了**长期**偏好时顺手给的建议（不额外调用）；构思与改动的输出都可以带
+MEMORY_KINDS = ("like", "dislike", "rule", "fact")
+MEMORY_SUGGEST = {"type": "array", "maxItems": 2, "description": "人表达了长期偏好（不是这一次的改动）时才给，≤ 2 条；没有就省略",
+                  "items": {"type": "object", "additionalProperties": False, "required": ["text", "kind"], "properties": {
+                      "text": {"type": "string", "minLength": 2, "maxLength": 40}, "kind": {"type": "string", "enum": list(MEMORY_KINDS)}}}}
+CONCEPT_SCHEMA["properties"]["memory_suggestions"] = MEMORY_SUGGEST
+MEMORY_MAX = 20
+MEMORY_KIND_CN = {"like": "喜欢", "dislike": "不喜欢 / 别做", "rule": "规矩", "fact": "关于这个人 / 项目"}
+MEMORY_LINE = ('可选 "memory_suggestions": [{"text": "≤30 字", "kind": "like|dislike|rule|fact"}]：只在人这句话流露出**长期**偏好'
+               '（以后都、我一向、我喜欢 / 讨厌、我在做某某游戏）时给，≤ 2 条；这一次的改动要求不算，用户偏好里已有的不要重复；没有就省略这个字段。')
+
+
+def memory_context(items: Any, scene_id: Any = None) -> dict:
+    """记忆条目 → {text, ids}：只取启用的、全局的 + 本场景的（scope=scene 只在 scene_id 相同时用），本场景的在前、新的在前，最多 20 条；
+    text 按 kind 分组，接在系统提示后面（DeepSeek 拼在后面、Claude 放在缓存断点之后的第二块），明说「这句话说的优先于偏好」。"""
+    use = [m for m in items or [] if isinstance(m, dict) and m.get("enabled", True) is not False and str(m.get("text") or "").strip()
+           and (m.get("scope") != "scene" or (scene_id and m.get("scene_id") == scene_id))]
+    use.sort(key=lambda m: (m.get("scope") != "scene", -float(m.get("created") or 0)))
+    use = use[:MEMORY_MAX]
+    if not use:
+        return {"text": "", "ids": [], "items": []}
+    lines = ["用户偏好（跨场景，人以前说过的；只是偏好，不是硬条件。人这句话说的优先于偏好，冲突时照这句话；和题材无关的偏好不用硬套）："]
+    for k in MEMORY_KINDS:
+        g = [m for m in use if (m.get("kind") if m.get("kind") in MEMORY_KINDS else "rule") == k]
+        if g:
+            lines.append(MEMORY_KIND_CN[k] + "：")
+            lines += [f"- {str(m['text']).strip()[:120]}{'（本场景）' if m.get('scope') == 'scene' else ''}" for m in g]
+    return {"text": "\n".join(lines), "ids": [m.get("id") for m in use if m.get("id")], "items": use}
 # 构思的「视角」：每次请求随机抽 2 个写进用户消息，只作可选参考（不进系统提示，系统提示里没有任何固定例句或维度清单）
 LENSES = [
     "轴线仪式：一条中轴串起门、庭、殿，越往里越庄重", "环形向心：一圈圈围着一个中心，所有东西朝内",
@@ -216,6 +245,8 @@ def concept_system_prompt() -> str:
 6. 人这句话里说死的东西（时段、点了名的结构、地形、地下空间、层数、从哪边进）三个概念都要满足，只是满足的方式不同。例：人说「空中花园」，三个都在空中；人说「神殿」，三个的主体都是神殿。
 7. 用户消息里可能附两个随机抽的「视角」：可以借鉴，不必照用，和题材不合就忽略；至少一个概念不用视角，只从题材的灵魂结构出发。
 8. 文案简体中文，具体、短。
+9. 系统提示后面附了「用户偏好」时：和这个题材相关的（时段、氛围、不要的东西）三个概念都要体现，并写进 concept 或 key_structures（例：喜欢夜景 → concept 里写清是夜里的什么景、靠什么亮）；和题材无关的不用硬套。
+10. """ + MEMORY_LINE + """
 
 输出：只输出一个 json 对象，不要 markdown，不要解释：
 {"concepts": [{"name": "…", "concept": "一句话", "key_structures": ["…"], "terrain_idea": "…", "why_different": "…"}, …共 3 个]}"""
@@ -247,7 +278,7 @@ def program_system_prompt() -> str:
    repeat 的方向：linear 默认沿 x（东西）排，沿南北排要写 axis:"z"；mirror axis:"x" = 左右翻（x → −x），模板必须有 x 偏移，不然两份重合成一份；axis:"z" = 前后翻。
    对称一对（街口两根广告柱）= {{"type":"repeat","pattern":"mirror","axis":"x","at":"street.N","child":{{"type":"cylinder","offset_m":[13,0],…}}}}——偏移写在 child 上，不写在 repeat 上。
    夹道（两排柱子 / 石像夹着一条南北向的路）= {{"type":"repeat","pattern":"mirror","axis":"x","child":{{"type":"repeat","pattern":"linear","axis":"z","count":6,"spacing_m":11,"offset_m":[-8,0],"child":{{"type":"column",…}}}}}}。
-   elev_m 只给真正悬空的东西（锚在 X.top 上的已经落在 X 顶面，不要再写 elev_m = X 的高度）。高架渠 / 天桥 / 栈道 / 空中步道：elev_m 只写在桥面上（或只装桥面的组上），墩、柱、拱、门写在组外或加 ground:"snap"；组里没有桥面就别给组写 elev_m（组的 elev_m 会把组里所有东西一起抬高）。形体的 children：不写 elev_m 立在父体顶上；写了 elev_m = 离父体底面（离地）的高度，挂在立面上——外挂平台 / 招牌 / 阳台 = {{"type":"building","size_m":[16,58,14],"children":[{{"type":"platform","offset_m":[11,0],"elev_m":26,"size_m":[6,1,10]}}]}}。螺旋梯 = stairs + shape:"cylinder"（size_m [直径, 高]）。地形操作只能锚到 site.* 和前面的地形操作。layout=rooms 的房间都要有英文 id，links 用房间 id（入口写 "entry"）。
+   elev_m 只给真正悬空的东西（锚在 X.top 上的已经落在 X 顶面，不要再写 elev_m = X 的高度）。高架渠 / 天桥 / 栈道 / 空中步道：elev_m 只写在桥面上（或只装桥面的组上），墩、柱、拱、门写在组外或加 ground:"snap"；组里没有桥面就别给组写 elev_m（组的 elev_m 会把组里所有东西一起抬高）。形体的 children：不写 elev_m 立在父体顶上；写了 elev_m = 离父体底面（离地）的高度，挂在立面上——外挂平台 / 招牌 / 阳台 = {{"type":"building","size_m":[16,58,14],"children":[{{"type":"platform","offset_m":[11,0],"elev_m":26,"size_m":[6,1,10]}}]}}。螺旋梯 = stairs + shape:"cylinder"（size_m [直径, 高]）。地形操作只能锚到 site.*、前面的地形操作和人画的标记（marks 的 id）。layout=rooms 的房间都要有英文 id，links 用房间 id（入口写 "entry"）。
    环形的走道 / 回廊 / 摊带 / 环廊写成空心圆柱（hollow:true，wall_m = 带宽）或 radial 弧段，不要写实心圆柱（实心的会变成一面鼓盖住中间）。竖着立的环（星门、环门）= torus + orient:"upright"。
 3. **不要默认用台地 / 撒房子**（terraces、scatter_houses、terrace 操作、edge terraced），除非题材真的需要（山村、梯田、民居片区）。
 4. 名字随便起：label 用人话（法师塔、光桥、海盗码头、禁书地窖）。id 用英文小写短名，被引用的才必须写；引用只能指向本程序里已有的 id，或 site / spawn。
@@ -314,9 +345,79 @@ def expand_user_text(intent: str, cons: dict, concepts: list, k: int, locked: di
     return "\n\n".join(parts)
 
 
-def revise_user_text(plan: dict, action: dict, locked_ids: list | None) -> str:
-    parts = ["当前场景程序：\n" + _one_line(plan),
-             "人的动作（程序已转成结构化事实，不是像素）：\n" + json.dumps(action, ensure_ascii=False),
+def _mark_brief(m: dict) -> dict:
+    """提示词里的标记：不给坐标（AI 不写坐标，也不用读），只给 id / 类 / 名字 / 大小"""
+    out = {k: m[k] for k in ("id", "type", "label") if k in m}
+    pts = m.get("polygon_m") or m.get("path_m")
+    if isinstance(pts, list) and pts and all(isinstance(q, list) and len(q) >= 2 for q in pts):
+        xs, zs = [float(q[0]) for q in pts], [float(q[1]) for q in pts]
+        if m.get("type") == "area":
+            out["size_m"] = [round(max(xs) - min(xs)), round(max(zs) - min(zs))]
+        else:
+            out["length_m"] = round(sum(((xs[i + 1] - xs[i]) ** 2 + (zs[i + 1] - zs[i]) ** 2) ** 0.5 for i in range(len(xs) - 1)))
+    return out
+
+
+def _turn_text(t: Any, n: int = 80) -> str:
+    """历史里的一条压成一句：第一句、≤ n 字"""
+    s = re.sub(r"\s+", " ", str(t or "")).strip()
+    first = re.split(r"(?<=[。！？!?])", s)[0] if len(s) > n else s
+    return first[:n] + ("…" if len(first) > n or len(s) > len(first) else "")
+
+
+HISTORY_ROUNDS = 10  # 只带最近 10 轮（人 + AI 各一条算一轮）
+
+
+def history_lines(history: Any) -> tuple[list[str], str]:
+    """history → (提示词里的行, 上一轮的提示)：上一轮 AI 没生效（ops 0 / effect 说没有看得见的变化）→ 换改法；生效了 → 同方向加大"""
+    hs = [h for h in history or [] if isinstance(h, dict) and str(h.get("text") or "").strip()][-2 * HISTORY_ROUNDS:]
+    lines = []
+    for h in hs:
+        if h.get("role") in ("ai", "assistant"):
+            extra = [f"ops {h['ops']}" if isinstance(h.get("ops"), int) else "", f"效果：{_turn_text(h.get('effect'), 100)}" if h.get("effect") else ""]
+            extra = [x for x in extra if x]
+            ids = [str(x) for x in h.get("ids") or [] if isinstance(x, str)][:12]
+            extra = extra[:1] + ([f"动了 {', '.join(ids)}"] if ids else []) + extra[1:]
+            lines.append(f"AI：{_turn_text(h.get('text'))}" + (f"（{'；'.join(extra)}）" if extra else ""))
+        else:
+            rids = [str(x) for x in h.get("refs") or [] if isinstance(x, str)][:8]
+            lines.append(f"人：{_turn_text(h.get('text'))}" + (f"（指：{', '.join(rids)}）" if rids else ""))
+    last = next((h for h in reversed(hs) if h.get("role") in ("ai", "assistant")), None)
+    if not last:
+        return lines, ""
+    eff = str(last.get("effect") or "")
+    if last.get("ops") == 0 or re.search("没有看得见|没生效|没有变化|没变化", eff):
+        return lines, "上一轮 AI 的改动没生效（ops 为 0 或效果说没有看得见的变化）：人说「还是没改 / 再来」时换一种改法（换字段、换节点、直接加东西），别重复上一轮。"
+    return lines, ("上一轮的改动生效了：人说「还不够 / 再来 / 还是太…」时沿同一方向、对同一处加大力度（数量 / 尺寸 / 高度 ×1.5 以上，或加东西）；"
+                   "只动上一轮动过的那些 id（AI 那行的「动了 …」）、人指的那块和锚在它上面的东西，场景里别的部分不要顺手改。")
+
+
+def _ref_line(r: dict) -> str:
+    return _one_line({k: r[k] for k in ("kind", "id", "instance", "label", "facts") if k in r})[:420]
+
+
+def revise_user_text(plan: dict, action: dict, locked_ids: list | None, refs: Any = None, history: Any = None) -> str:
+    view = plan
+    if plan.get("marks"):
+        view = {**plan, "marks": [_mark_brief(m) for m in plan["marks"] if isinstance(m, dict)]}
+    parts = ["当前场景程序：\n" + _one_line(view)]
+    if plan.get("marks"):
+        parts.append("marks 是人在图上画的标记（坐标是人给的，你看不到也不要写）：area（圈的一块）→ at:\"mark_1\" 放在它中心、area:\"mark_1\" 在它范围里散布 / 生成；"
+                     "trace（画的一笔）→ along:\"mark_2\" 沿线重复 / 连接；pin（点的位置）→ at:\"mark_3\"。地形操作的 at 也可以写标记 id。标记只能引用，不能 set / remove / add。"
+                     "锚到 area 标记上的东西要放得下：水平尺寸（环 / 放射重复按直径 = 2×半径 + 子件、直线重复按 个数×间距）不超过这个标记的 size_m（marks 里和引用的 facts 里都有）；加密度（加个数）时间距跟着缩，个数×间距 仍不超过那一边。"
+                     "复述里说位置时照 facts.from_landmark（相对主地标的方位、距离）说，不要猜方位。")
+    rl = [r for r in refs or [] if isinstance(r, dict) and r.get("id")][:12]
+    fresh, carried = [r for r in rl if not r.get("carried")], [r for r in rl if r.get("carried")]
+    if fresh:
+        parts.append("人加到对话里的东西（「这 / 这里 / 这块 / 这个 / 它」优先指这些；facts 是引擎算的事实）：\n" + "\n".join(_ref_line(r) for r in fresh))
+    if carried:
+        parts.append("这句没有新加引用，是接着上一轮说的；上一轮人指的是下面这些（facts 按现在的程序重新算过）——「还是 / 再 / 更 / 这里…」说的还是它们，"
+                     "改动落在它们、锚在它们上面的东西和上一轮动过的东西上；句子里点名了别的才去改别的：\n" + "\n".join(_ref_line(r) for r in carried))
+    hl, tip = history_lines(history)
+    if hl:
+        parts.append("最近的对话（旧 → 新；效果 = 引擎算的改动摘要）：\n" + "\n".join(hl) + ("\n" + tip if tip else ""))
+    parts.append("人的动作（程序已转成结构化事实，不是像素）：\n" + json.dumps(action, ensure_ascii=False))
+    parts += [
              "只输出对当前程序的改动：{\"understood\": true, \"restatement\": \"≤60 字复述\", \"ops\": [...], \"ask_to_point\": false}，需要追问时加 \"question\"。\n"
              "ops：\n"
              "- {\"op\":\"set\",\"id\":\"towers\",\"field\":\"count\",\"value\":8}：id 是节点 / 地形操作的 id（树里任何深度），或 site / spawn / lighting / plan（根上的 name / concept / mood / palette）；"
@@ -324,7 +425,8 @@ def revise_user_text(plan: dict, action: dict, locked_ids: list | None) -> str:
              "- {\"op\":\"add\",\"to\":\"root\" | \"terrain\" | \"relations\" | 某个 group 的 id,\"value\":{完整的节点 / 地形操作 / 关系}}\n"
              "- {\"op\":\"remove\",\"id\":\"x\"}（towers[2] 只删一个实例；关系用 rel:<序号>）\n"
              "只放真要改的，不要把整段程序抄回来。改空间布局就 set 它的 layout（迷宫 = maze），复述里写「改成迷宫平面」这样的话。"
-             "翻不成结构改动时（模糊的形容词）：understood=false、ask_to_point=true、ops=[]，在 restatement 里问清是位置、大小还是长相。"]
+             "翻不成结构改动时（模糊的形容词）：understood=false、ask_to_point=true、ops=[]，在 restatement 里问清是位置、大小还是长相"
+             + ("（人已经加了引用 / 接着上一轮的引用：先按引用去改，别再请人指）。" if rl else "。"), MEMORY_LINE]
     if locked_ids:
         parts.append("锁住、不能改的 id：" + ", ".join(locked_ids))
     return "\n\n".join(parts)
@@ -376,7 +478,8 @@ def revise_schema() -> dict:
         "restatement": {**(rv.get("restatement") or {"type": "string"}), "description": "一句话复述改了什么"},
         "ops": {"$ref": f"#/{k}/ops"} if "ops" in defs else {"type": "array", "items": {"type": "object"}},
         "question": rv.get("question") or {"type": ["string", "null"]},
-        "ask_to_point": {"type": "boolean", "description": "翻不了时为 true：请人在图上指"}},
+        "ask_to_point": {"type": "boolean", "description": "翻不了时为 true：请人在图上指"},
+        "memory_suggestions": MEMORY_SUGGEST},
         "required": ["understood", "restatement", "ops", "ask_to_point"], "additionalProperties": False, k: defs}
 
 
@@ -480,6 +583,22 @@ def fix_double_elev(p: dict, fixes: list) -> None:
                 fixes.append(f"{path}.elev_m: {e:g} = {at[:-4]} 的高度，已经在顶面上了 → 去掉")
 
 
+def clean_suggestions(data: dict) -> list[str]:
+    """memory_suggestions 写歪了不值得回喂：只留 {text 2–40 字, kind ∈ 四类} 的前 2 条，别的丢掉（kind 不认识按 rule）"""
+    v = data.get("memory_suggestions")
+    if v is None:
+        return []
+    good = []
+    for x in v if isinstance(v, list) else []:
+        t = str((x or {}).get("text") or "").strip()[:40] if isinstance(x, dict) else ""
+        if len(t) >= 2:
+            good.append({"text": t, "kind": x.get("kind") if x.get("kind") in MEMORY_KINDS else "rule"})
+    data.pop("memory_suggestions")
+    if good:
+        data["memory_suggestions"] = good[:2]
+    return [] if good == v else ["memory_suggestions：本地整理"]
+
+
 def postprocess_concepts(data: Any) -> tuple[dict, list[str], list[str]]:
     if isinstance(data, list):
         data = {"concepts": data}
@@ -490,7 +609,7 @@ def postprocess_concepts(data: Any) -> tuple[dict, list[str], list[str]]:
             if isinstance(data.get(alt), list):
                 data = {"concepts": data.pop(alt)}
                 break
-    fixes = strip_extra(CONCEPT_SCHEMA, data)
+    fixes = clean_suggestions(data) + strip_extra(CONCEPT_SCHEMA, data)
     for c in data.get("concepts") or []:
         if isinstance(c, dict) and isinstance(c.get("key_structures"), str):
             c["key_structures"] = [x for x in re.split(r"[、，,；;]", c["key_structures"]) if x][:5]
@@ -555,6 +674,8 @@ def postprocess_plan(data: Any) -> tuple[dict, list[str], list[str]]:
         return {"plan": {}}, [], ["应为 {\"plan\": {name, site, terrain?, nodes, …}}"]
     sch = plan_schema()
     fixes: list[str] = []
+    if p.pop("marks", None) is not None:
+        fixes.append("plan.marks: 标记是人画的，AI 不写，去掉")
     fix_misnested_root(p, fixes)
     fixes += [f"plan{x[1:]}" for x in strip_extra(sch, p)]
     fix_rooms(p, fixes)
@@ -676,7 +797,7 @@ def postprocess_revise(data: Any, plan: dict, locked_ids: set) -> tuple[dict, li
         data["ops"] = []
         fixes.append("$.ops: 缺 → []")
     sch = revise_schema()
-    fixes += strip_extra(sch, data, "$", sch)
+    fixes += clean_suggestions(data) + strip_extra(sch, data, "$", sch)
     errors = [e for e in validate(sch, data, "$", sch) if not e.startswith("$.ops")]  # ops 的细节交给 check_ops（按节点 schema 查，错误更具体）
     good, op_errs, op_fixes = check_ops(plan, data.get("ops") or [], locked_ids)
     data["ops"] = good if not op_errs else data.get("ops") or []
@@ -691,23 +812,115 @@ class MockAI:
     name = "mock"
     model = "mock"
 
-    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0) -> dict:
+    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0, mem: dict | None = None) -> dict:
         rs = recipes_for(intent, variant)
-        return {"concepts": [{**concept_of(r), "_recipe": auto_recipe(r) if r.get("auto") else r} for r in rs], "_usage": _usage_zero()}
+        out = {"concepts": [{**concept_of(r), "_recipe": auto_recipe(r) if r.get("auto") else r} for r in rs], "_usage": _usage_zero()}
+        if mock_suggestions(intent):
+            out["memory_suggestions"] = mock_suggestions(intent)
+        return out
 
-    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None) -> dict:
+    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None, mem: dict | None = None) -> dict:
         c = concepts[k]
         r = c.get("_recipe") or recipe_from_concept(c)
-        p = compose(r, None, (cons or {}).get("time_of_day"))
+        likes = " ".join(str(m.get("text")) for m in (mem or {}).get("items") or [] if m.get("kind") != "dislike")
+        dislikes = " ".join(str(m.get("text")) for m in (mem or {}).get("items") or [] if m.get("kind") == "dislike" or re.match("不要|别|不许", str(m.get("text"))))
+        p = compose(r, None, (cons or {}).get("time_of_day") or extract(likes).get("time_of_day"))  # 偏好：人这句没说时段才用
+        if re.search("房子|小屋|民居|村落", dislikes):  # 偏好：不要撒小房子（模拟 AI 只认这一条；真模型读系统提示里的偏好）
+            p["nodes"] = [n for n in p.get("nodes") or [] if not (isinstance(n, dict) and n.get("type") == "scatter_houses" and n.get("role") != "landmark")]
         p["name"] = str(c.get("name") or p["name"])[:16]
         p["concept"] = str(c.get("concept") or p.get("concept") or "")[:120]
         p["key_structures"] = [str(x)[:24] for x in (c.get("key_structures") or [])][:6]
         return {"plan": p, "_usage": _usage_zero()}
 
-    def revise(self, plan: dict, action: dict, locked_ids: set) -> dict:
-        ops, say = mock_revise_ops(plan, str(action.get("text") or action.get("value") or ""))
+    def revise(self, plan: dict, action: dict, locked_ids: set, ctx: dict | None = None) -> dict:
+        t = str(action.get("text") or action.get("value") or "")
+        ops, say = mock_context_ops(plan, t, (ctx or {}).get("refs"), (ctx or {}).get("history"))
+        if not ops:
+            ops, say = mock_revise_ops(plan, t)
         good, _, _ = check_ops(plan, ops, locked_ids)
-        return {"understood": True, "restatement": "；".join(say), "ops": good, "ask_to_point": False, "provider": "mock", "_usage": _usage_zero()}
+        out = {"understood": True, "restatement": "；".join(say), "ops": good, "ask_to_point": False, "provider": "mock", "_usage": _usage_zero()}
+        if mock_suggestions(t):
+            out["memory_suggestions"] = mock_suggestions(t)
+        return out
+
+
+_PREF_RE = re.compile(r"(?:我|俺)(?:很|最|特别|一直|一向|总是|比较)?(不喜欢|讨厌|受不了|喜欢|偏爱|爱看)([^，。,；;！!？?\s]{1,20})")
+
+
+def mock_suggestions(t: str) -> list:
+    """模拟 AI 的记忆建议：「我喜欢夜景」「我讨厌对称」这种长期偏好的说法 → [{text, kind}]（≤ 2 条）"""
+    out = [{"text": (v + o)[:30], "kind": "dislike" if v in ("不喜欢", "讨厌", "受不了") else "like"} for v, o in _PREF_RE.findall(t or "")
+           if not re.search("这|那|它", o)]  # 「我不喜欢这个塔」是这一次的改动
+    return out[:2]
+
+
+_HERE_WORDS = ("这里", "这块", "这儿", "这片", "此处", "那里", "那块", "它", "这个", "这")
+_MAKE_RE = re.compile(r"(?:做成|改成|变成|弄成|建成|搞成|放|加|建|盖|摆|弄)(?:一个|一片|一座|一些|一圈|一排|个|片|座|些)?([一-鿿]{2,6})")
+_MORE_RE = re.compile(r"还是太?(空|稀|少|小|矮|平)|还是没(改|变)|还不够|再来|再多|再密|太空了|太稀|没改|没变化")
+
+
+def mock_context_ops(plan: dict, t: str, refs: Any, history: Any) -> tuple[list, list[str]]:
+    """模拟 AI 用引用与历史：「这里做成夜市」→ 在引用的标记 / 节点上加一组（area / along / at 锚到它）；
+    「还是太空了」→ 看历史上一轮改的那一处（引用的、或上一轮 AI 那句话里点名的），数量 ×1.5（没生效就连尺寸一起放大）、再加一圈灯柱"""
+    idx = index(plan)
+    refs = [r for r in refs or [] if isinstance(r, dict) and anchor_base(r.get("id")) in idx]
+    if _MORE_RE.search(t) and history:
+        return _mock_more(plan, t, refs, history)
+    m = _MAKE_RE.search(t)
+    if not (m and refs and (any(w in t for w in _HERE_WORDS) or not _named(plan, t))):
+        return [], []
+    what = re.sub("[了吧吗呢啊的]+$", "", m.group(1))[:8] or "一组"
+    r = refs[0]
+    g, el = idx[anchor_base(r["id"])]
+    rid = r["id"] + (f"[{r['instance']}]" if isinstance(r.get("instance"), int) else "")
+    base = next((v for k, v in (("市", "market"), ("摊", "market"), ("林", "grove"), ("树", "grove"), ("园", "garden"), ("塔", "towers"), ("房", "houses")) if k in what), "spot")
+    child = ({"type": "tree", "label": "树", "size_m": [8, 12]} if base == "grove" else
+             {"type": "box", "label": f"{what}摊位", "size_m": [4, 3, 4]} if base == "market" else {"type": "building", "label": what, "size_m": [10, 7, 10]})
+    node = {"id": new_id(plan, base), "type": "repeat", "label": what, "child": child}
+    if g == "mark" and el.get("type") == "area":
+        node.update(pattern="scatter", area=rid, count=12)
+    elif g == "mark" and el.get("type") == "trace":
+        node.update(pattern="along", along=rid, count=8, spacing_m=10)
+    else:
+        node.update(pattern="grid", at=rid, rows=3, cols=4, spacing_m=8)
+    return [{"op": "add", "to": "root", "value": node}], [f"在{r.get('label') or el.get('label') or rid}里放了{what}"]
+
+
+def _mock_more(plan: dict, t: str, refs: list, history: list) -> tuple[list, list[str]]:
+    last = next((h for h in reversed(history) if isinstance(h, dict) and h.get("role") in ("ai", "assistant")), None)
+    if not last:
+        return [], []
+    dead = last.get("ops") == 0 or "没有看得见" in str(last.get("effect") or "")
+    said = str(last.get("text") or "") + str(last.get("effect") or "")
+    ref_ids = {anchor_base(r["id"]) for r in refs}
+    cands = [n for n in all_nodes(plan) if n.get("id") in ref_ids]
+    cands += [n for n in all_nodes(plan) if isinstance(n.get("label"), str) and len(n["label"]) >= 2 and n["label"] in said]
+    cands += [n for n in plan.get("nodes") or [] if isinstance(n, dict) and any(anchor_base(n.get(k)) in ref_ids for k in ("at", "area", "along"))]
+    cands += [n for n in reversed(plan.get("nodes") or []) if isinstance(n, dict)][:1]
+    rep = next((x for n in cands for x in [n] + [c for c in n.get("children") or [] if isinstance(c, dict)]
+                if x.get("type") == "repeat" and x.get("id") and isinstance(x.get("count") or x.get("rows"), int)), None)
+    if rep is None:
+        return [], []
+    lab = rep.get("label") or (rep.get("child") or {}).get("label") or rep["id"]
+    ops, say = [], []
+    if isinstance(rep.get("count"), int):
+        n = min(60, -(-rep["count"] * 3 // 2))
+        ops.append({"op": "set", "id": rep["id"], "field": "count", "value": n})
+        say.append(f"{lab}从 {rep['count']} 个加到 {n} 个")
+    else:
+        ops.append({"op": "set", "id": rep["id"], "field": "rows", "value": rep["rows"] + 2})
+        say.append(f"{lab}多两排")
+    sz = (rep.get("child") or {}).get("size_m")
+    if dead and isinstance(sz, list):
+        ops.append({"op": "set", "id": rep["id"], "field": "child.size_m", "value": [round(v * 1.4, 1) for v in sz]})
+        say.append("上一轮没看出变化，这次连尺寸一起放大")
+    if re.search("空|稀|少|不够", t):
+        anchor = {k: rep[k] for k in ("area", "along", "at") if rep.get(k)} or {"at": rep["id"]}
+        lamp = {"id": new_id(plan, "lamps"), "type": "repeat", "label": "灯柱", "pattern": "scatter" if "area" in anchor else "along" if "along" in anchor else "radial",
+                "count": 8, **anchor, **({"radius_m": 14} if not ({"area", "along"} & set(anchor)) else {}), "child": {"type": "box", "label": "灯柱", "size_m": [0.5, 5, 0.5]}}
+        ops.append({"op": "add", "to": "root", "value": lamp})
+        say.append("加了一圈灯柱")
+    return ops, say
 
 
 def _named(plan: dict, t: str) -> dict | None:
@@ -820,39 +1033,47 @@ def mock_revise_ops(plan: dict, t: str) -> tuple[list, list[str]]:
 
 
 # ---------- 两家服务商：底层在 providers.py，这里加「问什么」
-class DeepSeekAI(DeepSeekClient):
-    """DeepSeek：构思 / 展开 / 改动（系统提示 + 用户文本 + 本地后处理）"""
+def _sys(base: str, mem: dict | None) -> Any:
+    """系统提示 + 用户偏好：(稳定前缀, 偏好)；没有偏好就是前缀本身（providers.structured 两种都收）"""
+    return (base, mem["text"]) if mem and mem.get("text") else base
 
-    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0) -> dict:
+
+class DeepSeekAI(DeepSeekClient):
+    """DeepSeek：构思 / 展开 / 改动（系统提示 + 用户偏好 + 用户文本 + 本地后处理）"""
+
+    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0, mem: dict | None = None) -> dict:
         lenses = draw_lenses()
-        d = self.structured(concept_system_prompt(), concept_user_text(intent, cons, locked, variant, lenses), postprocess_concepts, self.MAX_TOKENS["concepts"])
+        d = self.structured(_sys(concept_system_prompt(), mem), concept_user_text(intent, cons, locked, variant, lenses), postprocess_concepts, self.MAX_TOKENS["concepts"])
         d["_lenses"] = lenses
         return d
 
-    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None) -> dict:
-        return self.structured(program_system_prompt(), expand_user_text(intent, cons, concepts, k, locked), postprocess_plan, self.MAX_TOKENS["expand"], salvage=salvage_plan)
+    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None, mem: dict | None = None) -> dict:
+        return self.structured(_sys(program_system_prompt(), mem), expand_user_text(intent, cons, concepts, k, locked), postprocess_plan, self.MAX_TOKENS["expand"], salvage=salvage_plan)
 
-    def revise(self, plan: dict, action: dict, locked_ids: set) -> dict:
-        data = self.structured(program_system_prompt(), revise_user_text(plan, action, sorted(locked_ids)), lambda d: postprocess_revise(d, plan, locked_ids), self.MAX_TOKENS["revise"])
+    def revise(self, plan: dict, action: dict, locked_ids: set, ctx: dict | None = None) -> dict:
+        ctx = ctx or {}
+        data = self.structured(_sys(program_system_prompt(), ctx.get("mem")), revise_user_text(plan, action, sorted(locked_ids), ctx.get("refs"), ctx.get("history")),
+                               lambda d: postprocess_revise(d, plan, locked_ids), self.MAX_TOKENS["revise"])
         data["provider"] = self.name
         return data
 
 
 class ClaudeAI(ClaudeClient):
-    """Claude：构思 / 展开 / 改动（结构化输出的 schema 由本文件生成）"""
+    """Claude：构思 / 展开 / 改动（结构化输出的 schema 由本文件生成；偏好放在缓存断点之后的第二个系统块）"""
 
-    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0) -> dict:
+    def concepts(self, intent: str, cons: dict, locked: dict | None, variant: int = 0, mem: dict | None = None) -> dict:
         lenses = draw_lenses()
-        d = self.structured(concept_system_prompt(), concept_user_text(intent, cons, locked, variant, lenses), claude_schema(CONCEPT_SCHEMA), postprocess_concepts, "low")
+        d = self.structured(_sys(concept_system_prompt(), mem), concept_user_text(intent, cons, locked, variant, lenses), claude_schema(CONCEPT_SCHEMA), postprocess_concepts, "low")
         d["_lenses"] = lenses
         return d
 
-    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None) -> dict:
-        return self.structured(program_system_prompt(), expand_user_text(intent, cons, concepts, k, locked), claude_schema(plan_out_schema()), postprocess_plan, "low")
+    def expand(self, intent: str, cons: dict, concepts: list, k: int, locked: dict | None, mem: dict | None = None) -> dict:
+        return self.structured(_sys(program_system_prompt(), mem), expand_user_text(intent, cons, concepts, k, locked), claude_schema(plan_out_schema()), postprocess_plan, "low")
 
-    def revise(self, plan: dict, action: dict, locked_ids: set) -> dict:
-        d = self.structured(program_system_prompt(), revise_user_text(plan, action, sorted(locked_ids)), claude_schema(revise_schema(), True),
-                            lambda x: postprocess_revise(x, plan, locked_ids), "medium")
+    def revise(self, plan: dict, action: dict, locked_ids: set, ctx: dict | None = None) -> dict:
+        ctx = ctx or {}
+        d = self.structured(_sys(program_system_prompt(), ctx.get("mem")), revise_user_text(plan, action, sorted(locked_ids), ctx.get("refs"), ctx.get("history")),
+                            claude_schema(revise_schema(), True), lambda x: postprocess_revise(x, plan, locked_ids), "medium")
         d["provider"] = self.name
         return d
 
@@ -883,26 +1104,28 @@ def get_ai(cfg: dict | None = None, force_mock: bool = False, max_calls: int | N
         raise RuntimeError("anthropic SDK 未安装：在仓库根目录执行 .venv\\Scripts\\pip install anthropic，或在 AI 设置里换 DeepSeek / 勾「模拟」") from e
 
 
-# ============================================================ 8. 两步编排与入口（app.py 的路由）
+# ============================================================ 8. 两步编排（入口 draft / revise 在 app.py：收尾、本地锁定、记忆）
 def _err_text(e: Exception) -> str:
     if isinstance(e, AIError):
         return f"{e.kind}: {e}"
     return f"{type(e).__name__}: {getattr(e, 'message', None) or e}"
 
 
-def generate(ai_obj: Any, intent: str, cons: dict, locked: dict | None = None, variant: int = 0) -> dict:
+def generate(ai_obj: Any, intent: str, cons: dict, locked: dict | None = None, variant: int = 0, mem: dict | None = None) -> dict:
     """两步：构思 1 次 → 展开 3 次（线程池并行）。某张展开失败 → 同一概念重试一次 → 再失败用模拟 AI 补那一张（sources / fills 标注）。
-    构思调用不合格（AIError）→ 用模拟 AI 的概念继续（_concepts_fallback 标注）；服务商 HTTP 错误照常抛出。"""
+    构思调用不合格（AIError）→ 用模拟 AI 的概念继续（_concepts_fallback 标注）；服务商 HTTP 错误照常抛出。
+    mem：memory_context() 的结果，接在每次调用的系统提示后面；构思回包里的 memory_suggestions 原样带出。"""
     t0 = time.time()
     steps: list = []
+    mk = {"mem": mem} if mem and mem.get("text") else {}
     try:
-        c = ai_obj.concepts(intent, cons, locked, variant)
+        c = ai_obj.concepts(intent, cons, locked, variant, **mk)
         concepts = c["concepts"]
         cu = c.get("_usage")
         cfix = c.get("_fixes") or []
         concept_src = getattr(ai_obj, "name", "mock")
     except AIError as e:
-        c = MockAI().concepts(intent, cons, locked, variant)
+        c = MockAI().concepts(intent, cons, locked, variant, **mk)
         concepts, cu, cfix, concept_src = c["concepts"], e.detail.get("usage"), [f"构思调用不能用（{_err_text(e)}），概念改用模拟 AI 的"], "mock"
     steps.append({"step": "concepts", "ms": int((time.time() - t0) * 1000), "provider": concept_src, "usage": cu, **({"lenses": c["_lenses"]} if c.get("_lenses") else {})})
 
@@ -913,7 +1136,7 @@ def generate(ai_obj: Any, intent: str, cons: dict, locked: dict | None = None, v
         used, errs, first, sample = None, [], [], ""
         for attempt in range(2):
             try:
-                r = ai_obj.expand(intent, cons, concepts, k, locked)
+                r = ai_obj.expand(intent, cons, concepts, k, locked, **mk)
                 first += list(r.get("_retry_errors") or [])  # 回喂前那一轮的 schema 错（看模型反复错在哪个字段）
                 return {"k": k, "plan": r["plan"], "usage": _sum_usage(used, r.get("_usage")), "fixes": r.get("_fixes") or [], "feedback": bool(r.get("_retried")),
                         "attempts": attempt + 1, "errors": errs, "first_errors": first[:12], "source": getattr(ai_obj, "name", "mock"),
@@ -928,7 +1151,7 @@ def generate(ai_obj: Any, intent: str, cons: dict, locked: dict | None = None, v
                     break
             except api_error_types() as e:
                 errs.append(_err_text(e))
-        r = MockAI().expand(intent, cons, concepts, k, locked)
+        r = MockAI().expand(intent, cons, concepts, k, locked, **mk)
         return {"k": k, "plan": r["plan"], "usage": used, "fixes": [], "feedback": False, "attempts": len(errs), "errors": errs, "first_errors": first[:12], "source": "mock",
                 "ms": int((time.time() - s0) * 1000), **({"first_sample": sample} if sample else {})}
     t1 = time.time()
@@ -953,185 +1176,9 @@ def generate(ai_obj: Any, intent: str, cons: dict, locked: dict | None = None, v
            "sources": [o["source"] for o in outs],
            "fills": [{"plan": o["k"], "reason": o["errors"][-1] if o["errors"] else "调用上限"}
                      for o in outs if o["source"] == "mock" and getattr(ai_obj, "name", "mock") != "mock"],
-           "provider": getattr(ai_obj, "name", "mock"), "_usage": total, "_steps": steps}
+           "provider": getattr(ai_obj, "name", "mock"), "_usage": total, "_steps": steps, "memory_suggestions": list(c.get("memory_suggestions") or [])}
     if concept_src != getattr(ai_obj, "name", "mock"):
         res["_concepts_fallback"] = True
     if fixes:
         res["_fixes"] = fixes
     return res
-
-
-def _finish(res: dict, ai_obj: Any, t0: float) -> dict:
-    ms = int((time.time() - t0) * 1000)
-    res.setdefault("provider", getattr(ai_obj, "name", "mock"))
-    if not res.get("_usage"):
-        res["_usage"] = _usage_zero(getattr(ai_obj, "model", "mock"), ms)
-    res["_ms"] = ms
-    return res
-
-
-def _keep_locked(plan: dict, locked: dict | None) -> tuple[dict, list[str]]:
-    """「锁」住的项（locked.ids，取自 locked.plan）原样放回新 plan（换一批时不动）：同 id 的替换，没有的挂到根上（锚点沿用它的父组）"""
-    if not locked or not isinstance(locked.get("plan"), dict) or not locked.get("ids"):
-        return plan, []
-    src = index(locked["plan"])
-    parents = {id(n): par for n, _, par, _ in walk_nodes(locked["plan"].get("nodes") or [])}
-    p = copy.deepcopy(plan)
-    ch = []
-    for lid in locked["ids"]:
-        if lid not in src:
-            continue
-        g, el = src[lid]
-        if g in ONE_GROUPS:
-            if p.get(g) != el:
-                p[g] = copy.deepcopy(el)
-                ch.append(f"锁·{g}")
-            continue
-        if g not in ("node", "terrain"):
-            continue
-        cur = index(p).get(lid)
-        if cur and cur[0] == g:
-            if cur[1] != el:
-                cur[1].clear()
-                cur[1].update(copy.deepcopy(el))
-                ch.append(f"锁·{el.get('label') or lid}")
-            continue
-        new = copy.deepcopy(el)
-        if g == "terrain":
-            p.setdefault("terrain", []).insert(0, new)
-        else:
-            par = parents.get(id(el))
-            if not any(new.get(k) for k in ("at", "under", "over", "from", "area", "around", "along")):  # 原来在组里：挂到根上要有锚点
-                at = (par or {}).get("at")
-                new["at"] = at if at and anchor_base(at) in set(index(p)) | {"site"} else "site.center"
-            p.setdefault("nodes", []).append(new)
-        ch.append(f"锁·{el.get('label') or lid}")
-    keep = [i for i in locked["ids"] if i in index(p)]
-    if keep:
-        p["locks"] = keep
-    return p, ch
-
-
-def draft(payload: dict, ai_obj: Any = None) -> dict:
-    """POST /api/ai/draft：{intent, locked?: {plan, ids}, variant?, force_mock?, max_calls?（1–8，本次最多几次 HTTP，默认 8）} →
-    {plans: [3], concepts: [3], constraints, constraints_fixed, diversity, warnings, sources, fills, provider, _usage（合计 + parts）, _steps, _ms, _fixes?}"""
-    intent = str(payload.get("intent") or "").strip()
-    if not intent:
-        raise ValueError("intent 不能为空")
-    t0 = time.time()
-    ai_obj = ai_obj or get_ai(force_mock=bool(payload.get("force_mock")), max_calls=_max_calls(payload.get("max_calls")))
-    cons = extract(intent)
-    locked = payload.get("locked") if isinstance(payload.get("locked"), dict) else None
-    if locked and isinstance(locked.get("plan"), dict):  # 锁住的 id：显式给的 + plan.locks
-        locked = {**locked, "ids": sorted(set(locked.get("ids") or []) | set(locked["plan"].get("locks") or []))}
-    variant = int(payload.get("variant") or payload.get("seed") or 0)
-    res = finish_draft(generate(ai_obj, intent, cons, locked, variant), cons, locked)
-    return _finish(res, ai_obj, t0)
-
-
-def finish_draft(res: dict, cons: dict, locked: dict | None = None) -> dict:
-    """模型（或模拟）给的三张 → 补概念字段、放回锁住的项、本地锁定、检查引用 / schema / 形体数、算三张差异"""
-    keep = set((locked or {}).get("ids") or [])
-    fixed, warns = [], []
-    plans = res.get("plans") or []
-    for i, p in enumerate(plans):
-        c = res["concepts"][i] if i < len(res.get("concepts") or []) else {}
-        if not p.get("concept") and c.get("concept"):
-            p["concept"] = str(c["concept"])[:120]
-        if not p.get("key_structures") and c.get("key_structures"):
-            p["key_structures"] = [str(x)[:24] for x in c["key_structures"]][:6]
-        p, ch1 = _keep_locked(p, locked)
-        p, ch2 = enforce(p, cons, keep)
-        plans[i] = p
-        if ch1 or ch2:
-            fixed.append({"plan": i, "fields": ch1 + ch2})
-        warns += [f"plan {i + 1}：引用不存在 {w}" for w in ref_warnings(p)]
-        bad = validate(plan_schema(), p)
-        if bad:  # 锁定补出来的东西也必须合 schema
-            warns += [f"plan {i + 1}：{e}" for e in bad[:5]]
-        n = shape_count(p)
-        if n > MAX_SHAPES:
-            warns.append(f"plan {i + 1}：展开后约 {n} 个形体 > {MAX_SHAPES}")
-    for f in res.get("fills") or []:
-        warns.append(f"plan {f['plan'] + 1}：模型这张没写成，用模拟 AI 按同一概念补位（{f['reason'][:80]}）")
-    res["plans"] = plans
-    res["constraints"] = summary(cons)
-    res["constraints_fixed"] = fixed
-    res["diversity"] = diversity(plans)
-    # 雷同：两张的骨架（地形操作序列 + 主体形体 + 重复签名，不比地面）一样 → 算同一个，org 差异记 0 并警告
-    keys = [structure_key(p) for p in plans]
-    clones = [[i, j] for i in range(len(plans)) for j in range(i + 1, len(plans)) if same_structure(keys[i], keys[j])]
-    if clones:
-        filled = {f["plan"] for f in res.get("fills") or []} | {i for i, s in enumerate(res.get("sources") or []) if s == "mock"}
-        res["diversity"]["clones"] = clones
-        res["diversity"]["org_min"] = 0
-        warns += [f"plan {a + 1} 与 plan {b + 1}：{'都是补位，' if a in filled and b in filled else ''}骨架一样（雷同），建议换一批" for a, b in clones]
-    res["warnings"] = warns
-    return res
-
-
-def structure_key(plan: dict) -> dict:
-    """一张的骨架：地形操作序列（op / 形状 / 边）、主体形体（类型 / 排法 / 屋顶 / 空心）、重复签名（排法 × 模板类型 × 个数档）。不含地面——换个底不算不同"""
-    nodes = all_nodes(plan)
-    m = next((n for n in nodes if n.get("role") == "landmark"), None) or next((n for n in plan.get("nodes") or [] if isinstance(n, dict) and n.get("type") not in ("link", "space")), {})
-    mc = (m.get("child") or {}) if m.get("type") == "repeat" else m
-    def rsig(n: dict) -> str:
-        c = n.get("count") or n.get("levels") or (n.get("rows") or 1) * (n.get("cols") or 1)
-        return f"{n.get('pattern')}:{(n.get('child') or {}).get('type')}:{'1' if c <= 2 else 'few' if c <= 6 else 'many'}"
-    return {"terrain": [f"{t.get('op')}:{t.get('shape')}:{t.get('edge')}" for t in plan.get("terrain") or [] if isinstance(t, dict)],
-            "main": f"{m.get('type')}:{m.get('pattern')}:{mc.get('type')}:{mc.get('roof') or mc.get('shape')}:{bool(mc.get('hollow'))}",
-            "repeats": sorted({rsig(n) for n in nodes if n.get("type") == "repeat"})}
-
-
-def same_structure(a: dict, b: dict) -> bool:
-    """地形操作序列一样 + 主体一样 + 重复签名重合一半以上 = 同一副骨架"""
-    ra, rb = set(a["repeats"]), set(b["repeats"])
-    return a["terrain"] == b["terrain"] and a["main"] == b["main"] and (not (ra | rb) or len(ra & rb) / len(ra | rb) >= 0.5)
-
-
-RESTATE_MAX = 60  # definitions.revise.restatement.maxLength
-
-
-def revise(payload: dict, ai_obj: Any = None) -> dict:
-    """POST /api/ai/revise：{plan, action: {type:'text', text} | 字符串, locked?: {ids} | [ids], force_mock?} →
-    {understood, restatement, ops, question?, ask_to_point, constraints, constraints_fixed, provider, _usage, _ms, _fixes?}"""
-    plan, action = payload.get("plan"), payload.get("action")
-    if not isinstance(plan, dict) or not action:
-        raise ValueError("需要 plan 与 action")
-    if isinstance(action, str):
-        action = {"type": "text", "text": action}
-    lk = payload.get("locked")
-    locked_ids = (set(lk.get("ids") or []) if isinstance(lk, dict) else set(lk or [])) | set(plan.get("locks") or [])
-    t0 = time.time()
-    ai_obj = ai_obj or get_ai(force_mock=bool(payload.get("force_mock")))
-    res = ai_obj.revise(plan, action, locked_ids)
-    text = str(action.get("text") or "")
-    ops = res.get("ops") or []
-    res["_model_ops"], res["_model_restatement"] = list(ops), res.get("restatement")
-    extra, notes, say = enforce_ops(plan, ops, text, locked_ids) if text else ([], [], [])
-    ops = ops + extra
-    asks = [s for s in say if s.endswith("？")]
-    say = [s for s in say if not s.endswith("？")]
-    if asks and not ops:  # 锁定找不到要改的东西：先问，不新增
-        res.update(understood=False, ask_to_point=False, question=asks[0], restatement="")
-    rs = (res.get("restatement") or "").strip().rstrip("。；")
-    key = lambda s: s.split("改成")[-1] if "改成" in s else s[2:] if s.startswith(("加了", "去掉")) else s  # noqa: E731  「矿洞改成迷宫平面」→「迷宫平面」
-    must = [s for s in say if key(s) not in rs]  # 复述要说到锁定补的事；模型已经说了就不重复
-    if must:
-        room = RESTATE_MAX - len("；".join(must)) - 2
-        rs = "；".join(must) + (("；" + rs[:room]) if rs and room > 4 else "")
-    if ops and not res.get("understood"):
-        res["understood"], res["ask_to_point"] = True, False
-    if ops and not rs:
-        rs = describe_ops(plan, ops)[:RESTATE_MAX - 1]
-    if not ops and res.get("provider") == "mock" and not rs and not res.get("question"):
-        res.update(understood=False, ask_to_point=True, question="是位置、大小，还是长相的事？在图上画一笔或圈一块最准。")
-        rs = "这句我没把握翻成结构改动"
-    res["ops"] = ops
-    rs = rs[:RESTATE_MAX - 1]
-    res["restatement"] = rs + ("。" if rs and not rs.endswith(("。", "？", "！")) else "")
-    res["constraints"] = summary(extract(text))
-    res["constraints_fixed"] = notes
-    return _finish(res, ai_obj, t0)
-
-

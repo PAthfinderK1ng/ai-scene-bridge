@@ -1,12 +1,13 @@
 // program.js — 场景程序解释器（docs/06 §4）：规范化后的 plan v2 → 高度场特征 + 体块 / 路 / 区域 / 标记 / 空间。
 // AI 只写局部尺寸与偏移、锚点；这里负责：场地基础形态 + 雕刻 → 高度场；节点树展开（group / repeat）；锚点解析（按依赖顺序、环检测）；
-// 局部 → 世界；落地（贴地取最高点并补基座 / 悬空 / 嵌入 / 立在别人顶上）；避让（后来者让，推 ≤ 半个尺寸）；连接路由；生成器。
+// 局部 → 世界；落地（贴地取最高点并补基座 / 悬空 / 嵌入 / 立在别人顶上）；避让（后来者让，推 ≤ 半个尺寸；撞的是子孙里的一件就按那一件的尺寸）；圈选里的重复排不下就收（fitInArea）；连接路由；生成器。
 // 确定性：随机只来自 seed（rng / valueNoise）。本文件不调 AI，也不做 schema 清洗（plan.js 的 normalizePlan 已做）。
+// 人画的标记（plan.marks，docs/07 §1.1）：和地形操作一样当锚点——at = area 中心 / pin 点 / trace 中点，area = 散布 / 生成器 / 地形操作的范围，along = 沿线重复 / 连接 / 开沟；写进 sid.meta.marks，不出体块。（台地生成器的特征在 terrain.js terraceFeatures）
 //
 // 对外：runProgram、walkNodes、size3、effShape、parseAnchor、NODE_CLASS / SHAPES / PARTS / GENERATORS / SITE_GROUNDS / DIRV / SUN、rotM / mulM / apM / invM（局部 → 世界的 2×2 矩阵）。（程序检查 programChecks / nodeLabel / findNodeIn 在 plan.js）
 
-import { rng, clamp, r2, pointInPolygon, distToPolygon, polygonCentroid, polygonArea, sculptHeight, buildTerrain, groundFeatures, meander } from "./terrain.js";
-import { boxCorners, facingToRotation, rotM, mulM, apM, invM, attachOffset, mirrorFix, support, ellipsePoly, rectPoly, hull, bboxOf, bbHit, polyLen, alongLine, deepPoint, mtv, ringOf, ringPolyMtv, footRects, onFoot, lineBank, alongDeg, isSupport, hangsAbove, standsUp, deckOf, fitSupport } from "./layout.js";
+import { rng, clamp, r2, pointInPolygon, distToPolygon, polygonCentroid, polygonArea, sculptHeight, buildTerrain, groundFeatures, meander, terraceFeatures } from "./terrain.js";
+import { boxCorners, facingToRotation, rotM, mulM, apM, invM, attachOffset, mirrorFix, support, ellipsePoly, rectPoly, hull, bboxOf, bbHit, polyLen, alongLine, deepPoint, mtv, ringOf, ringPolyMtv, footRects, onFoot, lineBank, alongDeg, isSupport, hangsAbove, standsUp, deckOf, fitSupport, fitInArea } from "./layout.js";
 import { obbOverlap } from "./validate.js";
 import { routeTrail, zigzagTrail } from "./routing.js";
 import { landVolume, waterRegions, footSamples } from "./sid.js";
@@ -101,7 +102,7 @@ export function runProgram(plan, opts = {}) {
   const inset = clamp(0.1 * Math.min(W, D), 8, 20);
   const sid = {
     sid_version: "0.1",
-    meta: { name: plan.name, units: "meters", up_axis: "+Y", handedness: "right", north: "-Z", player_height: 1.7, grid: 0.5, layer_height_m: layer, theme: "mountain_village", seed, plan_mode: true, plan_version: 2, ground: site.ground },
+    meta: { name: plan.name, units: "meters", up_axis: "+Y", handedness: "right", north: "-Z", player_height: 1.7, grid: 0.5, layer_height_m: layer, theme: "mountain_village", seed, plan_mode: true, plan_version: 2, ground: site.ground, ...(plan.marks && plan.marks.length ? { marks: clone(plan.marks) } : {}) }, // marks：人画的标记（参考用，不出体块）
     intent: { summary: plan.concept || "", mood: (plan.mood || []).slice() },
     style: { palette: [], references: [], lighting: {}, material_intents: {} },
     bounds: { min: [-hw, -40, -hd], max: [hw, 120, hd] },
@@ -132,7 +133,21 @@ export function runProgram(plan, opts = {}) {
   for (const w of waters) if (w.id === "sea") TR.set("sea", { id: "sea", kind: "terrain", op: "sea", center: polygonCentroid(w.polygon), poly: w.polygon, hole: w.hole, label: "海" });
   const sitePoint = (dir) => { const u = DIRV[dir] || [0, 0]; return [u[0] === 0 ? 0 : Math.sign(u[0]) * (hw - inset), u[1] === 0 ? 0 : Math.sign(u[1]) * (hd - inset)]; };
   const sitePoly = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
-  /** 地形阶段的锚点（只认 site.* 与前面的地形操作） */
+  // 人画的标记（docs/07 §1.1）：坐标是人给的（相对场地中心 = 世界坐标），当锚点 / 范围 / 线用；不出体块、不参与碰撞
+  for (const mk of plan.marks || []) {
+    const r = { id: mk.id, kind: "terrain", op: "mark", mark: mk.type, label: mk.label || mk.id, poly: null, line: null, half: 0, bank: 0 };
+    if (mk.type === "area") { r.poly = mk.polygon_m.map(P2); const c = polygonCentroid(r.poly); r.center = P2(pointInPolygon(c, r.poly) ? c : deepPoint(r.poly)); }
+    else if (mk.type === "trace") { r.line = mk.path_m.map(P2); r.center = P2(alongLine(r.line, 0.5).p); }
+    else { r.center = P2(mk.point_m); r.pin = true; }
+    TR.set(mk.id, r);
+  }
+  /** 节点（或最近一个写了 at / area 的祖先）锚在哪个圈选里：area 标记的记录，没有 = null（最近的锚点说了算） */
+  const areaMarkOf = (node, path) => {
+    const n = [node, ...(path || []).slice().reverse().map((id) => NI.get(id) && NI.get(id).node)].find((q) => q && (typeof q.area === "string" || typeof q.at === "string"));
+    const A = n && parseAnchor(typeof n.area === "string" ? n.area : n.at), r = A && TR.get(A.base);
+    return r && r.op === "mark" && r.mark === "area" && r.poly ? r : null;
+  };
+  /** 地形阶段的锚点（只认 site.*、前面的地形操作与标记） */
   const tAnchor = (s, who) => {
     const A = parseAnchor(s || "site.C");
     if (!A || A.base === "site") return { p: sitePoint(A && A.suffix && DIRV[A.suffix] ? A.suffix : "C") };
@@ -149,20 +164,25 @@ export function runProgram(plan, opts = {}) {
     return { p: r.center.slice() };
   };
   const linePts = (op, c, rot, who) => {
+    const LM = op.along && TR.get(op.along);
+    if (LM && LM.line) return LM.line.map(P2); // 沿人画的一笔
     if (Array.isArray(op.path_m) && op.path_m.length >= 2) return op.path_m.map((q) => { const v = apM(rotM(rot), q); return P2([c[0] + v[0], c[1] + v[1]]); });
     const a = op.from ? tAnchor(op.from, who).p : sitePoint("N"), b = op.to ? tAnchor(op.to, who).p : sitePoint("S");
     return [P2(a), P2(b)];
   };
   for (const op of plan.terrain || []) {
     const who = `「${op.label || op.id}」`;
-    const A = tAnchor(op.at, who), off = op.offset_m || [0, 0], c = [A.p[0] + off[0], A.p[1] + (off.length >= 3 ? off[2] : off[1])];
+    const AM = op.area && TR.get(op.area), byArea = !!(AM && AM.poly) && !["ramp", "carve", "river"].includes(op.op); // area: <圈选> = 形状就是那一块
+    const A = byArea ? { p: AM.center } : tAnchor(op.at, who), off = op.offset_m || [0, 0], c = [A.p[0] + off[0], A.p[1] + (off.length >= 3 ? off[2] : off[1])];
     const size = op.size_m || [40, 40], rot = op.rotate_deg ?? (A.tan && (op.shape === "rect" || op.shape === "ellipse" || op.op === "cliff" && !op.shape) ? alongDeg(A.tan, size) : 0); // 锚在沟 / 河 / 坡道上的方块、椭圆：缺省顺着线
     info.frames[op.id] = { base: P2(A.p), m: ID_M, origin: P2(c) };
     const LINE_OPS = ["ramp", "carve", "river"];
     let shape = op.shape || (LINE_OPS.includes(op.op) ? "line" : op.op === "lake" ? "ellipse" : op.op === "cliff" ? "rect" : (op.op === "dune" || op.op === "noise") && !op.size_m && !op.polygon_m ? "all" : "circle");
     if (LINE_OPS.includes(op.op)) shape = "line";
+    if (byArea) shape = "mark";
     let poly = null, hole = null, line = null, half = 0;
-    if (shape === "circle") poly = ellipsePoly(c, Math.min(size[0], size[1]) / 2, Math.min(size[0], size[1]) / 2);
+    if (shape === "mark") poly = AM.poly.map((q) => P2([q[0] + c[0] - AM.center[0], q[1] + c[1] - AM.center[1]]));
+    else if (shape === "circle") poly = ellipsePoly(c, Math.min(size[0], size[1]) / 2, Math.min(size[0], size[1]) / 2);
     else if (shape === "ellipse") poly = ellipsePoly(c, size[0] / 2, size[1] / 2, rot);
     else if (shape === "rect") poly = rectPoly(c, size[0], size[1], rot);
     else if (shape === "ring") { const rw = op.ring_m || Math.min(size[0], size[1]) * 0.2; poly = ellipsePoly(c, size[0] / 2, size[1] / 2, rot); hole = ellipsePoly(c, Math.max(1, size[0] / 2 - rw), Math.max(1, size[1] / 2 - rw), rot); }
@@ -186,12 +206,12 @@ export function runProgram(plan, opts = {}) {
         break;
       }
       case "lower": Object.assign(f, { blend: "min", target: r2(ref - Dp), skirt: op.edge_m || (f.edge === "terraced" ? (op.steps || 3) * 6 : Math.max(3, Dp * 1.5)), steps: op.steps || 3, register: "top", height: r2(ref - Dp) }); break; // 台阶边的坑：坑壁一级级往上（每级 6 m 宽）
-      case "flatten": Object.assign(f, { blend: "set", target: r2(ref + (op.height_m || 0)), skirt: op.edge_m || 4, register: "top", height: r2(ref + (op.height_m || 0)) }); break;
+      case "flatten": { const t = r2((op.target === "at_point" ? hAt(A.p[0], A.p[1]) : ref) + (op.height_m || 0) - (op.depth_m || 0)); Object.assign(f, { blend: "set", target: t, skirt: op.edge_m || 4, register: "top", height: t }); break; } // at_point：削到锚点（图钉）那一点原来的高度
       case "terrace": Object.assign(f, { blend: "quant", step: op.step_h_m || layer, base: 0, edge: "cliff", skirt: 0.5, register: "quant", reg_step: op.step_h_m || layer, reg_base: 0, height: r2(ref) }); break;
       case "ramp": { const a = line[0], b = line[line.length - 1]; Object.assign(f, { blend: "set", ramp: { a, b, ya: r2(hAt(a[0], a[1])), yb: r2(hAt(b[0], b[1])) }, skirt: op.edge_m || 3, line: [a, b], height: r2(Math.max(hAt(a[0], a[1]), hAt(b[0], b[1]))) }); break; }
       case "carve": { const n = op.steps || 3; Object.assign(f, { blend: "add", amount: -Dp, steps: n, skirt: op.edge_m || (f.edge === "cliff" ? 1 : f.edge === "terraced" ? n * clamp((2 * Dp) / n, 2, 6) : Math.max(2, Dp)), height: -Dp }); break; } // 台阶边的沟：每级宽 2 × 级高（2–6 m）
       case "river": {
-        if (!(Array.isArray(op.path_m) && op.path_m.length >= 2)) line = meander(line, hashStr(op.id));
+        if (!(Array.isArray(op.path_m) && op.path_m.length >= 2) && !(op.along && TR.has(op.along))) line = meander(line, hashStr(op.id)); // 人画的线不再加弯
         f.line = line; f.half = (op.width_m || 10) / 2;
         Object.assign(f, { blend: "add", amount: -Dp, skirt: op.edge_m || Math.max(3, Dp * 1.5), height: -Dp });
         break;
@@ -563,11 +583,22 @@ export function runProgram(plan, opts = {}) {
     const baseY = landY(land, p);
     const restOn = land.mode === "rest" && land.from !== "base" ? land.on : null;
     const sp = node.spacing_m, spv = Array.isArray(sp) ? sp : [sp, sp];
-    const tsz = size3(tpl), stepX = Number.isFinite(spv[0]) && spv[0] > 0 ? spv[0] : tsz[0] + 2, stepZ = Number.isFinite(spv[1]) && spv[1] > 0 ? spv[1] : tsz[2] + 2;
+    const tsz = size3(tpl);
+    let stepX = Number.isFinite(spv[0]) && spv[0] > 0 ? spv[0] : tsz[0] + 2, stepZ = Number.isFinite(spv[1]) && spv[1] > 0 ? spv[1] : tsz[2] + 2;
     const frs = []; // [{ o, m, y, restOn, sc }]
     const mk = (lp, faceRot = 0, extra = {}) => { const q = apM(M, lp); return Object.assign({ o: [p[0] + q[0], p[1] + q[1]], m: mulM(M, rotM(faceRot)), y: baseY, restOn, sc: frame.sc || 1, c: p, lift: baseY != null ? frame.lift || 0 : 0 }, extra); };
     const faceFor = (lp, mode) => { if (!mode || mode === "none" || (!lp[0] && !lp[1])) return 0; const f = mode === "out" ? unit(lp) : unit([-lp[0], -lp[1]]); return facingToRotation(f); };
-    const n = node.count || 1;
+    let n = node.count || 1;
+    // 锚在圈选（area 标记）里的直线 / 网格 / 放射重复：排出去了就缩间距（缩到挨着还放不下就少放几个）——圈的范围是人给的边界；记进 autofix
+    const AM = scope ? null : areaMarkOf(node, path);
+    if (AM && (pat === "linear" || pat === "grid" || pat === "radial")) {
+      const fit = fitInArea(AM.poly, p, M, pat, { n, R: node.rows || 2, C: node.cols || 2, stepX, stepZ, radius: node.radius_m || 20, tsz, axis: node.axis === "z" ? "z" : "x" });
+      if (fit) {
+        ({ stepX, stepZ } = fit); if (fit.n != null) n = fit.n;
+        node = Object.assign({}, node, fit.radius != null ? { radius_m: fit.radius } : {}, fit.R != null ? { rows: fit.R } : {}, fit.C != null ? { cols: fit.C } : {});
+        info.autofix.push({ id: recId, kind: "fit_area", how: fit.how, text: `「${node.label || (tpl && tpl.label) || node.id}」放进「${AM.label}」：${fit.how}` });
+      }
+    }
     if (pat === "linear") { const ax = node.axis === "z" ? [0, 1] : [1, 0], st = node.axis === "z" ? stepZ : stepX; for (let k = 0; k < n; k++) { const s = (k - (n - 1) / 2) * st; frs.push(mk([ax[0] * s, ax[1] * s], 0)); } }
     else if (pat === "grid") { const R = node.rows || 2, C = node.cols || 2; for (let i = 0; i < R; i++) for (let j = 0; j < C; j++) { const lp = [(j - (C - 1) / 2) * stepX, (i - (R - 1) / 2) * stepZ]; frs.push(mk(lp, faceFor(lp, node.face))); } }
     else if (pat === "radial") {
@@ -672,7 +703,7 @@ export function runProgram(plan, opts = {}) {
       if (!G.has(aid)) ensure(aid, true);
       const r = G.get(aid);
       if (r && r.kind === "terrain" && (r.op === "lake" || r.op === "sea")) wet = true; // 散在水里：只取水面下的点（湖中礁石不会爬上湖心岛）
-      if (r && (r.kind === "terrain")) { polys = r.terraces && r.op === "terraces" ? r.terraces.map((t) => t.polygon) : r.poly ? [r.poly] : r.line ? [corridor(r.line, 6)] : null; hole = r.hole || null; }
+      if (r && (r.kind === "terrain")) { polys = r.terraces && r.op === "terraces" ? r.terraces.map((t) => t.polygon) : r.poly ? [r.poly] : r.line ? lineBand(r.line, 6) : r.pin ? [rectPoly(r.center, node.size_m ? size3(node)[0] : 30, node.size_m ? size3(node)[2] : 30, 0)] : null; hole = r.hole || null; }
       else if (r && r.kind !== "site") { const e = extent(r); polys = e.poly ? [e.poly] : null; if (r.kind === "solid" && r.main) onVol = r.main; }
       if (!polys) W_(`「${node.label || node.id}」的范围「${aid}」没有面积，散在自己周围`);
     }
@@ -703,6 +734,7 @@ export function runProgram(plan, opts = {}) {
     }
   }
   const corridor = (line, w) => { const a = line[0], b = line[line.length - 1], u = unit([b[0] - a[0], b[1] - a[1]]), n = [-u[1] * w, u[0] * w]; return [add(a, n), add(b, n), add(b, n, -1), add(a, n, -1)]; };
+  const lineBand = (line, w) => line.slice(1).map((q, i) => corridor([line[i], q], w)).filter((r) => dist2(r[0], r[1]) > 0.1); // 折线两侧 w 米的带（一段一个四边形：人画的弯线也贴着走）
 
   // ---------------------------------------------------------- 避让（后来者让）
   const footBB = (v) => { const c = boxCorners(v.position, v.size, v.rotation_y || 0); return { c, bb: bboxOf(c) }; };
@@ -754,7 +786,8 @@ export function runProgram(plan, opts = {}) {
     // 最多推半个自己（沿推的方向量：34 × 150 的长雨棚往东西最多推 17 m，不是 75 m）
     // 重复（一圈柱子、一排摊位）：按单个实例的尺寸算，整组只许挪一个实例那么远
     const i0 = node.type === "repeat" && G.get(`${id}[0]`), ib = i0 && i0.vols && i0.vols.length ? bboxOf(i0.vols.flatMap((v) => boxCorners(v.position, v.size, v.rotation_y || 0))) : bb;
-    const bw = ib[2] - ib[0], bd = ib[3] - ib[1], maxPush = Math.max(2, Math.max(bw, bd) / 2), halfIn = (d) => Math.max(2, (Math.abs(d[0]) * bw + Math.abs(d[1]) * bd) / 2);
+    let bw = ib[2] - ib[0], bd = ib[3] - ib[1], maxPush = Math.max(2, Math.max(bw, bd) / 2);
+    const halfIn = (d) => Math.max(2, (Math.abs(d[0]) * bw + Math.abs(d[1]) * bd) / 2);
     // 悬空的形体：推完中心不能离开它锚着的那个东西的范围（雨棚得还在街上）——推不了就只报告
     const floatUnit = solids.every(isFloating), c0 = [(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2];
     const aRec = floatUnit && anchoredTo && anchoredTo.base !== "site" && anchoredTo.base !== "spawn" ? G.get(anchoredTo.id) : null;
@@ -807,6 +840,13 @@ export function runProgram(plan, opts = {}) {
     };
     const w0 = worstAt(null);
     if (w0) {
+      // 撞上的是自己子孙里的一小件（加多了的练功笼）：按那一件的尺寸推；撞上的是自己的环带（一圈环廊的带子压到别人的笼子）：按带宽推——
+      // 都不把整个大件（整圈环廊，同心的一层层）推走，推不开就报告
+      const pa = String(w0.a.plan_id || ""), sub = pa && pa !== id && !pa.startsWith(id + "[") ? mine.filter((v) => v.plan_id === pa || String(v.plan_id || "").startsWith(pa + "/")) : null;
+      const band = !sub && circOf(w0.a) && ringOf(w0.a);
+      if (sub && sub.length) { const sb = bboxOf(sub.flatMap((v) => boxCorners(v.position, v.size, v.rotation_y || 0))); bw = Math.min(bw, sb[2] - sb[0]); bd = Math.min(bd, sb[3] - sb[1]); }
+      else if (band) { bw = Math.min(bw, band.wall); bd = Math.min(bd, band.wall); }
+      maxPush = Math.max(2, Math.max(bw, bd) / 2);
       // 先沿最深那处的最小平移方向推；推完还压着别的，就在一圈圈的方向里找最近的空位（≤ 半个尺寸）
       let best = null;
       const k0 = w0.m.o + 0.6;
@@ -899,6 +939,7 @@ export function runProgram(plan, opts = {}) {
       const ts = r && r.kind === "terrain" ? (r.terraces || []) : [];
       if (ts.length) for (const t of ts) parts.push({ polygon: t.polygon, terrace_id: t.id, level: t.level });
       else if (r && r.kind === "terrain" && r.poly) parts.push({ polygon: r.poly });
+      else if (r && r.kind === "terrain" && (r.line || r.pin)) { const s = size3(node); if (r.line) for (const q of lineBand(r.line, Math.max(4, s[0] / 4))) parts.push({ polygon: q }); else parts.push({ polygon: rectPoly(r.center, s[0], s[2], 0) }); } // 沿手绘线一条带 / 图钉周围按自己的尺寸
       else if (r && r.kind !== "site") { const e = extent(r); if (e.poly) parts.push({ polygon: e.poly }); }
       if (!parts.length) W_(`「${who}」的范围「${aid}」没有面积，用自己的尺寸`);
     } else if (aid === "site") parts.push({ polygon: [[-hw + 6, -hd + 6], [hw - 6, -hd + 6], [hw - 6, hd - 6], [-hw + 6, hd - 6]] });
@@ -960,30 +1001,39 @@ export function runProgram(plan, opts = {}) {
   function placeLink(node, recId, inst) {
     const style = node.style || "path", who = node.label || node.id;
     state.set(node.id, 1);
-    const refs = [node.from, ...(node.via || []), node.to].filter(Boolean);
-    // 先粗算各端中心，再按「朝下一端」求真正的端点
-    const rough = refs.map(roughCenter);
-    if (rough.some((q) => !q) || refs.length < 2) { W_(`「${who}」的端点找不到，这条连接没生成`); state.set(node.id, 2); return null; }
-    // 端点朝向：第一端朝第二端，其余朝前一端
-    const ends = refs.map((s, i) => linkEnd(s, i === 0 ? rough[1] : rough[i - 1], style));
-    if (ends.some((e) => !e)) { W_(`「${who}」的端点找不到，这条连接没生成`); state.set(node.id, 2); return null; }
+    const TL = node.along && G.get(node.along) && G.get(node.along).line; // along: <手绘线> = 顺着人画的那一笔走（from / to 可省，写了就从它接到线头 / 线尾）
+    const refs = TL ? [] : [node.from, ...(node.via || []), node.to].filter(Boolean);
     const width = node.width_m || (style === "road" ? 5 : style === "bridge" ? 4 : style === "rope_bridge" ? 1.6 : style === "canal" ? 4 : 2);
-    let line = [ends[0].p], fallback = null, straight = false, unrouted = false;
-    const avoid = avoidPolysFor(ends);
-    for (let i = 0; i < ends.length - 1; i++) {
-      const a = ends[i], b = ends[i + 1];
-      let seg;
-      const walk = style === "path" || style === "road" || style === "stairs" || style === "ramp" || style === "canal";
-      if (!walk || a.elevated || b.elevated || style === "portal") seg = [a.p, b.p];
-      else {
-        const maxSlope = STYLE_SLOPE[style] || 0.7;
-        let r = routeTrail(T, a.p, b.p, { maxSlope, res: 2, avoidPolys: avoid, seed, maxPoints: 24 });
-        if (!r.points && avoid.length) r = routeTrail(T, a.p, b.p, { maxSlope, res: 2, seed, maxPoints: 24 });
-        if (r.points) seg = r.points;
-        else if (style === "stairs" || style === "canal") { seg = [a.p, b.p]; if (style === "canal") fallback = "直渠"; else straight = true; } // 台阶绕不上去就直上（崖边石阶），不算退回
-        else { seg = [a.p, b.p]; unrouted = true; fallback = `${r.facts.reason || "太陡"}，只画两端和虚线`; } // 走不通：不画实线路面（直线乱穿比没画还糟），检查里给修法
+    let ends, line, fallback = null, straight = false, unrouted = false;
+    if (TL) {
+      const g = (q) => ({ p: P2(q), y: r2(groundW(q[0], q[1])), elevated: false, rec: null }), L0 = TL[0], L1 = TL[TL.length - 1];
+      const e0 = node.from ? linkEnd(node.from, L0, style) : null, e1 = node.to ? linkEnd(node.to, L1, style) : null;
+      ends = [e0 || g(L0), e1 || g(L1)];
+      line = [...(e0 ? [e0.p] : []), ...TL.map(P2), ...(e1 ? [e1.p] : [])];
+    } else {
+      // 先粗算各端中心，再按「朝下一端」求真正的端点
+      const rough = refs.map(roughCenter);
+      if (rough.some((q) => !q) || refs.length < 2) { W_(`「${who}」的端点找不到，这条连接没生成`); state.set(node.id, 2); return null; }
+      // 端点朝向：第一端朝第二端，其余朝前一端
+      ends = refs.map((s, i) => linkEnd(s, i === 0 ? rough[1] : rough[i - 1], style));
+      if (ends.some((e) => !e)) { W_(`「${who}」的端点找不到，这条连接没生成`); state.set(node.id, 2); return null; }
+      line = [ends[0].p];
+      const avoid = avoidPolysFor(ends);
+      for (let i = 0; i < ends.length - 1; i++) {
+        const a = ends[i], b = ends[i + 1];
+        let seg;
+        const walk = style === "path" || style === "road" || style === "stairs" || style === "ramp" || style === "canal";
+        if (!walk || a.elevated || b.elevated || style === "portal") seg = [a.p, b.p];
+        else {
+          const maxSlope = STYLE_SLOPE[style] || 0.7;
+          let r = routeTrail(T, a.p, b.p, { maxSlope, res: 2, avoidPolys: avoid, seed, maxPoints: 24 });
+          if (!r.points && avoid.length) r = routeTrail(T, a.p, b.p, { maxSlope, res: 2, seed, maxPoints: 24 });
+          if (r.points) seg = r.points;
+          else if (style === "stairs" || style === "canal") { seg = [a.p, b.p]; if (style === "canal") fallback = "直渠"; else straight = true; } // 台阶绕不上去就直上（崖边石阶），不算退回
+          else { seg = [a.p, b.p]; unrouted = true; fallback = `${r.facts.reason || "太陡"}，只画两端和虚线`; } // 走不通：不画实线路面（直线乱穿比没画还糟），检查里给修法
+        }
+        line.push(...seg.slice(1).map(P2));
       }
-      line.push(...seg.slice(1).map(P2));
     }
     line = line.filter((q, k) => k === 0 || dist2(q, line[k - 1]) > 0.05);
     const span = dist2(ends[0].p, ends[ends.length - 1].p), degenerate = refs.length === 2 && span < 3 && style !== "portal";
@@ -1161,38 +1211,4 @@ export function walkNodes(nodes, fn, parent = null, inTemplate = false) {
     if (Array.isArray(n.children)) walkNodes(n.children, fn, n, inTemplate);
     if (n.type === "repeat" && isObj(n.child)) walkNodes([n.child], fn, n, true);
   }
-}
-
-/** 台地生成器 → override 平台特征（坡上台地 / 环台，v4 算法；高度相对锚点处的地面，按级高取整） */
-function terraceFeatures(n, c, { hAt, layer, hw, hd, seed }) {
-  const steps = n.steps || 4, st = n.step_h_m || layer, size = Array.isArray(n.size_m) ? n.size_m : [80, 80];
-  const rand = rng(hashStr(n.id) || 1), jit = (p, a) => P2([p[0] + (rand() - 0.5) * 2 * a, p[1] + (rand() - 0.5) * 2 * a]);
-  const feats = [];
-  const flat = (k, poly, height, extra) => { const c = polygonCentroid(poly); feats.push(Object.assign({ id: `${n.id}_${k}`, plan_id: n.id, kind: "plateau", label: n.label || "台地", notes: "", polygon: poly, center: [r2(c[0]), 0, r2(c[1])], radius: r2(Math.max(...poly.map((q) => dist2(q, c)))), level: Math.round(height / layer), height: r2(height), skirt: clamp(st * 0.8, 2, 10), override: true, step: k }, extra || {})); };
-  if (n.form === "ring") {
-    const R = clamp(Math.min(size[0], size[1]) / 2, 12, Math.max(12, Math.min(hw - Math.abs(c[0]), hd - Math.abs(c[1])) - 2));
-    let bw = n.width_m || Math.max(8, R / steps);
-    if (R - (steps - 1) * bw < 5) bw = Math.max(4, (R - 5) / Math.max(1, steps - 1));
-    const r0 = Math.max(3, R - (steps - 1) * bw), N = 12, base = Math.round(hAt(c[0] + R, c[1]) / st) * st;
-    const circ = (r, rev) => { const pts = []; for (let k = 0; k <= N; k++) { const a = -Math.PI / 2 + ((rev ? -1 : 1) * 2 * Math.PI * k) / N; pts.push(P2([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)])); } return pts; };
-    for (let k = 0; k < steps; k++) {
-      const lv = n.inverse ? steps - k : k + 1, ro = R - k * bw, ri = R - (k + 1) * bw;
-      const poly = k === steps - 1 ? circ(r0, false).slice(0, N).map((p) => jit(p, 0.4)) : [...circ(ro, false), ...circ(Math.max(ri, 2), true)].map((p, i) => (i % (N + 1) === 0 || i % (N + 1) === N ? p : jit(p, 0.4)));
-      flat(k, poly, base + lv * st, { ring: true, label: `${n.label || "环台"} 第 ${k + 1} 圈` });
-    }
-    const outline = circ(R, false).slice(0, N), top = feats.reduce((m, f) => (f.height > m.height ? f : m));
-    return { feats, outline, topPoint: P2(n.inverse ? add(c, [0, 1], R - bw / 2) : c), top: top.height };
-  }
-  // 坡上台地：上坡方向 = orient，否则沿地面上升的方向（平地时朝场地中心 / 朝北）
-  let ax = n.orient && DIRV[n.orient] && n.orient !== "C" ? DIRV[n.orient] : null;
-  if (!ax) { const g = [hAt(c[0] + 10, c[1]) - hAt(c[0] - 10, c[1]), hAt(c[0], c[1] + 10) - hAt(c[0], c[1] - 10)]; ax = Math.hypot(g[0], g[1]) > 0.5 ? unit(g) : Math.hypot(c[0], c[1]) > 5 ? unit([-c[0], -c[1]]) : [0, -1]; }
-  ax = unit(ax);
-  const a = size[1] / 2, b = size[0] / 2, F = (s, t) => [c[0] + ax[0] * s - ax[1] * t, c[1] + ax[1] * s + ax[0] * t];
-  const lowPt = F(-a, 0), base = Math.round(hAt(lowPt[0], lowPt[1]) / st) * st, depth = (2 * a) / steps;
-  for (let k = 0; k < steps; k++) {
-    const s0 = -a + k * depth, s1 = s0 + depth, w = b * (1 - (0.25 * k) / Math.max(1, steps - 1));
-    flat(k, [[s0, -w], [s0, 0], [s0, w], [s1, w], [s1, 0], [s1, -w]].map(([s, t]) => jit(F(s, t), 0.8)), base + (k + 1) * st, { label: `${n.label || "台地"} 第 ${k + 1} 级` });
-  }
-  const top = feats[feats.length - 1];
-  return { feats, outline: [F(-a, -b), F(a, -b), F(a, b), F(-a, b)].map(P2), topPoint: P2(deepPoint(top.polygon, 2.5)), top: top.height };
 }

@@ -38,6 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "desktop"))
 import ai  # noqa: E402
+import app  # noqa: E402  入口 draft / revise / finish_draft
 
 INPUTS = [
     "我要生成魔法学院",
@@ -168,7 +169,7 @@ def run_draft(ai_obj, text: str) -> dict:
     try:
         res = ai.generate(ai_obj, text, cons)
         row["raw"] = copy.deepcopy(res["plans"])
-        res = ai.finish_draft(res, cons)
+        res = app.finish_draft(res, cons)
         row["ms"] = int((time.time() - t0) * 1000)
         row.update(plans=res["plans"], concepts=res["concepts"], sources=res["sources"], fills=res["fills"], usage=res["_usage"], steps=res["_steps"],
                    fixes=res.get("_fixes") or [], warnings=res["warnings"], locked=res["constraints_fixed"], diversity=res["diversity"],
@@ -190,7 +191,7 @@ def run_revise(ai_obj, plan: dict, texts: list[str]) -> list[dict]:
         row = {"text": t}
         t0 = time.time()
         try:
-            r = ai.revise({"plan": plan, "action": {"type": "text", "text": t}}, ai_obj)  # 和 /api/ai/revise 同一条路（含本地锁定）
+            r = app.revise({"plan": plan, "action": {"type": "text", "text": t}}, ai_obj)  # 和 /api/ai/revise 同一条路（含本地锁定）
             row.update({k: r.get(k) for k in ("understood", "restatement", "ops", "question", "ask_to_point")})
             row["model_ops"] = r.get("_model_ops") or []
             row["lock_added"] = (r.get("ops") or [])[len(row["model_ops"]):]

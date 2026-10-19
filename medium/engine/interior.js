@@ -1135,3 +1135,24 @@ export function spaceFacts(sid) {
     passage_m: r1(items.reduce((a, x) => a + (x.passage_m || 0), 0)), rooms: items.reduce((a, x) => a + (x.rooms || 0), 0), items,
   };
 }
+
+// ============================================================ 空间内部层换算（interiorLevel：0 = 入口层，往里数；原在 views/map.js，视图共用）
+/** 内部层序号（0 = 入口层）→ 空间的 sublevel（地下入口在最上层，往下数；空中入口在最下层，往上数） */
+export function sublevelOf(space, k) { const n = levelsOf(space), kk = clamp(Math.round(Number(k) || 0), 0, n - 1); return space.stratum === "sky" ? kk : n - 1 - kk; }
+/** sublevel → 内部层序号 */
+export function interiorIndexOf(space, s) { const n = levelsOf(space); return space.stratum === "sky" ? s : n - 1 - s; }
+/** 「内部第 2 层」/「内部第 1 层（入口层）」 */
+export function interiorLevelName(space, s) { const k = interiorIndexOf(space, s); return `内部第 ${k + 1} 层${k === 0 ? "（入口层）" : ""}`; }
+/**
+ * 空间离地面几层——和构成清单的「深 / 高」同一口径（interior.js fitFloor）：地下 = 最上层顶板在外轮廓质心处地面下几层，
+ * 空中 = 最下层底面在地面上几层。没被迫下沉 / 抬高时就等于 plan 的 depth_layers / height_layers。
+ */
+export function spaceDepth(space, sid, T) {
+  const layer = Number(sid && sid.meta && sid.meta.layer_height_m) || (T && T.layer) || 3;
+  const c = polygonCentroid(space.polygon), g = T ? T.heightAt(c[0], c[1]) : 0, n = levelsOf(space);
+  const step = (Number(space.height) || 3) + (space.stratum === "sky" ? 1 : 2);
+  const v = space.stratum === "underground" ? (g - (space.floor_y + (n - 1) * step + space.height)) / layer : (space.floor_y - g) / layer;
+  return Math.max(0, Math.round(v));
+}
+/** 空间标高文案：「深 2 层」/「高 3 层」（同构成清单） */
+export function spaceLevelTag(space, sid, T) { return `${space.stratum === "underground" ? "深" : "高"} ${spaceDepth(space, sid, T)} 层`; }

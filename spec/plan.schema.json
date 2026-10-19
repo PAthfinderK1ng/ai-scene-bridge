@@ -8,7 +8,7 @@
   "required": ["name", "site", "nodes"],
   "x-version": 2,
   "x-groups": [
-    { "key": "terrain", "label": "地形", "def": "terrain_op", "min": 0, "max": 16, "type_field": "op" },
+    { "key": "terrain", "label": "地形", "def": "terrain_op", "min": 0, "max": 24, "type_field": "op" },
     { "key": "nodes", "label": "场景", "def": "node", "min": 1, "max": 40, "type_field": "type", "tree": true },
     { "key": "relations", "label": "关系", "def": "relation", "min": 0, "max": 12, "type_field": "type" },
     { "key": "look", "label": "外观", "def": null, "min": 0, "max": 0, "fields": ["lighting", "palette", "mood"] }
@@ -82,7 +82,8 @@
     "key_structures": { "type": "array", "maxItems": 6, "items": { "type": "string", "maxLength": 24 }, "description": "关键结构（构思阶段写的，最多 6 条）", "x-ui": { "label": "关键结构", "kind": "tags" } },
     "one_liner": { "type": "string", "maxLength": 120, "description": "旧字段（v4），等同 concept", "x-ui": { "hidden": true } },
     "site": { "$ref": "#/definitions/site" },
-    "terrain": { "type": "array", "maxItems": 16, "items": { "$ref": "#/definitions/terrain_op" } },
+    "terrain": { "type": "array", "maxItems": 24, "items": { "$ref": "#/definitions/terrain_op" }, "description": "AI 写的 ≤ 16 个；人在图上手调高度（heightEdit）加的也在这里，合计 ≤ 24" },
+    "marks": { "type": "array", "maxItems": 32, "items": { "$ref": "#/definitions/mark" }, "description": "人画的标记（docs/07 §1.1）：圈的一块（area）、画的一笔（trace）、点的一个位置（pin）。坐标是人给的（相对场地中心，x 东、z 南，米），AI 不写坐标，只拿 id 当锚点：at: mark_1（area 的中心 / pin 的点 / trace 的中点）、area: mark_1（散布 / 生成器 / 地形操作的范围）、along: mark_2（沿线重复 / 连接 / 开沟）。不出体块，不参与碰撞", "x-ui": { "hidden": true } },
     "nodes": { "type": "array", "minItems": 1, "maxItems": 40, "items": { "$ref": "#/definitions/node" } },
     "spawn": { "$ref": "#/definitions/spawn" },
     "relations": { "type": "array", "maxItems": 12, "items": { "$ref": "#/definitions/relation" } },
@@ -97,13 +98,30 @@
     "anchor": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]{0,31}(\\[([0-9]{1,3}|k)\\])?(\\.(top|bottom|center|C|N|NE|E|SE|S|SW|W|NW|inner|outer|start|mid|end|left|right))?$",
-      "description": "锚点（不是坐标）：site.<C|N|NE|E|SE|S|SW|W|NW>（场地中心 / 边）、<id>（它的中心）、<id>.<top|bottom|center|N|S|E|W|NE|…|inner|outer|start|mid|end|left|right>（沟 / 河 / 坡道这类线形地形：方位后缀 = 和该方位同侧的岸，left / right = 顺着 from → to 走的左 / 右岸）、<repeat id>[k]（第 k 个实例，从 0 数）、spawn。一组连接（repeat 的 child 是 link）里写 <repeat id> 或 <repeat id>[k]（字母 k）= 第 k 条连到那个重复的第 k 个实例，center = 这个重复的中心"
+      "description": "锚点（不是坐标）：site.<C|N|NE|E|SE|S|SW|W|NW>（场地中心 / 边）、<id>（它的中心）、<id>.<top|bottom|center|N|S|E|W|NE|…|inner|outer|start|mid|end|left|right>（沟 / 河 / 坡道这类线形地形：方位后缀 = 和该方位同侧的岸，left / right = 顺着 from → to 走的左 / 右岸）、<repeat id>[k]（第 k 个实例，从 0 数）、spawn、<mark id>（人画的标记：area 的中心 / pin 的点 / trace 的中点；area 也认 .N / .top 等后缀）。一组连接（repeat 的 child 是 link）里写 <repeat id> 或 <repeat id>[k]（字母 k）= 第 k 条连到那个重复的第 k 个实例，center = 这个重复的中心"
     },
     "label": { "type": "string", "minLength": 1, "maxLength": 16 },
     "dir": { "type": "string", "enum": ["C", "N", "NE", "E", "SE", "S", "SW", "W", "NW"] },
     "offset": { "type": "array", "items": { "type": "number", "minimum": -500, "maximum": 500 }, "minItems": 2, "maxItems": 3, "description": "在父组局部坐标里的偏移 [dx, dz] 或 [dx, dy, dz]（米，x 东、z 南、y 上）" },
     "pair": { "type": "array", "items": { "type": "number", "minimum": 0.5, "maximum": 600 }, "minItems": 2, "maxItems": 2 },
     "local_pts": { "type": "array", "minItems": 2, "maxItems": 24, "items": { "type": "array", "items": { "type": "number", "minimum": -500, "maximum": 500 }, "minItems": 2, "maxItems": 2 }, "description": "局部折线 / 多边形 [[x, z], …]（米，相对 at 锚点，x 东、z 南）" },
+    "site_pt": { "type": "array", "items": { "type": "number", "minimum": -300, "maximum": 300 }, "minItems": 2, "maxItems": 2, "description": "人给的一个点 [x, z]（米，相对场地中心，x 东、z 南）" },
+    "site_pts": { "type": "array", "minItems": 2, "maxItems": 64, "items": { "$ref": "#/definitions/site_pt" }, "description": "人画的折线 / 多边形 [[x, z], …]（米，相对场地中心）" },
+
+    "mark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "description": "人画的标记（只由界面写；AI 只引用 id）。area = 圈的一块（polygon_m ≥ 3 点）；trace = 画的一笔（path_m ≥ 2 点）；pin = 点的一个位置（point_m）",
+      "properties": {
+        "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
+        "type": { "type": "string", "enum": ["area", "trace", "pin"], "x-ui": { "label": "标记", "kind": "enum", "summary": true, "short": "{o}", "options": { "area": "圈选", "trace": "手绘线", "pin": "图钉" } } },
+        "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
+        "polygon_m": { "$ref": "#/definitions/site_pts", "x-ui": { "hidden": true } },
+        "path_m": { "$ref": "#/definitions/site_pts", "x-ui": { "hidden": true } },
+        "point_m": { "$ref": "#/definitions/site_pt", "x-ui": { "hidden": true } }
+      }
+    },
 
     "site": {
       "type": "object",
@@ -126,13 +144,16 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["op"],
-      "description": "地形雕刻操作，按顺序作用在高度场上。合成：raise / lower / cliff = 抬到 / 压到（锚点处原高度 ± height / depth，平顶；edge round 时是相加的圆丘）；flatten / ramp = 覆盖；carve / river / dune / noise = 相加；lake = 压到 + 水面；terrace = 把已有坡面台阶化。台阶化的面登记成台地。只能锚到 site.* 和前面的地形操作。",
+      "description": "地形雕刻操作，按顺序作用在高度场上。合成：raise / lower / cliff = 抬到 / 压到（锚点处原高度 ± height / depth，平顶；edge round 时是相加的圆丘）；flatten / ramp = 覆盖（flatten 削到锚点处高度 + height_m − depth_m；target at_point = 取锚点那一点（图钉）原来的高度）；carve / river / dune / noise = 相加；lake = 压到 + 水面；terrace = 把已有坡面台阶化。台阶化的面登记成台地。只能锚到 site.*、前面的地形操作和人画的标记（marks）。area: <圈选标记> = 形状就用那一块；along: <手绘线标记> = 沟 / 河 / 坡道沿那条线。",
       "properties": {
         "id": { "$ref": "#/definitions/id", "x-ui": { "hidden": true } },
         "op": { "type": "string", "enum": ["raise", "lower", "flatten", "terrace", "ramp", "carve", "lake", "river", "cliff", "dune", "noise"],
           "x-ui": { "label": "操作", "kind": "enum", "summary": true, "short": "{o}", "options": { "raise": "抬起", "lower": "压低", "flatten": "削平", "terrace": "台阶化", "ramp": "坡道", "carve": "开沟", "lake": "成湖", "river": "河", "cliff": "立崖", "dune": "沙丘", "noise": "起伏" } } },
         "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
-        "at": { "$ref": "#/definitions/anchor", "x-ui": { "label": "在哪", "kind": "anchor", "ref": ["site", "terrain"], "summary": true, "short": "@{r}" } },
+        "at": { "$ref": "#/definitions/anchor", "x-ui": { "label": "在哪", "kind": "anchor", "ref": ["site", "terrain", "marks"], "summary": true, "short": "@{r}" } },
+        "area": { "$ref": "#/definitions/ref", "description": "用人圈的一块（area 标记）当形状（不用 shape / size_m）", "x-ui": { "label": "范围", "kind": "ref", "ref": ["marks"], "when": { "op": ["raise", "lower", "flatten", "terrace", "lake", "cliff", "dune", "noise"] } } },
+        "along": { "$ref": "#/definitions/ref", "description": "沿人画的一笔（trace 标记）开沟 / 成河 / 做坡道", "x-ui": { "label": "沿着", "kind": "ref", "ref": ["marks"], "when": { "op": ["ramp", "carve", "river"] } } },
+        "target": { "type": "string", "enum": ["center", "at_point"], "description": "削平到哪的高度：center = 操作中心（缺省）；at_point = 锚点那一点（图钉）原来的地面高", "x-ui": { "label": "削到", "kind": "enum", "options": { "center": "中心高度", "at_point": "图钉处高度" }, "when": { "op": ["flatten"] } } },
         "offset_m": { "$ref": "#/definitions/offset", "x-ui": { "label": "偏移", "kind": "offset", "step": 1, "unit": "m" } },
         "shape": { "type": "string", "enum": ["circle", "ellipse", "rect", "ring", "line", "polygon"],
           "x-ui": { "label": "形状", "kind": "enum", "options": { "circle": "圆", "ellipse": "椭圆", "rect": "矩形", "ring": "环", "line": "线", "polygon": "多边形" }, "when": { "op": ["raise", "lower", "flatten", "terrace", "lake", "cliff", "dune", "noise"] } } },
@@ -143,7 +164,7 @@
         "to": { "$ref": "#/definitions/anchor", "x-ui": { "label": "到", "kind": "anchor", "ref": ["site", "terrain"], "when": { "op": ["ramp", "carve", "river"] } } },
         "rotate_deg": { "type": "number", "minimum": -360, "maximum": 360, "x-ui": { "label": "转", "kind": "number", "step": 15, "unit": "°" } },
         "height_m": { "type": "number", "minimum": 0, "maximum": 150, "x-ui": { "label": "高", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "高 {v} m", "when": { "op": ["raise", "cliff", "flatten"] } } },
-        "depth_m": { "type": "number", "minimum": 0, "maximum": 80, "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "深 {v} m", "when": { "op": ["lower", "carve", "lake", "river"] } } },
+        "depth_m": { "type": "number", "minimum": 0, "maximum": 80, "x-ui": { "label": "深", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "深 {v} m", "when": { "op": ["lower", "carve", "lake", "river", "flatten"] } } },
         "edge": { "type": "string", "enum": ["slope", "cliff", "terraced", "round"], "x-ui": { "label": "边", "kind": "enum", "options": { "slope": "缓坡", "cliff": "陡崖", "terraced": "台阶", "round": "圆丘" }, "when": { "op": ["raise", "lower", "flatten", "carve", "cliff", "lake"] } } },
         "edge_m": { "type": "number", "minimum": 0.5, "maximum": 60, "description": "边坡宽（米）", "x-ui": { "label": "边坡宽", "kind": "number", "step": 1, "unit": "m" } },
         "steps": { "type": "integer", "minimum": 2, "maximum": 12, "x-ui": { "label": "级数", "kind": "number", "step": 1, "unit": "级", "summary": true, "short": "{v} 级", "when": { "edge": ["terraced"] } } },
@@ -169,7 +190,7 @@
         },
         "label": { "$ref": "#/definitions/label", "x-ui": { "label": "名字", "kind": "text" } },
         "role": { "type": "string", "enum": ["landmark", "primary", "secondary", "detail"], "description": "landmark = 地标（出生点要看得见、走得到）", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "space"] }, "label": "角色", "kind": "enum", "options": { "landmark": "地标", "primary": "主要", "secondary": "次要", "detail": "细节" } } },
-        "at": { "$ref": "#/definitions/anchor", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "锚点", "kind": "anchor", "ref": ["site", "terrain", "nodes", "spawn"], "summary": true, "short": "@{r}" } },
+        "at": { "$ref": "#/definitions/anchor", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "锚点", "kind": "anchor", "ref": ["site", "terrain", "nodes", "spawn", "marks"], "summary": true, "short": "@{r}" } },
         "offset_m": { "$ref": "#/definitions/offset", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "terraces", "scatter_houses", "space", "grove", "field"] }, "label": "偏移", "kind": "offset", "step": 1, "unit": "m" } },
         "rotate_deg": { "type": "number", "minimum": -360, "maximum": 360, "description": "绕竖轴转（度，0 = 门朝北，俯视逆时针为正）", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "scatter_houses", "grove", "field"] }, "label": "转", "kind": "number", "step": 15, "unit": "°" } },
         "elev_m": { "type": "number", "minimum": -60, "maximum": 200, "description": "离地高度（> 0 即悬空）。形体的子节点：从父体底面量（= 立面上的高度，挂墙平台 / 招牌 / 阳台），≥ 父体高就到屋顶以上，不写 = 立在父体顶上；at 是 X.top 时是离 X 顶面的高度；浮岛的子节点从岛面量", "x-ui": { "when": { "type": ["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism", "building", "tower", "wall", "courtyard", "stairs", "platform", "column", "gate", "statue", "tree", "rock", "crystal", "island", "water", "group", "repeat", "space"] }, "label": "离地", "kind": "number", "step": 1, "unit": "m", "summary": true, "short": "离地 {v} m" } },
@@ -208,8 +229,8 @@
         "start_deg": { "type": "number", "minimum": -360, "maximum": 360, "description": "第一个的方位（0 = 北，90 = 东）", "x-ui": { "label": "起始方位", "kind": "number", "step": 15, "unit": "°", "when": { "pattern": ["radial"] } } },
         "sweep_deg": { "type": "number", "minimum": 10, "maximum": 360, "x-ui": { "label": "张角", "kind": "number", "step": 15, "unit": "°", "when": { "pattern": ["radial"] } } },
         "face": { "type": "string", "enum": ["center", "out", "path", "none"], "x-ui": { "label": "朝向", "kind": "enum", "options": { "center": "朝心", "out": "朝外", "path": "朝路", "none": "不转" }, "when": { "pattern": ["radial", "along", "grid", "linear", "scatter"] } } },
-        "along": { "$ref": "#/definitions/ref", "description": "沿哪条 link 排", "x-ui": { "label": "沿着", "kind": "ref", "ref": ["nodes"], "when": { "pattern": ["along"] } } },
-        "area": { "$ref": "#/definitions/ref", "description": "散布在哪：节点 / 地形操作 id / site", "x-ui": { "label": "范围", "kind": "ref", "ref": ["site", "terrain", "nodes"], "when": { "type": ["repeat", "scatter_houses", "grove", "field"] } } },
+        "along": { "$ref": "#/definitions/ref", "description": "沿哪条线：重复（pattern along）沿一条 link 或人画的一笔（trace 标记）排；连接（link）写了 along: <trace 标记> 就顺着那一笔走（from / to 可省）", "x-ui": { "label": "沿着", "kind": "ref", "ref": ["nodes", "marks"], "when": { "pattern": ["along"] } } },
+        "area": { "$ref": "#/definitions/ref", "description": "散布在哪：节点 / 地形操作 id / site / 人圈的一块（area 标记）", "x-ui": { "label": "范围", "kind": "ref", "ref": ["site", "terrain", "nodes", "marks"], "when": { "type": ["repeat", "scatter_houses", "grove", "field"] } } },
         "axis": { "type": "string", "enum": ["x", "z"], "description": "linear：一排沿哪个方向（x 东西 / z 南北）；mirror：沿哪个方向翻（x = 东西对称，模板要偏开 offset_m [d, 0]）", "x-ui": { "label": "方向", "kind": "enum", "options": { "x": "东西", "z": "南北" }, "when": { "pattern": ["mirror", "linear"] }, "variants": [{ "when": { "pattern": ["mirror"] }, "label": "镜像轴", "options": { "x": "东西对称", "z": "南北对称" } }] } },
         "levels": { "type": "integer", "minimum": 1, "maximum": 20, "x-ui": { "label": "层数", "kind": "number", "step": 1, "summary": true, "short": "{v} 层", "when": { "pattern": ["stack"] } } },
         "taper": { "type": "number", "minimum": 0, "maximum": 0.6, "description": "叠层每层缩小的比例", "x-ui": { "label": "收分", "kind": "number", "step": 0.05, "when": { "pattern": ["stack"] } } },
@@ -323,7 +344,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["op", "to", "value"],
-      "description": "加一项：to = root（根节点）/ terrain（地形操作）/ relations / <group 或带 children 的节点 id>（加成它的子节点）；value 按对应定义校验；index 可选（插到第几个）",
+      "description": "加一项：to = root（根节点）/ terrain（地形操作）/ relations / marks（人画的标记，只由界面加）/ <group 或带 children 的节点 id>（加成它的子节点）；value 按对应定义校验；index 可选（插到第几个）",
       "properties": {
         "op": { "const": "add" },
         "to": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
@@ -335,7 +356,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["op", "id"],
-      "description": "删一项：节点（连同子树）/ 地形操作 / 单个实例 id[k]（写进 repeat 的 skip）/ 关系 \"rel:<序号>\"；引用它的东西本地降级（锚点改到它的父组或 site，连接去掉）",
+      "description": "删一项：节点（连同子树）/ 地形操作 / 标记 / 单个实例 id[k]（写进 repeat 的 skip）/ 关系 \"rel:<序号>\"；引用它的东西本地降级（锚点改到它的父组或 site，连接去掉）",
       "properties": {
         "op": { "const": "remove" },
         "id": { "type": "string" }

@@ -1,0 +1,450 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+// marks.test.html — docs/07：人画的标记（marks）当锚点 / 范围 / 线、随意选点调高度（heightEdit）、引用事实（describeRef）、改动摘要（diffCompiled）、场地坐标。
+import { test, run, assert, close, between } from "./harness.js";
+import { pointInPolygon, distToPolyline, polygonCentroid } from "../terrain.js";
+import { snapshot } from "../sid.js";
+import { ACC6_PLAN, ACC6_OPS2, ACC6_SEED } from "./fixtures.js";
+import { PLAN_SCHEMA, normalizePlan, compilePlan, applyOps, addMark, updateMark, removeMark, heightEdit, describeRef, diffCompiled, worldToSite, siteToWorld, knobsFor } from "../plan.js";
+
+const EX = await fetch("../../../spec/examples/plans/magic-academy.plan.json", { cache: "no-store" }).then((r) => r.json());
+/** 最小 plan：平地 160 m 见方 + 给的节点 */
+const mini = (nodes, extra = {}) => Object.assign({ name: "测试", site: { size_m: [160, 160], ground: "flat", layer_m: 3 }, nodes, spawn: { at: "site.S" } }, extra);
+const RECT = [[-40, -25], [40, -25], [40, 25], [-40, 25]]; // 80 × 50 = 4000 m²
+const vols = (r, pid) => r.sid.volumes.filter((v) => v.plan_id === pid || (v.plan_path || []).includes(pid));
+const xz = (p) => [p[0], p[2]];
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const errs = (r) => r.facts.validation.filter((m) => m.level === "error");
+const H = (r, p) => r.T.heightAt(p[0], p[1]);
+
+// ============================================================ schema 与规范化
+test("schema：顶层 marks（area / trace / pin，坐标是 *_m 的场地坐标）；地形操作有 area / along / target(at_point)；地形操作上限 24", () => {
+  const D = PLAN_SCHEMA.definitions;
+  assert(PLAN_SCHEMA.properties.marks && PLAN_SCHEMA.properties.marks.items.$ref.endsWith("/mark"), "marks");
+  assert(D.mark.properties.type.enum.join() === "area,trace,pin", "mark.type");
+  for (const k of ["polygon_m", "path_m", "point_m"]) assert(D.mark.properties[k], "mark." + k);
+  assert(D.terrain_op.properties.area && D.terrain_op.properties.along && D.terrain_op.properties.target.enum.includes("at_point"), "terrain area / along / target");
+  assert(PLAN_SCHEMA.properties.terrain.maxItems === 24 && PLAN_SCHEMA["x-groups"].find((g) => g.key === "terrain").max === 24, "上限 24");
+  const k = knobsFor("node", { type: "box" }, PLAN_SCHEMA, mini([], { marks: [{ id: "mark_1", type: "pin", label: "图钉 1", point_m: [0, 0] }] })).find((q) => q.key === "at");
+  assert(k.options.some((o) => o.group === "marks" && o.value === "mark_1"), "锚点下拉里有标记");
+});
+
+test("normalizePlan：标记夹进场地、没 id 的补 mark_N、没名字的补「圈选 N / 手绘线 N / 图钉 N」、几何不全的丢掉并提一句；没有标记时不出 marks 字段", () => {
+  const { plan, warnings } = normalizePlan(mini([{ type: "box", at: "site.C" }], { marks: [
+    { type: "area", polygon_m: [[-200, -10], [10, -10], [10, 10], [-200, 10]] },
+    { type: "trace", path_m: [[0, 0], [30, 5]] },
+    { type: "pin", point_m: [5, 999] },
+    { type: "area", polygon_m: [[0, 0], [1, 1]] },
+  ] }));
+  assert(plan.marks.length === 3, "留 3 个：" + JSON.stringify(plan.marks));
+  assert(plan.marks.map((m) => m.id).join() === "mark_1,mark_2,mark_3", "id " + plan.marks.map((m) => m.id));
+  assert(plan.marks.map((m) => m.label).join() === "圈选 1,手绘线 1,图钉 1", "名字 " + plan.marks.map((m) => m.label));
+  assert(plan.marks[0].polygon_m[0][0] === -80 && plan.marks[2].point_m[1] === 80, "夹进场地");
+  assert(warnings.some((w) => w.includes("太小") || w.includes("去掉")), "提一句：" + warnings);
+  assert(!("marks" in normalizePlan(mini([{ type: "box", at: "site.C" }])).plan), "没有标记不出字段");
+});
+
+test("旧程序没有标记时不受影响：编译结果与加一个远处图钉的编译结果的体块 / 路 / 地形一样（标记不出几何）", () => {
+  const a = compilePlan(EX, { seed: 1 });
+  const { plan, id } = addMark(EX, { type: "pin", point_m: [-100, -100] });
+  assert(id === "mark_1", "id " + id);
+  const b = compilePlan(plan, { seed: 1 });
+  const pick = (r) => JSON.stringify([r.sid.volumes, r.sid.paths, r.sid.regions, r.sid.terrain.features]);
+  assert(pick(a) === pick(b), "加了标记几何变了");
+  assert(!a.sid.meta.marks && b.sid.meta.marks && b.sid.meta.marks[0].id === "mark_1", "meta.marks 只在有标记时写");
+  assert(errs(b).length === 0, "validate " + errs(b).map((e) => e.msg));
+});
+
+test("addMark：编号接着往下排、名字按类型数；id 不撞节点；点太多抽稀到 ≤ 64；坐标取 0.1 m", () => {
+  let p = mini([{ id: "mark_1", type: "box", at: "site.C" }]);
+  const a = addMark(p, { type: "area", polygon_m: RECT });
+  assert(a.id === "mark_2", "撞了节点 id：" + a.id);
+  const ring = Array.from({ length: 300 }, (_, k) => [30 * Math.cos((k / 300) * 2 * Math.PI) + 0.0123, 30 * Math.sin((k / 300) * 2 * Math.PI)]);
+  const b = addMark(a.plan, { type: "area", polygon_m: ring });
+  const m = b.plan.marks.find((q) => q.id === b.id);
+  assert(m.label === "圈选 2" && m.polygon_m.length <= 64 && m.polygon_m.length >= 32, `${m.label} ${m.polygon_m.length}`);
+  assert(m.polygon_m.every((q) => Math.abs(q[0] * 10 - Math.round(q[0] * 10)) < 1e-9), "0.1 m");
+  const c = addMark(b.plan, { type: "trace", path_m: [[0, 0]] });
+  assert(c.id === null, "一个点的线不成立");
+});
+
+// ============================================================ 锚点
+test("at: <圈选> = 那一块的中心；at: <图钉> = 那一点；at: <手绘线> = 线的中点", () => {
+  let p = mini([{ id: "a", type: "box", size_m: [6, 6, 6], at: "mark_1" }, { id: "b", type: "box", size_m: [4, 4, 4], at: "mark_2" }, { id: "c", type: "box", size_m: [4, 4, 4], at: "mark_3" }],
+    { marks: [{ id: "mark_1", type: "area", polygon_m: [[20, 20], [60, 20], [60, 50], [20, 50]] }, { id: "mark_2", type: "pin", point_m: [-50, -40] }, { id: "mark_3", type: "trace", path_m: [[-60, 10], [-20, 10]] }] });
+  const r = compilePlan(p, { seed: 1 });
+  const at = (id) => xz(vols(r, id)[0].position);
+  assert(dist(at("a"), [40, 35]) < 0.6, "area 中心 " + at("a"));
+  assert(dist(at("b"), [-50, -40]) < 0.6, "图钉 " + at("b"));
+  assert(dist(at("c"), [-40, 10]) < 0.6, "线中点 " + at("c"));
+});
+
+test("at: <圈选>.N = 那一块的北边（往里 1.5 m）；锚在标记上的组 + 偏移照常", () => {
+  const p = mini([{ id: "g", type: "group", at: "mark_1.N", children: [{ id: "k", type: "box", size_m: [4, 4, 4], offset_m: [10, 0] }] }], { marks: [{ id: "mark_1", type: "area", polygon_m: RECT }] });
+  const r = compilePlan(p, { seed: 1 }), q = xz(vols(r, "k")[0].position);
+  assert(Math.abs(q[0] - 10) < 0.6, "x " + q); between(q[1], -25, -20, "北边 ");
+});
+
+test("area: <圈选> = 散布 / 树林的范围：重复的实例都在圈里；树林的区域就是那一块", () => {
+  const poly = [[0, -50], [60, -50], [60, 10], [0, 10]];
+  const p = mini([{ id: "rocks", type: "repeat", pattern: "scatter", count: 10, area: "mark_1", child: { type: "rock", size_m: [3, 2, 3] } }, { id: "woods", type: "grove", area: "mark_2" }],
+    { marks: [{ id: "mark_1", type: "area", polygon_m: poly }, { id: "mark_2", type: "area", polygon_m: [[-70, 20], [-20, 20], [-20, 60], [-70, 60]] }] });
+  const r = compilePlan(p, { seed: 1 });
+  const vs = r.sid.volumes.filter((v) => v.instance_of === "rocks");
+  assert(vs.length >= 8, "撒下 " + vs.length);
+  assert(vs.every((v) => pointInPolygon(xz(v.position), poly)), "都在圈里");
+  const reg = r.sid.regions.find((g) => g.plan_id === "woods");
+  assert(reg && reg.kind === "forest" && pointInPolygon([-45, 40], reg.polygon) && !pointInPolygon([0, 0], reg.polygon), "树林区域");
+});
+
+test("area: <图钉> / <手绘线>：图钉周围按自己的尺寸撒，手绘线两侧一条带", () => {
+  const L = [[-60, -40], [-20, -40], [0, 0], [40, 10]];
+  const p = mini([{ id: "a", type: "repeat", pattern: "scatter", count: 6, size_m: [24, 1, 24], area: "mark_1", child: { type: "rock", size_m: [2, 2, 2] } }, { id: "b", type: "repeat", pattern: "scatter", count: 8, area: "mark_2", child: { type: "tree", size_m: [3, 5] } }],
+    { marks: [{ id: "mark_1", type: "pin", point_m: [50, 50] }, { id: "mark_2", type: "trace", path_m: L }] });
+  const r = compilePlan(p, { seed: 1 });
+  const A = r.sid.volumes.filter((v) => v.instance_of === "a"), B = r.sid.volumes.filter((v) => v.instance_of === "b");
+  assert(A.length >= 4 && A.every((v) => dist(xz(v.position), [50, 50]) < 18), "图钉周围 " + A.map((v) => xz(v.position)));
+  assert(B.length >= 6 && B.every((v) => distToPolyline(xz(v.position), L) <= 6.5), "沿线 " + B.map((v) => distToPolyline(xz(v.position), L).toFixed(1)));
+});
+
+test("along: <手绘线> = 沿人画的那一笔排（重复）", () => {
+  const L = [[-60, 30], [-10, 30], [20, -20], [60, -20]];
+  const p = mini([{ id: "lamps", type: "repeat", pattern: "along", along: "mark_1", count: 8, child: { type: "column", size_m: [0.6, 4] } }], { marks: [{ id: "mark_1", type: "trace", path_m: L }] });
+  const r = compilePlan(p, { seed: 1 }), vs = r.sid.volumes.filter((v) => v.instance_of === "lamps");
+  assert(vs.length === 8, "个数 " + vs.length);
+  assert(vs.every((v) => distToPolyline(xz(v.position), L) < 0.8), "贴着线 " + vs.map((v) => distToPolyline(xz(v.position), L).toFixed(2)));
+  assert(!r.warnings.some((w) => w.includes("lamps") || w.includes("不是连接")), "没有警告：" + r.warnings);
+});
+
+test("连接 along: <手绘线>：路顺着那一笔走；from / to 可省，写了就从它接到线头", () => {
+  const L = [[-50, 40], [0, 20], [30, -30]];
+  const p = mini([{ id: "hut", type: "building", size_m: [8, 5, 6], at: "site.SW" }, { id: "road", type: "link", style: "road", along: "mark_1" }, { id: "road2", type: "link", style: "path", along: "mark_1", from: "hut" }],
+    { marks: [{ id: "mark_1", type: "trace", path_m: L }] });
+  const { plan, warnings } = normalizePlan(p);
+  assert(plan.nodes.some((n) => n.id === "road") && !warnings.some((w) => w.includes("road")), "没 from / to 的沿线连接留着：" + warnings);
+  const r = compilePlan(p, { seed: 1 });
+  const a = r.sid.paths.find((q) => q.plan_id === "road"), b = r.sid.paths.find((q) => q.plan_id === "road2");
+  assert(a && a.points.length === 3 && a.points.every((q, i) => dist(q, L[i]) < 0.01), "路 = 线 " + JSON.stringify(a && a.points));
+  assert(b && b.points.length === 4 && dist(b.points[1], L[0]) < 0.01 && dist(b.points[0], L[0]) > 3, "接到线头 " + JSON.stringify(b && b.points));
+});
+
+test("地形操作 at <图钉> / area <圈选> / along <手绘线>：抬起在图钉处、削平的范围就是圈选、沟顺着线", () => {
+  const L = [[-70, 50], [-30, 50], [-10, 70]];
+  const p = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }], {
+    marks: [{ id: "mark_1", type: "pin", point_m: [40, 40] }, { id: "mark_2", type: "area", polygon_m: [[-60, -60], [-20, -60], [-20, -30], [-60, -30]] }, { id: "mark_3", type: "trace", path_m: L }],
+    terrain: [{ id: "hill", op: "raise", at: "mark_1", shape: "circle", size_m: [20, 20], height_m: 6, edge: "slope" }, { id: "pad", op: "flatten", area: "mark_2", height_m: 3 }, { id: "ditch", op: "carve", along: "mark_3", width_m: 6, depth_m: 2, edge: "cliff" }],
+  });
+  const r = compilePlan(p, { seed: 1 });
+  close(H(r, [40, 40]), 6, 0.05, "图钉处抬 6 m");
+  close(H(r, [-40, -45]), 3, 0.05, "圈选里削到 3 m");
+  close(H(r, [0, 0]), 0, 0.05, "别处不动");
+  between(H(r, [-30, 50]), -2.05, -1.9, "沟沿线");
+  const f = r.sid.terrain.features.find((q) => q.plan_id === "pad");
+  assert(f.polygon.length === 4 && dist(f.polygon[0], [-60, -60]) < 0.01, "削平的多边形 = 圈选");
+});
+
+test("normalizePlan：地形 area 只认圈选、along 只认手绘线；关系 / 第一眼看不能引用标记；不存在的标记锚点降级", () => {
+  const { plan, warnings } = normalizePlan(mini([{ id: "a", type: "box", at: "mark_9" }, { id: "b", type: "box", at: "mark_1" }], {
+    marks: [{ id: "mark_1", type: "pin", point_m: [0, 0] }],
+    terrain: [{ id: "t", op: "flatten", area: "mark_1" }, { id: "u", op: "carve", along: "mark_1" }],
+    relations: [{ type: "visible_from", a: "b", b: "mark_1" }], spawn: { at: "mark_1", look_at: "mark_1" },
+  }));
+  assert(!plan.terrain[0].area && !plan.terrain[1].along, "area / along 去掉");
+  assert(plan.relations.length === 0 && !plan.spawn.look_at && plan.spawn.at === "mark_1", "关系去掉、出生点可以锚标记");
+  assert(plan.nodes[0].at === "site.C" && plan.nodes[1].at === "mark_1", "降级");
+  assert(warnings.some((w) => w.includes("不是圈选")) && warnings.some((w) => w.includes("不是手绘线")), warnings.join("；"));
+});
+
+test("applyOps：add to marks / set 标记字段 / remove 标记（锚在它上面的手调高度一起删，别的锚点降级）", () => {
+  let p = mini([{ id: "k", type: "box", at: "mark_1" }]);
+  p = applyOps(p, [{ op: "add", to: "marks", value: { type: "pin", point_m: [10, 10] } }]).plan;
+  assert(p.marks[0].id === "mark_1" && p.marks[0].label === "图钉 1", JSON.stringify(p.marks));
+  assert(p.nodes[0].at === "mark_1", "锚上了");
+  p = applyOps(p, [{ op: "set", id: "mark_1", field: "label", value: "井口" }]).plan;
+  assert(p.marks[0].label === "井口", "改名");
+  p = heightEdit(p, { point_m: [-20, 0], delta_m: 3 }).plan;
+  assert(p.terrain.length === 1 && p.marks.length === 2, "手调了一处");
+  const r = applyOps(p, [{ op: "remove", id: "mark_2" }, { op: "remove", id: "mark_1" }]);
+  assert(!r.plan.marks && r.plan.terrain.length === 0, "标记和手调的操作都删了");
+  assert(r.plan.nodes[0].at === "site.C" && r.warnings.some((w) => w.includes("mark_1")), "降级并提一句：" + r.warnings);
+  const q = updateMark(heightEdit(mini([{ type: "box", at: "site.C" }]), { point_m: [0, 0], delta_m: 2 }).plan, "mark_1", { point_m: [30, 30] });
+  close(compilePlan(q).T.heightAt(30, 30), 2, 0.05, "拖图钉：手调的高度跟着走");
+  assert(removeMark(q, "mark_1").terrain.length === 0, "removeMark");
+});
+
+// ============================================================ 随意选点调高度
+test("heightEdit：任意一点 +4.5 m → 放一个图钉 + 一个「手调高度 1」（圆、直径 2r、边坡 0.4 r）；中心 +4.5，边坡外不动", () => {
+  const base = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }]);
+  const { plan, pinId, opId } = heightEdit(base, { point_m: [20, 10], delta_m: 4.5, radius_m: 12, mode: "raise" });
+  const op = plan.terrain.find((t) => t.id === opId), pin = plan.marks.find((m) => m.id === pinId);
+  assert(pin && pin.type === "pin" && pin.point_m.join() === "20,10", "图钉 " + JSON.stringify(pin));
+  assert(op && op.op === "raise" && op.at === pinId && op.label === "手调高度 1" && op.shape === "circle" && op.size_m.join() === "24,24" && op.height_m === 4.5 && op.edge === "slope" && op.edge_m === 4.8, JSON.stringify(op));
+  const r = compilePlan(plan);
+  close(H(r, [20, 10]), 4.5, 0.05, "中心");
+  close(H(r, [30, 10]), 4.5, 0.05, "半径以内平顶");
+  between(H(r, [34, 10]), 0.05, 4.45, "边坡里过渡");
+  close(H(r, [20 + 12 + 4.8 + 2, 10]), 0, 0.01, "边坡外不动");
+});
+
+test("heightEdit：同一个图钉连续拖 = 改同一个操作（量叠加、不堆新的）；换半径改尺寸；第二个点是「手调高度 2」", () => {
+  const base = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }]);
+  const e1 = heightEdit(base, { point_m: [-30, 20], delta_m: 3 });
+  const e2 = heightEdit(e1.plan, { point_m: [-30, 20], delta_m: 2.5, radius_m: 20, pinId: e1.pinId });
+  assert(e2.pinId === e1.pinId && e2.opId === e1.opId, "同一个");
+  assert(e2.plan.terrain.length === 1 && e2.plan.marks.length === 1, "没堆新的");
+  const op = e2.plan.terrain[0];
+  assert(op.height_m === 5.5 && op.size_m[0] === 40 && op.edge_m === 8, JSON.stringify(op));
+  close(H(compilePlan(e2.plan), [-30, 20]), 5.5, 0.05, "高度");
+  const e3 = heightEdit(e2.plan, { point_m: [-30, 20], delta_m: 1, opId: e1.opId });
+  assert(e3.opId === e1.opId && e3.plan.terrain[0].height_m === 6.5, "按 opId 也找得到");
+  const e4 = heightEdit(e3.plan, { point_m: [40, -30], delta_m: 2 });
+  assert(e4.opId !== e1.opId && e4.plan.terrain.find((t) => t.id === e4.opId).label === "手调高度 2" && e4.plan.marks.length === 2, "第二处");
+});
+
+test("heightEdit：往下拖过零 → 换成 lower；Alt（lower）只压低；压低的高度正确", () => {
+  const base = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }]);
+  const e1 = heightEdit(base, { point_m: [0, 30], delta_m: 2 });
+  const e2 = heightEdit(e1.plan, { point_m: [0, 30], delta_m: -5, pinId: e1.pinId });
+  const op = e2.plan.terrain[0];
+  assert(op.op === "lower" && op.depth_m === 3 && op.height_m === undefined, JSON.stringify(op));
+  close(H(compilePlan(e2.plan), [0, 30]), -3, 0.05, "压低 3 m");
+  const e3 = heightEdit(base, { point_m: [0, 30], delta_m: 4, mode: "lower" });
+  assert(e3.plan.terrain[0].op === "lower" && e3.plan.terrain[0].depth_m === 4, "Alt 往上拖也是压低");
+});
+
+test("heightEdit flatten（Shift）：削到按下那一点原来的高度（target at_point）；在坡上削出一块平地", () => {
+  const base = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }], { terrain: [{ id: "dome", op: "raise", at: "site.C", shape: "circle", size_m: [100, 100], height_m: 20, edge: "round" }] });
+  const r0 = compilePlan(base), P = [25, 0], h0 = H(r0, P);
+  assert(h0 > 3 && h0 < 19, "在坡上 " + h0);
+  const e = heightEdit(base, { point_m: P, delta_m: 0, radius_m: 8, mode: "flatten" });
+  const op = e.plan.terrain.find((t) => t.id === e.opId);
+  assert(op.op === "flatten" && op.target === "at_point" && op.at === e.pinId && !op.height_m && !op.depth_m, JSON.stringify(op));
+  const r = compilePlan(e.plan);
+  for (const q of [[25, 0], [30, 0], [20, 0], [25, 6], [25, -6]]) close(H(r, q), h0, 0.12, "平地 " + q);
+  const up = heightEdit(e.plan, { point_m: P, delta_m: 2, pinId: e.pinId, mode: "flatten" });
+  close(H(compilePlan(up.plan), [25, 0]), h0 + 2, 0.12, "削平后再抬 2 m");
+});
+
+test("手调高度进撤销 / 删除：删掉图钉就回到原来的地形；AI 能在程序里看到「手调高度 1」并引用（set height_m）", () => {
+  const base = mini([{ id: "b", type: "box", size_m: [4, 4, 4], at: "site.N" }]);
+  const e = heightEdit(base, { point_m: [10, 10], delta_m: 5 });
+  assert(JSON.stringify(normalizePlan(removeMark(e.plan, e.pinId)).plan) === JSON.stringify(normalizePlan(base).plan), "删掉图钉 = 原样");
+  const ai = applyOps(e.plan, [{ op: "set", id: e.opId, field: "height_m", value: 8 }]);
+  close(H(compilePlan(ai.plan), [10, 10]), 8, 0.05, "AI 改它");
+});
+
+// ============================================================ 引用事实
+test("describeRef 圈选：size_m / area_m2 / ground_y（含抬起的那块）/ contains（中心在圈里的，子节点不重复列）/ near；facts ≤ 300 字符；text 一句话", () => {
+  const p = mini([
+    { id: "main_house", type: "building", label: "主宅", size_m: [12, 8, 10], at: "site.C", offset_m: [-15, 0] },
+    { id: "yard", type: "group", label: "谷仓院", at: "site.C", offset_m: [20, 5], children: [{ id: "barn", type: "building", label: "谷仓", size_m: [10, 6, 8] }, { id: "silo", type: "tower", label: "筒仓", size_m: [4, 10], offset_m: [9, 0] }] },
+    { id: "gate", type: "gate", label: "大门", size_m: [6, 6, 2], at: "site.C", offset_m: [0, 33] },
+    { id: "far", type: "tower", label: "远塔", size_m: [5, 20], at: "site.NW" },
+  ], { marks: [{ id: "mark_1", type: "area", label: "圈选 1", polygon_m: RECT }], terrain: [{ id: "bump", op: "raise", at: "site.C", offset_m: [30, -15], shape: "circle", size_m: [16, 16], height_m: 7, edge: "slope" }] });
+  const r = compilePlan(p, { seed: 1 }), d = describeRef(r, r.plan, { kind: "mark", id: "mark_1" });
+  assert(d.label === "圈选 1", d.label);
+  assert(d.facts.size_m.join() === "80,50" && d.facts.area_m2 === 4000, JSON.stringify(d.facts));
+  assert(d.facts.ground_y[0] === 0 && d.facts.ground_y[1] >= 6.9, "地面范围 " + d.facts.ground_y);
+  assert(d.facts.contains.join() === "main_house,yard", "contains " + d.facts.contains);
+  assert(d.facts.near && d.facts.near[0] === "gate" && !d.facts.near.includes("far"), "near " + d.facts.near);
+  assert(JSON.stringify(d.facts).length <= 300, "长度");
+  assert(d.text.includes("80×50 m") && d.text.includes("主宅") && d.text.includes("谷仓院"), d.text);
+});
+
+test("describeRef 节点 / 重复的实例 / 地形操作 / 连接 / 图钉 / 出生点：类型、尺寸、个数、锚点、长度、所在的东西", () => {
+  const p = mini([
+    { id: "hall", type: "building", label: "主殿", size_m: [20, 12, 16], at: "site.C" },
+    { id: "towers", type: "repeat", label: "法师塔", pattern: "radial", count: 6, radius_m: 33, at: "hall", child: { type: "tower", label: "法师塔", size_m: [8, 34] } },
+    { id: "walk", type: "link", style: "path", from: "spawn", to: "hall", label: "主路" },
+  ], { marks: [{ id: "mark_1", type: "pin", point_m: [0, 0] }], terrain: [{ id: "mound", op: "raise", at: "site.C", shape: "circle", size_m: [50, 50], height_m: 2, label: "台" }] });
+  const r = compilePlan(p, { seed: 1 });
+  const t = describeRef(r, r.plan, { kind: "node", id: "towers" });
+  assert(t.facts.type === "repeat" && t.facts.count === 6 && t.facts.radius_m === 33 && t.facts.of === "tower" && t.facts.at === "hall", JSON.stringify(t.facts));
+  const t2 = describeRef(r, r.plan, { kind: "node", id: "towers", instance: 2 });
+  assert(t2.label === "法师塔[2]" && t2.facts.type === "tower" && t2.facts.size_m.join() === "8,34" && t2.facts.extent_m[2] === 34, JSON.stringify(t2));
+  const op = describeRef(r, r.plan, { kind: "op", id: "mound" });
+  assert(op.label === "台" && op.facts.op === "raise" && op.facts.height_m === 2 && op.facts.contains.includes("hall"), JSON.stringify(op.facts));
+  const ln = describeRef(r, r.plan, { kind: "link", id: "walk" });
+  assert(ln.facts.style === "path" && ln.facts.length_m > 10 && ln.facts.to === "hall", JSON.stringify(ln.facts));
+  const pin = describeRef(r, r.plan, { kind: "mark", id: "mark_1" });
+  assert(pin.facts.type === "pin" && pin.facts.on === "hall" && pin.facts.ground_y === 2, JSON.stringify(pin.facts));
+  const sp = describeRef(r, r.plan, { kind: "spawn" });
+  assert(sp.label === "出生点" && Number.isFinite(sp.facts.ground_y), JSON.stringify(sp));
+  for (const d of [t, t2, op, ln, pin, sp]) assert(JSON.stringify(d.facts).length <= 300, "≤ 300");
+  assert(describeRef(r, r.plan, { kind: "node", id: "nope" }).facts.missing, "找不到");
+});
+
+test("describeRef：facts 太长时先削 contains / near，压到 300 字符以内", () => {
+  const nodes = Array.from({ length: 30 }, (_, k) => ({ id: `stall_number_${k}`, type: "box", size_m: [3, 3, 3], at: "site.C", offset_m: [((k % 6) - 2.5) * 10, (Math.floor(k / 6) - 2) * 10] }));
+  const r = compilePlan(mini(nodes, { marks: [{ id: "mark_1", type: "area", polygon_m: [[-60, -60], [60, -60], [60, 60], [-60, 60]] }] }), { seed: 1 });
+  const d = describeRef(r, r.plan, { kind: "mark", id: "mark_1" });
+  assert(JSON.stringify(d.facts).length <= 300 && d.facts.contains.length >= 3 && d.facts.area_m2 === 14400, JSON.stringify(d.facts).length + " " + JSON.stringify(d.facts));
+  assert(d.text.includes("等 30 个"), d.text);
+});
+
+// ============================================================ 改动摘要
+test("diffCompiled：没改 → 没有看得见的变化；只改名 → 不算看得见", () => {
+  const p = mini([{ id: "hall", type: "building", label: "主殿", size_m: [20, 12, 16], at: "site.C" }]);
+  const a = compilePlan(p, { seed: 1 }), b = compilePlan(p, { seed: 1 });
+  const d = diffCompiled(a, b, a.plan, b.plan);
+  assert(!d.visible && d.items.length === 0 && d.summary === "没有看得见的变化", JSON.stringify(d));
+  const c = compilePlan(applyOps(p, [{ op: "set", id: "hall", field: "label", value: "大殿" }]).plan, { seed: 1 });
+  const e = diffCompiled(a, c);
+  assert(!e.visible && e.items[0].kind === "rename" && e.summary.startsWith("没有看得见的变化"), JSON.stringify(e));
+});
+
+test("diffCompiled：新增 / 删除 / 挪动（子节点跟着组走只报组）/ 数量与半径 / 变大", () => {
+  const p = mini([
+    { id: "hall", type: "building", label: "主殿", size_m: [20, 12, 16], at: "site.C" },
+    { id: "towers", type: "repeat", label: "法师塔", pattern: "radial", count: 6, radius_m: 33, at: "hall", child: { type: "tower", size_m: [6, 20] } },
+    { id: "g", type: "group", label: "门组", at: "site.S", offset_m: [0, -10], children: [{ id: "gl", type: "column", size_m: [1, 6], offset_m: [-4, 0] }, { id: "gr", type: "column", size_m: [1, 6], offset_m: [4, 0] }] },
+    { id: "old", type: "rock", label: "老石头", size_m: [4, 3, 4], at: "site.NE" },
+  ]);
+  const a = compilePlan(p, { seed: 1 });
+  const q = applyOps(p, [{ op: "set", id: "towers", field: "count", value: 8 }, { op: "set", id: "towers", field: "radius_m", value: 40 }, { op: "set", id: "g", field: "offset_m", value: [20, -10] },
+    { op: "remove", id: "old" }, { op: "add", to: "root", value: { id: "well", type: "cylinder", label: "井", size_m: [3, 2], at: "site.W" } }, { op: "set", id: "hall", field: "size_m", value: [20, 20, 16] }]).plan;
+  const b = compilePlan(q, { seed: 1 }), d = diffCompiled(a, b, a.plan, b.plan);
+  const it = (id, kind) => d.items.find((x) => x.id === id && (!kind || x.kind === kind));
+  assert(d.visible, "看得见");
+  assert(it("towers") && it("towers").change.includes("× 6 → × 8") && it("towers").change.includes("半径 33 → 40 m"), JSON.stringify(d.items));
+  assert(it("g", "move") && it("g", "move").change.includes("挪了 20 m") && it("g", "move").change.includes("东") && !it("gl") && !it("gr"), "只报组 " + JSON.stringify(d.items));
+  assert(it("old", "remove") && it("well", "add"), "删 / 加");
+  assert(it("hall", "size") && it("hall", "size").change.includes("高 12 → 20 m"), "变高 " + JSON.stringify(d.items));
+  assert(d.summary.startsWith("改了：") && d.summary.includes("法师塔"), d.summary);
+});
+
+test("diffCompiled：手调高度 → 地形项（看得见）；色板 / 时段也算", () => {
+  const p = mini([{ id: "hall", type: "building", size_m: [20, 12, 16], at: "site.C" }]);
+  const a = compilePlan(p, { seed: 1 });
+  const e = heightEdit(p, { point_m: [-40, 30], delta_m: 5 });
+  const b = compilePlan(e.plan, { seed: 1 }), d = diffCompiled(a, b);
+  assert(d.visible && d.items.some((x) => x.id === e.opId && x.kind === "add" && x.label === "手调高度 1"), JSON.stringify(d));
+  const c = compilePlan(applyOps(p, [{ op: "set", id: "lighting", field: "time_of_day", value: "night" }]).plan, { seed: 1 });
+  const d2 = diffCompiled(a, c);
+  assert(d2.visible && d2.items.some((x) => x.id === "lighting"), JSON.stringify(d2));
+  assert(diffCompiled(null, a).visible, "新场景");
+});
+
+test("applyOps 数组下标（模型照提示词写的 size_m.1）：整数组保留、标量 / 没写按有效尺寸展开、模板 child.size_m.0、实例 towers[2]、越界跳过", () => {
+  const p = mini([
+    { id: "spire", type: "tower", label: "塔", size_m: [40, 96], at: "site.C" },
+    { id: "ring", type: "cylinder", size_m: 56, at: "site.N" },
+    { id: "towers", type: "repeat", pattern: "radial", count: 4, radius_m: 40, at: "spire", child: { type: "tower", size_m: [6, 20] } },
+    { id: "blk", type: "box", at: "site.W" },
+  ]);
+  const r = applyOps(p, [
+    { op: "set", id: "spire", field: "size_m.1", value: 130 }, { op: "set", id: "ring", field: "size_m.0", value: 72 },
+    { op: "set", id: "towers", field: "child.size_m.0", value: 9 }, { op: "set", id: "towers[2]", field: "size_m.1", value: 40 },
+    { op: "set", id: "blk", field: "size_m.2", value: 11 }, { op: "set", id: "spire", field: "size_m.5", value: 1 }, { op: "set", id: "spire", field: "size_m.0", value: null },
+  ]);
+  const n = (id) => r.plan.nodes.find((q) => q.id === id);
+  assert(n("spire").size_m.join() === "40,130", "塔 " + JSON.stringify(n("spire").size_m));
+  assert(n("ring").size_m[0] === 72 && n("ring").size_m[1] === 56, "标量展开 " + JSON.stringify(n("ring").size_m));
+  assert(n("towers").child.size_m.join() === "9,20", "模板 " + JSON.stringify(n("towers").child));
+  assert(JSON.stringify(n("towers").overrides["2"].size_m) === "[9,40]", "实例 " + JSON.stringify(n("towers").overrides));
+  assert(n("blk").size_m.join() === "6,6,11", "没写 → 默认展开 " + JSON.stringify(n("blk").size_m));
+  const w = r.warnings.filter((x) => x.includes("size_m"));
+  assert(w.length === 2 && w.some((x) => x.includes("size_m.5")) && w.some((x) => x.includes("不能删")), w.join("；"));
+  const c = compilePlan(r.plan, { seed: 1 }), sv = vols(c, "spire").filter((v) => v.plan_id === "spire");
+  assert(sv.length && Math.max(...sv.map((v) => v.position[1] + v.size[1] / 2)) - Math.min(...sv.map((v) => v.position[1] - v.size[1] / 2)) >= 120, "塔真的变高了");
+});
+
+test("回放 acc6 第 2 轮「还是太空了」：size_m.0 不再被丢；摘要先说夜市那块（摊棚 / 灯串 / 灯柱），没有假的「样子变了」，「等 N 处」按东西数", () => {
+  const a = compilePlan(ACC6_PLAN, { seed: ACC6_SEED });
+  const r = applyOps(a.plan, ACC6_OPS2);
+  assert(!r.warnings.some((x) => x.includes("size_m.0")), r.warnings.join("；"));
+  const ring = r.plan.nodes.find((q) => q.id === "night_market").children.find((q) => q.id === "market_ring");
+  assert(ring.size_m[0] === 72 && ring.size_m[1] === 3.2, JSON.stringify(ring.size_m));
+  const b = compilePlan(r.plan, { seed: ACC6_SEED }), d = diffCompiled(a, b, a.plan, b.plan, { focus: ["mark_1"] });
+  const shown = d.summary.replace(/^改了：/, "").replace(/ 等 \d+ 处.*$/, "").split("；");
+  assert(shown.length === 4 && shown.every((s) => /^(夜市|环形摊廊|摊棚|灯串|夜市沿路灯柱|夜市火塘|夜市石径)/.test(s)), "前 4 处都是夜市那块：" + d.summary);
+  assert(d.summary.includes("摊棚 × 10 → × 18") && d.summary.includes("灯串 × 10 → × 18") && d.summary.includes("夜市沿路灯柱 新增"), d.summary);
+  assert(!d.items.some((it) => it.kind === "look" && ["atrium", "cells"].includes(it.id)), "没有假的样子变了 " + JSON.stringify(d.items.filter((it) => it.kind === "look")));
+  assert(!d.items.some((it) => it.kind === "move" && ["stalls", "lanterns", "tier_low", "tier_mid", "tier_high", "cells"].includes(it.id)), "个数变了带出的挪动不报 " + JSON.stringify(d.items.filter((it) => it.kind === "move")));
+  const ids = new Set(d.items.filter((it) => it.visible).map((it) => it.id)), m = /等 (\d+) 处/.exec(d.summary);
+  assert(m && Number(m[1]) === ids.size, `等 N 处 = 东西数 ${ids.size}：${d.summary}`);
+  // 「等 N 处」藏掉的也给得出来（界面点开看全部）：all 每处一行，cut = 摘要省略了
+  assert(d.cut === true && d.all.length === ids.size && d.all.some((s) => s.startsWith("夜市沿路灯柱")), "全部 " + JSON.stringify(d.all));
+  assert(diffCompiled(a, a, a.plan, a.plan).cut === false, "没省略 → cut=false");
+  // v6 第 2 轮验收后：圈选里排不下的重复由引擎收进圈里（缩间距 / 半径，记进 autofix），不再有块落到圈外
+  const fit = b.facts.plan.autofix.filter((x) => x.kind === "fit_area");
+  assert(fit.length >= 1 && !(d.outside || []).length && !d.summary.includes("超出了圈的范围"), "排不下的收进圈里 " + JSON.stringify({ fit, outside: d.outside }));
+  // 没有 focus：照样不报假的「样子变了」，新增排在挪动前面
+  const d0 = diffCompiled(a, b, a.plan, b.plan);
+  assert(!d0.items.some((it) => it.kind === "look" && ["atrium", "cells"].includes(it.id)) && d0.items.findIndex((it) => it.kind === "move") > d0.items.findIndex((it) => it.kind === "add"), d0.summary);
+  // 圈选的方位：相对主地标，不是猜的
+  const f = describeRef(a, a.plan, { kind: "mark", id: "mark_1" });
+  assert(f.facts.from_landmark && f.facts.from_landmark.id === "spire" && f.facts.from_landmark.dir === "西北" && f.facts.from_landmark.dist_m >= 80 && f.facts.from_landmark.dist_m <= 100, JSON.stringify(f.facts));
+  assert(f.text.includes("在中空圆塔西北") && JSON.stringify(f.facts).length <= 300, f.text);
+});
+
+test("手调高度的小鼓包（≤ 一层、上面没东西）不自动连支路，台地可达不报；台地标签按实际高度", () => {
+  const p = mini([{ id: "hall", type: "building", size_m: [20, 12, 16], at: "site.C" }]);
+  const e = heightEdit(p, { point_m: [-50, 50], delta_m: 3 }), r = compilePlan(e.plan, { seed: 1 });
+  assert(!r.sid.paths.some((q) => /^spur_/.test(q.id) && q.auto_spur), "没有自动支路 " + r.sid.paths.map((q) => q.id));
+  const t = r.T.terraces.find((q) => q.plan_id === e.opId);
+  assert(!t || Math.abs(t.height - 3) < 0.6, "台地高度 = 实际高度 " + (t && t.height));
+});
+
+// ============================================================ 坐标、确定性、SID
+test("worldToSite / siteToWorld：plan 编译出的 SID 是恒等；bounds 不居中的 SID 按中心平移，来回一致", () => {
+  const r = compilePlan(mini([{ type: "box", at: "site.C" }]));
+  assert(worldToSite(r.sid, [12.5, -3]).join() === "12.5,-3" && siteToWorld(r.sid, [12.5, -3]).join() === "12.5,-3", "恒等");
+  const sid = { bounds: { min: [0, 0, 0], max: [100, 40, 60] } };
+  assert(worldToSite(sid, [50, 30]).join() === "0,0" && siteToWorld(sid, [10, -5]).join() === "60,25", "平移");
+  const q = [33.3, 7.7]; const back = siteToWorld(sid, worldToSite(sid, q));
+  assert(dist(back, q) < 1e-9, "来回");
+});
+
+test("确定性：带标记 + 手调高度的 plan 两次编译 SID 一样；describeRef / diffCompiled 两次一样；标记不出体块，SID validate 0 error", () => {
+  let p = mini([{ id: "r", type: "repeat", pattern: "scatter", count: 9, area: "mark_1", child: { type: "tree", size_m: [4, 6] } }, { id: "path", type: "link", style: "path", along: "mark_2" }],
+    { marks: [{ type: "area", polygon_m: RECT }, { type: "trace", path_m: [[-70, 60], [0, 40], [60, 60]] }] });
+  p = heightEdit(p, { point_m: [50, -50], delta_m: 3 }).plan;
+  const a = compilePlan(p, { seed: 7 }), b = compilePlan(p, { seed: 7 });
+  assert(snapshot(a.sid) === snapshot(b.sid), "SID 一样");
+  assert(JSON.stringify(describeRef(a, a.plan, { kind: "mark", id: "mark_1" })) === JSON.stringify(describeRef(b, b.plan, { kind: "mark", id: "mark_1" })), "describeRef 一样");
+  assert(JSON.stringify(diffCompiled(a, b)) === JSON.stringify(diffCompiled(a, b)), "diff 一样");
+  assert(a.sid.meta.marks.length === 3 && a.sid.meta.marks.map((m) => m.id).join() === "mark_1,mark_2,mark_3", "meta.marks " + JSON.stringify(a.sid.meta.marks));
+  assert(!a.sid.volumes.some((v) => String(v.plan_id).startsWith("mark_")), "标记不出体块");
+  assert(errs(a).length === 0, "validate " + errs(a).map((e) => e.msg));
+});
+
+// ============================================================ v6 第 2 轮验收：「还是太空了」加密度后放不下圈选 / 同心环被挤散 / 摘要藏了被挤动的
+test("圈选里的直线 / 网格 / 放射重复排不下：引擎缩间距（缩到挨着还放不下就少放几个）收进圈里，记进 autofix；放得下的不动", () => {
+  const mk = (stall, lamp, grid) => mini([{ id: "market", type: "group", label: "夜市", at: "mark_1", children: [
+    { id: "stalls", type: "repeat", pattern: "linear", axis: "z", count: stall[0], spacing_m: stall[1], offset_m: [-10, 0], child: { type: "box", label: "摊位", size_m: [4, 3, 3] } },
+    { id: "lamps", type: "repeat", pattern: "radial", count: 10, radius_m: lamp, offset_m: [20, 0], child: { type: "column", label: "灯柱", size_m: [1, 5] } },
+    { id: "tables", type: "repeat", pattern: "grid", rows: grid[0], cols: grid[1], spacing_m: [6, 6], offset_m: [-25, 0], child: { type: "box", label: "桌", size_m: [2, 1, 2] } }] }],
+    { marks: [{ type: "area", polygon_m: RECT }] });
+  const ok = compilePlan(mk([6, 6], 8, [3, 2]), { seed: 3 });
+  assert(!ok.facts.plan.autofix.some((x) => x.kind === "fit_area"), "放得下：不收 " + JSON.stringify(ok.facts.plan.autofix));
+  const r = compilePlan(mk([14, 5.5], 30, [9, 2]), { seed: 3 }), fx = r.facts.plan.autofix.filter((x) => x.kind === "fit_area");
+  assert(fx.some((x) => x.id === "stalls") && fx.some((x) => x.id === "lamps" && /半径/.test(x.how)) && fx.some((x) => x.id === "tables" && /行距/.test(x.how)), JSON.stringify(fx));
+  assert(/放进「圈选 1」/.test(fx[0].text), fx[0].text);
+  const out = r.sid.volumes.filter((v) => ["stalls", "lamps", "tables"].some((id) => (v.instance_of || v.plan_id || "").startsWith(id)) && !pointInPolygon(xz(v.position), RECT));
+  assert(!out.length, "全在圈里 " + out.map((v) => v.id + "@" + xz(v.position)).join(" "));
+  const n = r.sid.volumes.filter((v) => String(v.plan_id).startsWith("stalls[")).length;
+  assert(n >= 10 && n <= 14, "摊位放了 " + n + " 个（排不下才少放）");
+  const d = diffCompiled(compilePlan(mk([8, 6], 8, [3, 2]), { seed: 3 }), r);
+  assert(!(d.outside || []).length && !/超出了圈的范围/.test(d.summary), d.summary);
+});
+test("同心的一层层环廊：环带压到上一层的小笼子、或自己的小笼子撞了，最多按带宽 / 那一件的尺寸推，整圈不被推走（推不开就报告）", () => {
+  const ring = (id, d, elev, n) => ({ id, type: "cylinder", label: id, size_m: [d, 4], hollow: true, wall_m: 6, elev_m: elev, children: [{ id: id + "_c", type: "repeat", pattern: "radial", count: n, radius_m: d / 2 + 3, face: "out", child: { type: "box", label: "笼", size_m: [6, 5, 4], ground: "float" } }] });
+  for (const n of [3, 6]) {
+    const r = compilePlan(mini([{ id: "spiral", type: "group", label: "螺旋", at: "site.C", children: [ring("r1", 46, 0, n), ring("r2", 52, 3.5, n), ring("r3", 58, 7.5, n)] }]), { seed: 1 });
+    const c = (id) => xz(r.sid.volumes.find((v) => v.plan_id === id).position);
+    for (const id of ["r2", "r3"]) assert(dist(c(id), c("r1")) <= 3.01, `${n} 个笼：${id} 离同心 ${dist(c(id), c("r1")).toFixed(1)} m`);
+  }
+});
+test("改动摘要：没改定义、被别人长大挤走的节点 =「顺带被挤动：…」排在最前面（kind bump），不藏在「等 N 处」里", () => {
+  const mk = (w) => mini([{ id: "big", type: "box", label: "大殿", at: "site.C", size_m: [w, 8, 10] }, { id: "hut", type: "box", label: "小屋", at: "site.C", offset_m: [18, 0], size_m: [10, 5, 10] }]);
+  const a = compilePlan(mk(10), { seed: 1 }), b = compilePlan(mk(30), { seed: 1 }), d = diffCompiled(a, b, a.plan, b.plan);
+  const it = d.items.find((x) => x.id === "hut");
+  assert(it && it.kind === "bump" && d.items[0].id === "hut" && /^被挤动 \d+ m/.test(it.change), JSON.stringify(d.items));
+  assert(/^顺带被挤动：小屋 \d+ m（往.+）；改了：大殿/.test(d.summary), d.summary);
+  const d2 = diffCompiled({ sid: a.sid, T: a.T }, { sid: b.sid, T: b.T }, a.plan, b.plan);
+  assert(!d2.items.some((x) => x.kind === "bump"), "不带 facts 时看不出谁被挤：照旧记「挪了」");
+});
+
+run();
+</script>

@@ -2,7 +2,10 @@
 // 状态只有 store：plan（AI 写的场景程序：形体 / 组 / 重复 / 连接 / 生成器 + 地形雕刻，局部尺寸与偏移，没有全局坐标）+ 视图状态。
 // plan 一变 → compilePlan → 渲染。人在图上拖 = 改节点的 offset_m（在父组坐标里反算），在剖面里拖 = 改 elev_m / 尺寸 / 深度；
 // 画路 = 加一条连接（两头吸到最近的节点），圈区域 = 加一个生成器 / 空间。全部本地、可撤销；只有「发送 / 重出 / 换一批」调 AI。
-import { compilePlan, applyOps, normalizePlan, resolveTarget, offsetFromPoint, findNode, expand, newElement, distinctPlans, PLAN_SCHEMA } from "./engine/plan.js";
+// v6（docs/07）：加到对话（引用卡片 → refs、对话历史 → history、改动摘要 diffCompiled）；圈 / 画 / 点 = 人给的标记（plan.marks）；
+// 「高度」工具与剖面地面线随意选点调高度（heightEdit，拖动中临时编译只更新 3D 小窗）；场景会话（/api/scenes，1.5 s 防抖自动存，
+// 服务不可用时退回 localStorage）；用户记忆（/api/memory，AI 的 memory_suggestions 跟着原有调用回来，不额外调 AI）。
+import { compilePlan, applyOps, normalizePlan, resolveTarget, offsetFromPoint, findNode, expand, newElement, distinctPlans, PLAN_SCHEMA, updateMark, heightEdit, worldToSite, diffCompiled } from "./engine/plan.js";
 import { levelsOf, LAYOUT_LABEL, SKY_LAYOUT_LABEL, STRATUM_LABEL, INTERIOR_LAYOUTS } from "./engine/interior.js";
 import { defaultSection, sampleSection, widthClamp, rotateSection } from "./engine/section.js";
 import { classifyStroke, strokeToPolygon } from "./engine/strokes.js";
@@ -10,7 +13,9 @@ import { polygonCentroid } from "./engine/terrain.js";
 import * as MapView from "./views/map.js";
 import * as ProfileView from "./views/profile.js";
 import * as EyeView from "./views/eye.js";
-import { el, renderSide, refreshAI, openSettings, markPill, bindSettings, openExport, closeModal, diffButtons, sectionTo, buildBrief, buildPackage, exportSid } from "./ui.js";
+import { el, renderSide, refreshAI, openSettings, markPill, bindSettings, openExport, closeModal, diffButtons, sectionTo, buildBrief, buildPackage, exportSid, renderRefs, bindComposer, describe, refLabel, refOf, addRef, takeRefs, newMark, markOf, pinHere, moveMark, removeMarkLocal, dropMark, clearInside } from "./ui.js";
+import * as S from "./session.js";
+import { markDirty, refreshMemory, memRemember, memSuggest } from "./session.js";
 
 const $ = (s) => document.querySelector(s);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
@@ -36,6 +41,9 @@ export const store = {
   insetOn: local("scene.inset.on", false), insetMin: local("scene.inset.min", false), three: null, inset: null,
   diffs: [], readback: null, corrections: [], reference: null, board: null,
   undo: [], redo: [],
+  refs: [], lastRefs: [], chat: [], history: [], localFx: [],              // 加到对话：引用卡片、上一轮的引用（接着说时带上）、聊天记录、给 AI 的历史、两次说话之间的本地改动
+  sceneId: null, sceneName: "", scenes: [], storeMode: "server", ns: "", booted: false, // 场景会话
+  memory: [], liveN: 0,                                                   // 记忆；拖动预览计数（测试用）
 };
 
 // ============================================================ 编译
@@ -113,7 +121,8 @@ export function edit(label, fn, { actions = [], geometry = true } = {}) {
   const text = typeof label === "function" ? label(res) : label;
   if (snap() === before) { render(); note(text); return false; }
   store.undo.push({ snap: before, label: text }); if (store.undo.length > 50) store.undo.shift(); store.redo = [];
-  render(); note(text, { undo: true, actions });
+  if (!store.aiApplying && geometry) { store.localFx.push(short(text, 40)); if (store.localFx.length > 8) store.localFx.shift(); }
+  render(); note(text, { undo: true, actions }); markDirty();
   return true;
 }
 /** 场景程序的改动（set / add / remove，作用在树上），本地 */
@@ -123,9 +132,10 @@ export function planOps(label, ops, opts) {
 export function undo() {
   const e = store.undo.pop(); if (!e) { note("没有可撤销的了"); return; }
   store.redo.push({ snap: snap(), label: e.label }); put(e.snap); store.comparing = false; if (store.step === 2) store.step = 3;
-  render(); note(`撤销：${e.label}`, { actions: [{ label: "重做", fn: redo }] });
+  store.localFx.push(`撤销了「${short(e.label, 30)}」`);
+  render(); note(`撤销：${e.label}`, { actions: [{ label: "重做", fn: redo }] }); markDirty();
 }
-export function redo() { const e = store.redo.pop(); if (!e) { note("没有可重做的了"); return; } store.undo.push({ snap: snap(), label: e.label }); put(e.snap); render(); note(`重做：${e.label}`, { undo: true }); }
+export function redo() { const e = store.redo.pop(); if (!e) { note("没有可重做的了"); return; } store.undo.push({ snap: snap(), label: e.label }); put(e.snap); render(); note(`重做：${e.label}`, { undo: true }); markDirty(); }
 /** 检查的修法：ops 直接改程序；「不重要」记下；引擎修法（改 SID 的 patch）留不住 → 记下它要忽略的，否则换个种子重排 */
 export function applyFix(c, i) {
   const f = c.fixes && c.fixes[i]; if (!f) return;
@@ -146,6 +156,7 @@ export const PARTS = new Set(["passage", "room", "entrance", "goal", "link", "co
 /** 选中（null 取消）：树里的项展开（祖先也展开）；实例记下 inst；空间切到它那一层 */
 export function select(t) {
   if (!t) { store.sel = null; render(); return; }
+  if (t.type === "mark") { const id = t.mark_id || t.id; store.sel = { type: "mark", mark_id: id, plan_id: null, sid_id: null }; store.closed.delete("marks"); store.open.add(id); render(); return; }
   const v = t.sid_id && volOf(t.sid_id), inst = (v && instanceIdOf(v)) || (INST.test(t.plan_id || "") ? t.plan_id : null);
   const tid = treeIdOf((v && v.plan_id) || t.plan_id) || treeIdOf(t.plan_id);
   store.sel = { type: t.type || null, plan_id: tid || t.plan_id || null, sid_id: t.sid_id || null, part: t.part || null, index: t.index ?? null, p: t.p || null, inst: PARTS.has(t.type) ? null : inst };
@@ -158,9 +169,16 @@ export function select(t) {
   }
   render();
 }
-export function setView(v) { if (v !== store.view) note(null); store.view = v; hidePopup(); renderViews(); }
-const TOOL_TIP = { move: "拖形体 / 组 / 地形块 / 空间 / 出生点 = 改它的偏移（按住 Alt 拖重复里的一个 = 只挪这一个）", path: "画一笔 = 加一条连接：两头吸到最近的节点", region: "圈一块 = 加一个生成器（树林 / 田 / 撒房子 / 水池 / 平台）；在地下 / 天上层圈 = 新建一个空间", section: "在图上拉一条线做剖切（15° 吸附，按住 Alt 不吸附）", erase: "点掉一个节点 / 地形块 / 连接；点重复里的一个 = 只去掉这一个" };
-export function setTool(t) { if (!TOOL_TIP[t]) t = "move"; store.tool = t; if (t !== "move" && store.view !== "map") store.view = "map"; renderViews(); if (t !== "move") note(TOOL_TIP[t]); }
+export function setView(v) { if (v !== store.view) note(null); store.view = v; hidePopup(); renderViews(); markDirty(); }
+const TOOL_TIP = { move: "拖形体 / 组 / 地形块 / 空间 / 出生点 = 改它的偏移（按住 Alt 拖重复里的一个 = 只挪这一个）", path: "画一笔 → 加到对话（手绘线），或直接连成一条路", region: "圈一块 = 加到对话，再说这块要做成什么；在地下 / 天上层圈 = 新建一个空间", section: "在图上拉一条线做剖切（15° 吸附，按住 Alt 不吸附）", erase: "点掉一个节点 / 地形块 / 连接 / 标记；点重复里的一个 = 只去掉这一个",
+  height: "在地面任意一点按下、上下拖 = 抬高 / 压低；滚轮或 [ ] 调半径，Shift 削平到按下点，Alt 只压低；按在图钉上 = 接着改它" };
+export function setTool(t) {
+  if (!TOOL_TIP[t]) t = "move";
+  store.tool = t; if (t !== "move" && store.view !== "map") store.view = "map";
+  // 调高度要看 3D 小窗实时变：没开着就先开成收起的一条（不挡图上要按的地方），第一次按下拖动时再展开（onHeightStart）
+  if (t === "height") { if (!insetShown()) { store.insetOn = true; store.insetMin = true; } if (store.stratum !== "ground") store.stratum = "ground"; }
+  renderViews(); if (t !== "move") note(TOOL_TIP[t]);
+}
 export function setStratum(st) {
   store.stratum = st;
   const sp = store.sel && store.sid && spaceOf(store.sel);
@@ -174,7 +192,9 @@ const maxLevels = (st) => Math.max(1, ...((store.sid && store.sid.spaces) || [])
 export function levelName(s, n) { return n <= 1 ? "" : s === n - 1 ? "上层" : s === 0 ? "下层" : "中层"; }
 export function sOf(space, k) { const n = levelsOf(space), kk = clamp(k | 0, 0, n - 1); return space.stratum === "sky" ? kk : n - 1 - kk; }
 export const kName = (k) => (k === 0 ? "入口层" : `第 ${k + 1} 层`);
-function setStep(n) { store.step = n; syncChrome(); if (n >= 3) $("#input").placeholder = "说一句要改的，如「法师塔多两座」「书库再飘高一点」「加一座钟楼」"; }
+const PH = ["说一句，比如「我要生成魔法学院」「海盗港口，地下有溶洞」", "说一句要改的，如「法师塔多两座」「书库再飘高一点」；@ 点名、图上右键「加到对话」"];
+export const placeholder = (t) => { $("#input").placeholder = t || PH[store.step >= 3 ? 1 : 0]; };
+function setStep(n) { store.step = n; syncChrome(); placeholder(); }
 
 // ============================================================ 提示条 / 小弹窗
 let noteTimer = null;
@@ -200,12 +220,13 @@ export function hidePopup() { $("#popup").hidden = true; }
 const chip = (label, on, cls = "chip") => el("button", { type: "button", class: cls, onclick: on }, label);
 
 // ============================================================ 渲染（中栏）
-export function render() { renderViews(); renderSide(); }
+export function render() { renderViews(); renderSide(); renderRefs(); }
 /** 视图共用的上下文（视图是纯函数：数据进、DOM 出、回调出）。选中按场景树的项高亮整组；空间内部的部件按 sid_id / part */
 export function ctx(extra = {}) {
   const s = store.sel;
   let selected = null;
-  if (s && (PARTS.has(s.type) || s.type === "space")) selected = { plan_id: s.plan_id || undefined, sid_id: s.sid_id || undefined, part: s.part || undefined, type: s.type || undefined };
+  if (s && s.type === "mark") selected = { type: "mark", mark_id: s.mark_id, id: s.mark_id };
+  else if (s && (PARTS.has(s.type) || s.type === "space")) selected = { plan_id: s.plan_id || undefined, sid_id: s.sid_id || undefined, part: s.part || undefined, type: s.type || undefined };
   else if (s && s.plan_id) selected = { plan_id: hlId(s.plan_id), type: s.type || undefined };
   return Object.assign({ sid: store.sid, T: store.T, facts: store.facts, checks: store.checks, plan: store.plan, index: store.index, stratum: store.stratum, interiorLevel: store.interiorLevel,
     section: sectionSpec(), selected, diffs: store.diffs, tool: store.tool, eye: store.eye, sectionHandles: store.tool === "move" || store.tool === "section" }, extra);
@@ -279,16 +300,16 @@ function mount3d(host, inset) {
   if (!views3d.has(key)) views3d.set(key, import("./views/view3d.js").then((m) => m.mountView3d(host, ctx(), { inset })).then((v) => { store[inset ? "inset" : "three"] = v; return v; }).catch((e) => { views3d.delete(key); note("3D 没加载成功：" + ((e && e.message) || e)); return null; }));
   return views3d.get(key);
 }
-let INSET = null, corner = 0;
+let INSET = null, corner = 2; // 默认右下：左上常是人刚圈的那块 / 场景树一侧
 const insetEl = () => INSET || (INSET = $("#inset3d"));
 export const insetMode = () => (!store.insetOn || !store.plan || store.comparing ? null : store.view === "map" ? "float" : store.view === "profile" ? "dock" : null);
 const insetShown = () => { const m = insetMode(); return !!m && !(m === "float" && store.insetMin); };
 function placeInset(box) {
   const host = $("#views"), W = host.clientWidth, H = host.clientHeight, w = box.offsetWidth || 320, h = box.offsetHeight || 240;
   let p = local("scene.inset.pos", null);
-  if (!p) { // 人没拖过：在四个角里挑挡住选中 / 地标 / 入口最少的那个
+  if (!p) { // 人没拖过：默认右下；在四个角里挑挡住选中 / 标记（圈 / 画 / 点）/ 刚改的 / 地标 / 入口最少的那个
     const left = host.classList.contains("has-switch") ? 64 : 12, xs = [left, left, W - w - 12, W - w - 12], ys = [46, H - h - 12, H - h - 12, 46], hr = host.getBoundingClientRect();
-    const keep = mapSvg && mapSvg.isConnected ? [...mapSvg.querySelectorAll(".selection, .landmark, .spawn, [data-section-label]")].map((n) => n.getBoundingClientRect()).filter((r) => r.width || r.height) : [];
+    const keep = mapSvg && mapSvg.isConnected ? [...mapSvg.querySelectorAll(".selection, .mark, .diffs > *, .landmark, .spawn, [data-section-label], .height-brush")].map((n) => n.getBoundingClientRect()).filter((r) => r.width || r.height) : [];
     const cost = (i) => keep.reduce((a, r) => a + Math.max(0, Math.min(r.right - hr.left, xs[i] + w) - Math.max(r.left - hr.left, xs[i])) * Math.max(0, Math.min(r.bottom - hr.top, ys[i] + h) - Math.max(r.top - hr.top, ys[i])), 0);
     if (cost(corner) > 0) for (let i = 0; i < 4; i++) if (cost(i) < cost(corner)) corner = i;
     p = { x: xs[corner], y: ys[corner] };
@@ -376,12 +397,37 @@ function showCompare() {
 // ============================================================ 聊天（只用来和 AI 说话；本地操作不写这里）
 export const aiTag = () => el("span", { class: "ai-tag", title: "点了会调用 AI" }, "调 AI");
 function scrollLog(m) { const log = $("#log"); if (log.scrollHeight - log.scrollTop - log.clientHeight < 80 || log.lastElementChild === m) log.scrollTop = 1e9; }
-export function msg(who, text, attach) {
-  const m = el("div", { class: "msg " + who }, who === "sys" ? null : el("div", { class: "who" }, who === "ai" ? "AI" : "你"), text);
-  if (attach) m.append(el("div", { class: "attach" }, attach));
-  $("#log").append(m); scrollLog(m); return m;
+/** 一条消息的内容：谁 + 引用小标 + 正文 + 改动摘要；你和 AI 的话旁边有「记住这个」 */
+/** 改动摘要：「等 N 处」省略了的，旁边一个「全部 N 处」点开看每一处（悬停也看得到） */
+function effectEl(effect, fxVisible, all) {
+  const box = el("div", { class: "effect" + (fxVisible === false ? " none" : "") }, effect);
+  if (Array.isArray(all) && all.length) { box.title = all.join("\n"); box.append(" ", el("details", { class: "fx-all" }, el("summary", {}, `全部 ${all.length} 处`), el("ul", {}, ...all.map((t) => el("li", {}, t))))); }
+  return box;
 }
-export const sys = (t) => msg("sys", t);
+const fxLog = (o) => (o.effect ? Object.assign({ effect: o.effect, fxVisible: o.fxVisible }, Array.isArray(o.effectAll) && o.effectAll.length ? { effectAll: o.effectAll } : {}) : {});
+function bubble(m, who, text, { refs, effect, fxVisible, effectAll, mem: memOk = true } = {}) {
+  const mem = memOk && who !== "sys" && typeof text === "string" && text.trim().length >= 2 ? el("button", { type: "button", class: "mem-btn", title: "把这句话存成跨场景的偏好（记忆面板里可以改 / 关掉）", onclick: (e) => { e.stopPropagation(); memRemember(text, e.currentTarget); } }, "记住这个") : null;
+  m.replaceChildren(...[who === "sys" ? null : el("div", { class: "who" }, who === "ai" ? "AI" : "你", mem),
+    refs && refs.length ? el("div", { class: "refchips" }, refs.map((r) => el("span", { class: "refchip" }, r))) : null, text,
+    effect ? effectEl(effect, fxVisible, effectAll) : null].filter(Boolean));
+}
+/** 写一条消息；keep=false 不进场景的聊天记录（欢迎语、要不要记住这类一次性的） */
+export function msg(who, text, attach, opts = {}) {
+  const m = el("div", { class: "msg " + who });
+  bubble(m, who, text, opts);
+  if (attach) m.append(el("div", { class: "attach" }, attach));
+  $("#log").append(m); scrollLog(m);
+  if (opts.keep !== false && typeof text === "string") logChat(Object.assign({ who, text }, opts.refs && opts.refs.length ? { refs: opts.refs } : {}, fxLog(opts)));
+  return m;
+}
+export const sys = (t, keep) => msg("sys", t, null, { keep });
+function logChat(e) { store.chat.push(Object.assign({ t: Date.now() }, e)); if (store.chat.length > 300) store.chat.splice(0, store.chat.length - 300); markDirty(); }
+/** 换场景时：按存下的聊天记录重画聊天栏（按钮类的附件不恢复） */
+function renderChat() {
+  $("#log").replaceChildren();
+  for (const e of store.chat) msg(e.who, e.text, null, Object.assign({}, e, { keep: false }));
+  if (!store.chat.length) msg("ai", "说一句你想要的场景：我先想三个空间组织不同的概念，再各写成一段场景程序。之后在图上拖、圈、画，或右键「加到对话」再说；只有说话、重出、换一批会调 AI。", null, { keep: false, mem: false });
+}
 function settle(btn) { const box = btn && btn.closest(".attach, .msg"); if (box) box.querySelectorAll("button").forEach((b) => { b.disabled = true; }); if (btn) btn.classList.add("on"); }
 function chips(labels, onPick, { tag } = {}) { return el("div", { class: "chiprow" }, ...labels.map((l) => el("button", { type: "button", class: "chip", onclick: (ev) => { settle(ev.currentTarget); onPick(l); } }, l, tag && tag(l) ? aiTag() : null))); }
 const ERR_TEXT = { offline: "本地服务没响应（它关了？）", auth: "密钥无效或过期", model: "模型名不对", rate: "请求太频繁或余额不足", busy: "模型繁忙", timeout: "等太久了（超过时限没回来）", net: "连不上 AI 服务商（网络 / 代理）", server: "服务出错" };
@@ -392,7 +438,7 @@ function thinking(t, onCancel) {
   const t0 = Date.now(), tick = setInterval(() => { const s = Math.round((Date.now() - t0) / 1000); if (s >= 3) sec.textContent = ` ${s} s`; }, 1000);
   const stop = () => { clearInterval(tick); m.classList.remove("thinking"); };
   return {
-    done(text, attach) { stop(); m.replaceChildren(el("div", { class: "who" }, "AI"), text); if (attach) m.append(el("div", { class: "attach" }, attach)); scrollLog(m); },
+    done(text, attach, opts = {}) { stop(); bubble(m, "ai", text, opts); if (attach) m.append(el("div", { class: "attach" }, attach)); scrollLog(m); logChat(Object.assign({ who: "ai", text }, fxLog(opts))); },
     fail(e, retry) {
       stop();
       if (e && e.kind === "cancel") { m.className = "msg sys"; m.replaceChildren("已取消。"); return; }
@@ -410,13 +456,17 @@ const PROV = { deepseek: "DeepSeek", claude: "Claude", anthropic: "Claude", mock
 const fmtK = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0));
 /** 一次 AI 动作一行（draft 是三步：构思 + 3 份展开，合计）：「DeepSeek flash · 构思 + 展开 ×3 · 21.4 s · 18.2k token · ¥0.012」；模拟写「不花钱」 */
 export function usageLine(d) {
-  if (!d) return;
+  if (!d || d.provider === "local") return; // 整句是「记住…」：没调 AI
   const u = d._usage || {}, ms = d._ms ?? u.ms ?? 0, steps = Array.isArray(d._steps) ? d._steps : [];
-  const nEx = steps.filter((s) => s.step === "expand").length, how = steps.some((s) => s.step === "concepts") ? `构思 + 展开 ×${nEx || 3}` : "";
+  // 展开只数真调了模型的那几张；调用上限 / 失败时模拟 AI 补位的另外写（「展开 ×0（3 张模拟补位）」）
+  const src = Array.isArray(d.sources) && d.sources.length ? d.sources : steps.filter((s) => s.step === "expand").map((s) => s.provider);
+  const nReal = d.provider === "mock" ? src.length || 3 : src.filter((x) => x && x !== "mock").length, nFill = d.provider === "mock" ? 0 : src.length - nReal;
+  const how = steps.some((s) => s.step === "concepts") ? `构思 + 展开 ×${nReal}${nFill ? `（${nFill} 张模拟补位）` : ""}` : "";
   const who = `${PROV[d.provider] || d.provider || "AI"}${d.provider !== "mock" && u.model ? " " + String(u.model).replace(/^deepseek-|^claude-/, "") : ""}`;
-  if (d.provider === "mock") { sys([who, how, `${(ms / 1000).toFixed(1)} s`, "不花钱"].filter(Boolean).join(" · ")); return; }
+  const mem = (u.memory_ids || []).length ? `用了 ${u.memory_ids.length} 条偏好` : "";
+  if (d.provider === "mock") { sys([who, how, `${(ms / 1000).toFixed(1)} s`, "不花钱", mem].filter(Boolean).join(" · ")); return; }
   const cost = u.cost_cny != null ? (u.cost_cny < 0.001 ? "<¥0.001" : `¥${u.cost_cny.toFixed(3)}`) : u.cost_usd != null ? `$${u.cost_usd.toFixed(3)}` : "";
-  sys([who, how, `${(ms / 1000).toFixed(1)} s`, `${fmtK((u.input || 0) + (u.output || 0))} token`, cost].filter(Boolean).join(" · "));
+  sys([who, how, `${(ms / 1000).toFixed(1)} s`, `${fmtK((u.input || 0) + (u.output || 0))} token`, cost, mem].filter(Boolean).join(" · "));
 }
 /** 服务端从这句话里读出的硬条件：「按你的话锁定：迷宫、浮岛（三张都照办）」 */
 function lockedLine(d, three = true) {
@@ -427,7 +477,7 @@ function lockedLine(d, three = true) {
 }
 
 // ============================================================ /api（本地 Python 服务；密钥不经过这里）
-async function call(method, path, body, { timeoutMs = 30000, signal } = {}) {
+export async function call(method, path, body, { timeoutMs = 30000, signal } = {}) {
   const ac = new AbortController(), t = setTimeout(() => ac.abort("timeout"), timeoutMs);
   if (signal) { if (signal.aborted) ac.abort("cancel"); else signal.addEventListener("abort", () => ac.abort("cancel"), { once: true }); }
   let res;
@@ -453,41 +503,58 @@ export const API = {
   config: () => call("GET", "/api/config", null, { timeoutMs: 10000 }),
   setConfig: (patch) => call("POST", "/api/config", patch),
   testKey: (api_key, opts = {}) => call("POST", "/api/config/test", Object.assign(api_key ? { api_key } : {}, opts), { timeoutMs: 45000 }),
-  draft: (intent, { locked = null, variant = 0 } = {}, signal) => once(() => call("POST", "/api/ai/draft", Object.assign({ intent, variant }, locked ? { locked } : {}, store.mock ? { force_mock: true } : {}), { timeoutMs: 240000, signal })),
-  revise: (plan, text, signal) => once(() => call("POST", "/api/ai/revise", Object.assign({ plan, action: { type: "text", text }, locked: { ids: plan.locks || [] } }, store.mock ? { force_mock: true } : {}), { timeoutMs: 90000, signal })),
+  draft: (intent, { locked = null, variant = 0 } = {}, signal) => once(() => call("POST", "/api/ai/draft", Object.assign({ intent, variant }, locked ? { locked } : {}, sceneArg(), store.mock ? { force_mock: true } : {}), { timeoutMs: 240000, signal })),
+  /** extra = { refs, history }（docs/07 §1.2） */
+  revise: (plan, text, signal, extra = {}) => once(() => call("POST", "/api/ai/revise", Object.assign({ plan, action: { type: "text", text }, locked: { ids: plan.locks || [] } }, extra, sceneArg(), store.mock ? { force_mock: true } : {}), { timeoutMs: 90000, signal })),
   validate: (doc, schema = "sid") => call("POST", "/api/validate", { doc, schema }, { timeoutMs: 30000 }),
   score: (intent, readback) => call("POST", "/api/score", { intent, readback, auto_map: true }),
 };
+const sceneArg = () => (store.sceneId && store.storeMode === "server" ? { scene_id: store.sceneId } : {});
 
 // ============================================================ 说 / 选 / 改（调 AI 的只有这三处：发送、重出、换一批）
 function busy(on) { store.busy = Math.max(0, store.busy + (on ? 1 : -1)); document.body.classList.toggle("busy", store.busy > 0); $("#send-label").textContent = store.busy > 0 ? "排队" : "发送"; }
 function flush() { if (!store.busy && store.pending) { const q = store.pending; store.pending = null; say(q); } }
 export function say(t) {
   if (store.busy) { store.pending = t; sys("AI 还在想，这句排在后面。"); return; }
-  msg("user", t);
-  if (store.plan && !store.comparing) onText(t); else onIntent(t);
+  placeholder();
+  if (store.plan && !store.comparing) { const refs = takeRefs(t); msg("user", t, null, { refs: refs.map((r) => r.label) }); onText(t, refs); }
+  else { msg("user", t); onIntent(t); }
 }
+/** 接着上一轮说的话（没加引用时带上上一轮的引用）：还是 / 再 / 更 / 太 / 又 / 多一点 / 这 / 那 / 它… */
+const FOLLOW_RE = /还是|还不?够|再|更|太|又|继续|接着|[多少大小高低密疏宽窄长短亮暗]一?点|这|那|它|没改|没变/;
+/** 给 AI 的历史（只有当前场景的，最近 10 轮 = 20 条；长的压成一句） */
+function pushHistory(h) { store.history.push(Object.assign({}, h, { text: short(h.text, 160) })); if (store.history.length > 20) store.history.splice(0, store.history.length - 20); }
 function setCards(d, locked = 0) {
   const plans = d.plans.map((p) => normalizePlan(p).plan);
   store.cards = { plans, concepts: d.concepts || [], diversity: d.diversity || null, compiled: plans.map(compileCard), locked };
 }
+/** AI 回包里和记忆有关的：存下了 → 刷新记忆；建议 → 「要记住吗：… [记住] [不用]」 */
+function memoryAfter(d) {
+  if (d.memory_saved && d.memory_saved.length) refreshMemory();
+  for (const s of d.memory_suggestions || []) memSuggest(s);
+}
 export async function onIntent(text, variant = 0) {
-  store.intent = text;
   const ac = new AbortController(), th = thinking("先想三个空间组织不同的概念，再各写成一段场景程序", () => ac.abort());
   busy(true);
   try {
+    await S.ensureScene();
     const d = await API.draft(text, { variant }, ac.signal);
+    if (!(d.plans || []).length && d.memory_note) { th.done(d.memory_note); memoryAfter(d); return; } // 整句是「记住…」：只存记忆，不出卡
+    store.intent = text;
     setCards(d);
-    th.done(`三个概念：${store.cards.concepts.map((c, i) => c.name || store.cards.plans[i].name).join(" / ")}。点一个就开始改。`);
+    const said = `三个概念：${store.cards.concepts.map((c, i) => c.name || store.cards.plans[i].name).join(" / ")}。点一个就开始改。`;
+    th.done(said);
+    pushHistory({ role: "user", text }); pushHistory({ role: "ai", text: said, ops: 0 });
+    if (d.memory_note) sys(d.memory_note);
     lockedLine(d);
     if (d.warnings && d.warnings.length) sys(`有 ${d.warnings.length} 处引用对不上，已就近处理。`);
     if (d._concepts_fallback) sys("构思那一步没用上 AI 的回答，概念改用了本地的。");
-    usageLine(d);
-    setStep(2); showCompare();
+    usageLine(d); memoryAfter(d);
+    setStep(2); showCompare(); markDirty();
   } catch (e) { th.fail(e, () => onIntent(text, variant)); } finally { busy(false); flush(); }
 }
 function redraft() { if (!store.intent) return; store.variantN += 1; msg("user", "三个都不要，重出"); onIntent(store.intent, store.variantN); }
-function fresh(s) { s.comparing = false; s.sel = null; s.diffs = []; s.readback = null; s.corrections = []; s.step = 3; s.section = null; s.ignored = []; s.open = new Set(); s.collapsed = new Set(); s.stratum = "ground"; s.interiorLevel = 0; }
+function fresh(s) { s.comparing = false; s.sel = null; s.diffs = []; s.readback = null; s.corrections = []; s.step = 3; s.section = null; s.ignored = []; s.open = new Set(); s.collapsed = new Set(); s.stratum = "ground"; s.interiorLevel = 0; s.refs = []; s.lastRefs = []; }
 export function pick(i) {
   const C = store.cards, plan = C && C.plans[i];
   if (!plan) return;
@@ -495,12 +562,12 @@ export function pick(i) {
   setStep(3);
   if (!store.plan) {
     store.plan = clone(plan); fresh(store); store.undo = []; store.redo = [];
-    const r = C.compiled[i]; if (r) Object.assign(store, { plan: r.plan, sid: r.sid, T: r.T, checks: r.checks, facts: r.facts, index: r.index, warnings: r.warnings }); else recompute();
-    render(); note(`选了「${name}」`); return;
+    const r = C.compiled && C.compiled[i]; if (r) Object.assign(store, { plan: r.plan, sid: r.sid, T: r.T, checks: r.checks, facts: r.facts, index: r.index, warnings: r.warnings }); else recompute();
+    render(); note(`选了「${name}」`); markDirty(); return;
   }
   edit(`换成「${name}」`, (s) => { s.plan = clone(plan); fresh(s); });
 }
-function keepCurrent() { store.comparing = false; setStep(3); render(); }
+function keepCurrent() { store.comparing = false; setStep(3); render(); markDirty(); }
 /** 打开一段示例程序（本地，不调 AI；可撤销） */
 export async function loadExample(key) {
   const file = SAMPLES[key] || key;
@@ -515,33 +582,62 @@ export async function loadExample(key) {
   return true;
 }
 
-/** 改：一句话 → AI 回程序的 ops（set / add / remove）→ 本地应用（锁住的项不动、可撤销） */
-async function onText(t) {
+/** 改：一句话（+ 引用卡片 + 历史）→ AI 回程序的 ops（set / add / remove）→ 本地应用（锁住的项不动、可撤销）→ 改动摘要 */
+async function onText(t, refs = []) {
   const plan0 = store.plan, ac = new AbortController();
   if (store.inflight) store.inflight.abort();
   store.inflight = ac;
+  // 两次说话之间人在图上做的本地改动，作为一条「你」的历史带给 AI
+  if (store.localFx.length) { pushHistory({ role: "user", text: `（我在图上改了：${store.localFx.slice(-5).join("；")}）` }); store.localFx = []; }
+  const history = store.history.slice(-20);
+  // 这句没加引用、又是接着说的（「还是太空了」「再密一点」「这里…」）：把上一轮的引用带上（carried，事实重新算），AI 才知道还是那一块；
+  // 不是接着说的就不带，也不再往后传
+  let sent = refs;
+  if (!refs.length && (store.lastRefs || []).length && FOLLOW_RE.test(t)) {
+    sent = store.lastRefs.map((r) => { const d = describe(r); return d.facts && !d.facts.missing ? Object.assign({}, r, { facts: d.facts, carried: true }) : null; }).filter(Boolean);
+  }
+  store.lastRefs = refs.length ? refs.map((r) => Object.assign({ kind: r.kind, id: r.id, label: r.label }, r.instance != null ? { instance: r.instance } : {})) : sent.length ? store.lastRefs : [];
+  // 改动摘要里排在最前面的：这轮引用的（或带过来的上一轮引用）
+  const rids = sent.map((r) => r && r.id).filter(Boolean);
+  store.focusIds = rids;
+  pushHistory(Object.assign({ role: "user", text: t + (refs.length ? `（引用：${refs.map((r) => r.label).join("、")}）` : sent.length ? `（接着上一轮：${sent.map((r) => r.label).join("、")}）` : "") }, rids.length ? { refs: rids } : {}));
   const th = thinking("在想怎么改", () => ac.abort());
   busy(true);
   try {
-    const r = await API.revise(plan0, t, ac.signal);
-    const locks = new Set(store.plan.locks || []), kept = [];
-    const base = (id) => { const m = INST.exec(String(id || "")); return m ? m[1] : id; };
-    const ops = (r.ops || []).filter((o) => { const hit = o && (o.op === "set" || o.op === "remove") && locks.has(base(o.id)); if (hit) kept.push(base(o.id)); return !hit; });
-    const has = r.understood !== false && ops.length > 0;
-    const ok = has && planOps(`AI：${short(r.restatement || "改了")}`, ops);
-    // 服务端已经把锁住的项的改动拿掉了（ops 空）：句子里点了锁住的项的名字时，直说没改它，别照念 AI 的复述
-    const named = [...locks].filter((id) => { const n = (findNode(store.plan, id) || {}).node || {}; return [n.label, n.child && n.child.label].some((l) => l && l.length >= 2 && t.includes(l)); });
-    let text = !has && named.length ? `「${named.map(labelOf).join("、")}」你锁住了，这句没改它（要改先在场景树里解锁）` : r.restatement || (has ? "好。" : "这句我没把握翻成程序上的改动。");
-    if (kept.length) text += `（你锁住的${[...new Set(kept)].map(labelOf).join("、")}没动）`;
-    if (has && !ok) text += "（算出来和原来一样，图没变）";
-    if (store.opWarnings && store.opWarnings.length) { text += `（${store.opWarnings.length} 处没法照办，跳过了）`; store.opWarnings = null; }
-    const onOpt = (o) => { const tl = { 画一笔: "path", 圈一块: "region", 拖一下: "move" }[o]; if (tl) setTool(tl); else say(o); };
-    const pts = ["画一笔", "圈一块", "拖一下"];
-    const attach = r.question ? el("div", {}, el("div", { class: "hint" }, r.question), r.ask_to_point ? chips(pts, onOpt) : null) : r.ask_to_point ? chips(pts, onOpt) : null;
-    th.done(text, attach);
-    lockedLine(r, false);
-    usageLine(r);
-  } catch (e) { th.fail(e, () => onText(t)); } finally { if (store.inflight === ac) store.inflight = null; busy(false); flush(); }
+    await S.ensureScene();
+    const r = await API.revise(plan0, t, ac.signal, { refs: sent, history });
+    applyRevise(r, t, th);
+  } catch (e) { th.fail(e, () => onText(t, refs)); } finally { if (store.inflight === ac) store.inflight = null; busy(false); flush(); }
+}
+/** 把 revise 的回包落到程序上，聊天里写复述 +「改了：…」（diffCompiled），历史里记 ops 数与 effect */
+export function applyRevise(r, t, th = { done: (text, attach, o) => msg("ai", text, attach, o) }) {
+  const before = { sid: store.sid, T: store.T, facts: store.facts }, plan0 = store.plan;
+  const locks = new Set(store.plan.locks || []), kept = [];
+  const base = (id) => { const m = INST.exec(String(id || "")); return m ? m[1] : id; };
+  const ops = (r.ops || []).filter((o) => { const hit = o && (o.op === "set" || o.op === "remove") && locks.has(base(o.id)); if (hit) kept.push(base(o.id)); return !hit; });
+  const has = r.understood !== false && ops.length > 0;
+  store.aiApplying = true;
+  let ok = false; try { ok = has && planOps(`AI：${short(r.restatement || "改了")}`, ops); } finally { store.aiApplying = false; }
+  // 服务端已经把锁住的项的改动拿掉了（ops 空）：句子里点了锁住的项的名字时，直说没改它，别照念 AI 的复述
+  const named = [...locks].filter((id) => { const n = (findNode(store.plan, id) || {}).node || {}; return [n.label, n.child && n.child.label].some((l) => l && l.length >= 2 && t.includes(l)); });
+  let text = !has && named.length ? `「${named.map(labelOf).join("、")}」你锁住了，这句没改它（要改先在场景树里解锁）` : r.restatement || (has ? "好。" : "这句我没把握翻成程序上的改动。");
+  if (kept.length) text += `（你锁住的${[...new Set(kept)].map(labelOf).join("、")}没动）`;
+  if (store.opWarnings && store.opWarnings.length) { text += `（${store.opWarnings.length} 处没法照办，跳过了）`; store.opWarnings = null; }
+  let fx = null;
+  if (ok) { try { fx = diffCompiled(before, { sid: store.sid, T: store.T, facts: store.facts }, plan0, store.plan, { focus: store.focusIds || [] }); } catch (e) { console.warn(e); } }
+  else if (has) fx = { summary: "没有看得见的变化（算出来和原来一样）", visible: false };
+  const effect = fx ? (fx.visible ? fx.summary : "这次没有看得见的变化：可以换个说法，或者圈一块 / 右键「加到对话」指给我看") : "";
+  const onOpt = (o) => { const tl = { 画一笔: "path", 圈一块: "region", 拖一下: "move" }[o]; if (tl) setTool(tl); else say(o); };
+  const pts = ["画一笔", "圈一块", "拖一下"];
+  const attach = r.question ? el("div", {}, el("div", { class: "hint" }, r.question), r.ask_to_point ? chips(pts, onOpt) : null) : r.ask_to_point ? chips(pts, onOpt) : null;
+  th.done(text, attach, { effect, fxVisible: fx ? fx.visible : undefined, effectAll: fx && fx.visible && fx.cut ? fx.all : undefined });
+  // 这一轮动了哪些 id（set / remove 的目标、add 进来的新节点）：下一轮「还是…」时 AI 照这些接着改，别顺手改别处
+  const touched = ok ? [...new Set(ops.map((o) => (o.op === "add" ? (o.value && o.value.id) || o.to : base(o.id))).filter((x) => x && x !== "root" && x !== "terrain" && x !== "relations"))].slice(0, 12) : [];
+  pushHistory(Object.assign({ role: "ai", text: r.restatement || text, ops: ok ? ops.length : 0, effect: fx ? fx.summary : has ? "" : r.memory_saved ? "记住了偏好" : "没改" }, touched.length ? { ids: touched } : {}));
+  store.lastEffect = fx;
+  lockedLine(r, false);
+  usageLine(r); memoryAfter(r); markDirty();
+  return fx;
 }
 
 // ---------- 换一批：三个新概念；锁住的项（场景树里点了锁的）三张都保留（服务端按 locked 合进去）
@@ -556,8 +652,8 @@ export async function variants() {
     const d = await API.draft(store.intent || base.concept || base.name, { locked: { plan: base, ids: locks }, variant: store.variantN }, ac.signal);
     setCards(d, locks.length);
     th.done(`三个新概念：${store.cards.concepts.map((c, i) => c.name || store.cards.plans[i].name).join(" / ")}。`);
-    usageLine(d);
-    setStep(2); showCompare();
+    usageLine(d); memoryAfter(d);
+    setStep(2); showCompare(); markDirty();
   } catch (e) { th.fail(e, () => variants()); } finally { busy(false); flush(); }
 }
 
@@ -636,7 +732,6 @@ function nearestRef(p, not) {
   for (const t of store.plan.terrain) { const g = resolveTarget(store.sid, store.T, t.id); if (g) cand(t.id, g.point); }
   return best;
 }
-const GEN_CHOICES = [["grove", "树林"], ["field", "田"], ["scatter_houses", "撒房子"], ["water", "水池"], ["platform", "平台"]];
 /** 加一个根节点并把它的原点放在世界点 at（锚在场地中心，偏移反算）；extra 覆盖默认值 */
 function addRootAt(s, type, point, extra) {
   const e = Object.assign(newElement("node", type, s.plan), extra);
@@ -648,11 +743,75 @@ function addRootAt(s, type, point, extra) {
   s.sel = { type: type === "space" ? "space" : "node", plan_id: e.id, sid_id: null }; s.open.add(e.id);
   return e;
 }
+
+const toSite = (p) => worldToSite(store.sid, p);
+function focusInput(ph) { placeholder(ph); $("#input").focus(); }
+/** 画路「直接连起来」：两头吸到最近的节点，加一条连接 */
+function linkPath(points) {
+  const from = nearestRef(points[0]), to = nearestRef(points[points.length - 1], from);
+  if (!from || !to) { note("两头没找到可以连的东西"); return; }
+  edit(() => `加了一条路：${labelOf(from)} → ${labelOf(to)}（样式在场景树里改）`, (s) => {
+    const e = Object.assign(newElement("node", "link", s.plan), { from, to, style: "path", label: "小路" });
+    s.plan = applyOps(s.plan, [{ op: "add", to: "root", value: e }]).plan;
+    s.sel = { type: "node", plan_id: e.id }; s.open.add(e.id);
+  });
+}
+
+// ============================================================ 随意选点调高度（docs/07 §4）：拖动中临时编译、节流 120 ms、只更新 3D 小窗（不入撤销栈）；松手才提交
+let liveT = null, liveNext = null, liveDue = 0, HD = null;
+function live(fn) {
+  liveNext = fn; if (liveT) return;
+  liveT = setTimeout(() => { liveT = null; const f = liveNext; liveNext = null; if (!f) return; const t0 = performance.now(); try { f(); } catch (e) { console.warn(e); } liveDue = performance.now() + Math.max(120, (performance.now() - t0) * 1.5); }, Math.max(0, liveDue - performance.now()));
+}
+function liveCancel() { liveNext = null; clearTimeout(liveT); liveT = null; }
+/** 临时编译一份 plan，只给 3D 小窗看（俯视图不重画，store 不变） */
+function showLive(plan, brush) {
+  if (!insetShown()) return;
+  const R = compilePlan(plan, { seed: store.seed, ignored: store.ignored });
+  store.liveN++;
+  if (!store.inset) return; // three.js 还没加载好
+  store.inset.update(Object.assign(ctx(), { sid: R.sid, T: R.T, plan: R.plan }));
+  if (store.inset.setBrush) store.inset.setBrush(brush || null);
+}
+function liveEnd() { liveCancel(); hint(null); if (store.inset && store.inset.setBrush) store.inset.setBrush(null); }
+const sgnM = (v) => `${v > 0 ? "+" : v < 0 ? "−" : "±"}${r1(Math.abs(v))} m`;
+const isPin = (id) => { const m = markOf(id); return !!m && m.type === "pin"; };
+/** 离 point_m 不到 tol 米、上面已经有手调高度的图钉（剖面上在同一处再拖 = 接着改它） */
+function nearPin(point_m, tol = 3) {
+  let best = null, bd = tol;
+  for (const t of (store.plan && store.plan.terrain) || []) { const m = isPin(t.at) && markOf(t.at); if (!m) continue; const d = Math.hypot(m.point_m[0] - point_m[0], m.point_m[1] - point_m[1]); if (d <= bd) { bd = d; best = m.id; } }
+  return best;
+}
+/** 提交一次手调高度：在那儿放图钉 + 一个人给的地形操作（同一个图钉 = 改同一个操作）；选中它（俯视图出中心 / 高度把手） */
+export function commitHeight(point_m, { delta_m = 0, radius_m = 12, mode = "raise" } = {}, pinId = null) {
+  let res = null;
+  const ok = edit(() => `${res.label}：${mode === "flatten" ? "削平到按下点" + (delta_m ? " " + sgnM(delta_m) : "") : sgnM(mode === "lower" ? -Math.abs(delta_m) : delta_m)}（半径 ${radius_m} m）`, (s) => {
+    res = heightEdit(s.plan, { point_m, delta_m, radius_m, mode, pinId: pinId || undefined });
+    s.plan = res.plan; res.label = ((s.plan.terrain || []).find((t) => t.id === res.opId) || {}).label || "手调高度";
+  });
+  liveEnd();
+  if (ok && res && findNode(store.plan, res.opId)) select({ type: "feature", plan_id: res.opId });
+  return ok && res;
+}
+const opPreview = (id, field, value) => applyOps(store.plan, [{ op: "set", id, field, value }]).plan;
+export function setOpField(id, field, value) {
+  const t = (store.plan.terrain || []).find((x) => x.id === id); if (!t) return false;
+  liveEnd();
+  return planOps(`${t.label || id}${field === "depth_m" ? "深" : field === "step_h_m" ? "每级" : field === "amplitude_m" ? "起伏" : "高"} ${r1(value)} m`, [{ op: "set", id, field, value }]);
+}
+/** 地形操作的中心把手：手调的（锚在图钉上）挪图钉；AI 的改 offset_m */
+function opMovePlan(id, p, info) {
+  const t = (store.plan.terrain || []).find((x) => x.id === id), d = (info && info.delta) || [0, 0];
+  if (t && isPin(t.at)) { const m = markOf(t.at); return { pin: m.id, plan: updateMark(store.plan, m.id, { point_m: [r1(m.point_m[0] + d[0]), r1(m.point_m[1] + d[1])] }) }; }
+  const off = offsetAfter(id, d); return off ? { plan: opPreview(id, "offset_m", off) } : null;
+}
+
 export const mapHandlers = {
   tool: () => store.tool,
   canDrag: (t) => !!store.plan && DRAG.has(t && t.type) && (/^section_/.test(t.type) || !!moveIdOf(t, false)),
-  onGesture(on) { document.body.classList.toggle("gesturing", !!on); },
-  onDragCancel() { hint(null); renderViews(); },
+  // 拖动中 3D 小窗变淡、不接指针；调高度时它就是实时预览，不变淡（指针照样穿过去）
+  onGesture(on) { document.body.classList.toggle("gesturing", !!on); document.body.classList.toggle("height-live", !!on && store.tool === "height"); },
+  onDragCancel() { liveEnd(); renderViews(); },
   onDrag(t, p, info = {}) {
     if (/^section_/.test(t.type) && info.line) { hint(`剖切线 ${info.length_m} m · ${info.angle_deg}°`); if (store.inset && store.inset.setSection) store.inset.setSection({ mode: "line", line: info.line, width_m: sectionSpec().width_m }); return; }
     const d = info.delta || [0, 0], id = moveIdOf(t, altHeld), inst = id && INST.test(id);
@@ -661,22 +820,19 @@ export const mapHandlers = {
   onDragEnd(t, p, info) { hint(null); dragEnd(t, p, info || {}); },
   onSelect(t, p) { select(!t || t.type === "ground" ? { type: "ground", p } : t); },
   onSection(line, info = {}) { edit(`剖切线 ${info.length_m ?? Math.round(Math.hypot(line[1][0] - line[0][0], line[1][1] - line[0][1]))} m`, (s) => setSection(s, { mode: "line", line }), { geometry: false, actions: store.view === "profile" ? [] : [{ label: "看剖面", fn: () => setView("profile") }] }); },
+  /** 画一笔：加到对话（变成手绘线标记）或直接连成一条路 */
   onPath(points, ev) {
     const kind = classifyStroke(points);
     if (kind === "tap") return;
     if (kind === "loop") return mapHandlers.onRegion(points, ev);
     if (store.stratum !== "ground") { note("地下 / 天上的通道由空间布局生成：在场景树里改布局、岔路，或「换一个」"); return; }
-    const from = nearestRef(points[0]), to = nearestRef(points[points.length - 1], from);
-    if (!from || !to) { note("两头没找到可以连的东西"); return; }
-    let id = null;
-    edit(() => `加了一条路：${labelOf(from)} → ${labelOf(to)}（样式在场景树里改）`, (s) => {
-      const e = Object.assign(newElement("node", "link", s.plan), { from, to, style: "path", label: "小路" });
-      id = e.id; s.plan = applyOps(s.plan, [{ op: "add", to: "root", value: e }]).plan;
-      s.sel = { type: "node", plan_id: id }; s.open.add(id);
-    });
+    const tip = el("span", { class: "hint" }, "画了一笔：");
+    popup(ev, [tip, chip("加到对话", () => { hidePopup(); const id = newMark("画了一笔（手绘线）", { type: "trace", path_m: points.map(toSite) }); if (id) { addRef({ kind: "mark", id }, { quiet: true }); focusInput("沿这条线做什么？"); } }),
+      chip("直接连起来", () => { hidePopup(); linkPath(points); }), chip("算了", hidePopup)], points[points.length - 1]);
   },
+  /** 圈一块：地面 = 圈选标记，自动加到对话、输入框聚焦（不再给固定菜单）；地下 / 天上 = 新建空间 */
   onRegion(points, ev) {
-    const r = strokeToPolygon(points, { T: store.T, maxPoints: 10 });
+    const r = strokeToPolygon(points, { T: store.T, maxPoints: 24 });
     if (!r.polygon || r.polygon.length < 3 || r.area_m2 < 20) { note("圈得太小了，再圈大一点"); return; }
     const c = r.centroid || polygonCentroid(r.polygon), xs = r.polygon.map((q) => q[0]), zs = r.polygon.map((q) => q[1]);
     const w = Math.max(6, Math.round(Math.max(...xs) - Math.min(...xs))), d = Math.max(6, Math.round(Math.max(...zs) - Math.min(...zs)));
@@ -689,13 +845,54 @@ export const mapHandlers = {
       })), chip("算了", hidePopup)], c);
       return;
     }
-    popup(ev, [tip(`圈了 ${area} m²（约 ${w}×${d} m），这块是：`), ...GEN_CHOICES.map(([type, l]) => chip(l, () => {
-      hidePopup();
-      const size = type === "platform" ? [w, 1, d] : [w, d];
-      edit(`圈的这块：${l}（${w}×${d} m）`, (s) => { addRootAt(s, type, c, { label: l, size_m: size }); });
-    })), chip("算了", hidePopup)], c);
+    const label = `圈了一块（${area} m²，约 ${w}×${d} m）`, id = newMark(label, { type: "area", polygon_m: r.polygon.map(toSite) });
+    if (!id) { note("这一圈没存下来，再圈一次"); return; }
+    addRef({ kind: "mark", id }, { quiet: true });
+    popup(ev, [tip(`已加到对话，说说这块要做成什么（${area} m²，约 ${w}×${d} m）`), chip("清空这块里的东西", () => { hidePopup(); clearInside(id); }), chip("算了", () => { hidePopup(); dropMark(id, label); })], c);
+    focusInput("这块要做成什么？");
   },
-  onErase(t) { removeTarget(t); },
+  /** 右键：菜单（加到对话 / 在这放个图钉）；Ctrl+点：空地 = 放图钉并加到对话，点在东西上 = 把它加到对话 */
+  onPin(p, { target, point_m, ev } = {}) {
+    if (!store.plan || store.comparing) return;
+    const ref = target && target.type !== "ground" ? refOf(target) : null, pm = point_m || toSite(p);
+    if (ev && ev.button === 2) {
+      popup(ev, [ref ? chip(`把「${refLabel(ref, describe(ref))}」加到对话`, () => addRef(ref)) : null, chip("在这放个图钉（加到对话）", () => { hidePopup(); pinHere(pm); }),
+        store.stratum === "ground" ? chip("在这调高度", () => { hidePopup(); setTool("height"); }) : null, chip("算了", hidePopup)].filter(Boolean), p);
+      return;
+    }
+    if (ref) addRef(ref); else pinHere(pm);
+  },
+  onMarkMove(id, p, info = {}) { hint(null); moveMark(id, info.delta); },
+  onMarkMoveLive(id, p, info = {}) { const d = info.delta || [0, 0]; hint(`→ 挪 ${Math.round(Math.hypot(d[0], d[1]))} m`); },
+  onMarkRemove(id) { removeMarkLocal(id); },
+  onErase(t) { if (t && t.type === "mark") removeMarkLocal(t.mark_id || t.id); else removeTarget(t); },
+  // ---------- 高度工具
+  onHeightStart(p0, meta = {}) {
+    if (!store.plan || store.stratum !== "ground") { note("高度工具只在地面层用"); return false; }
+    // 接着改同一个操作：按在图钉上（mark_id）、按在选中的手调高度的中心把手上（op_id → 它的图钉）、或离已有手调图钉不到 2 m
+    const op = meta.op_id ? ((store.plan.terrain || []).find((t) => t.id === meta.op_id) || null) : null;
+    const pinId = (meta.mark_id && isPin(meta.mark_id) && meta.mark_id) || (op && isPin(op.at) && op.at) || (meta.point_m && nearPin(meta.point_m, 2)) || null;
+    HD = { plan0: store.plan, pinId };
+    if (!insetShown()) { store.insetOn = true; store.insetMin = false; updateInset(); }
+    return true;
+  },
+  onHeightDrag(p0, info) {
+    if (!HD) return;
+    hint(`${info.mode === "flatten" ? "削平到按下点" + (info.delta_m ? " " + sgnM(info.delta_m) : "") : sgnM(info.delta_m)} · 半径 ${info.radius_m} m（松手生效）`);
+    const h = HD;
+    live(() => { const r = heightEdit(h.plan0, { point_m: info.point_m, delta_m: info.delta_m, radius_m: info.radius_m, mode: info.mode, pinId: h.pinId || undefined }); showLive(r.plan, { point: p0, radius_m: info.radius_m, delta_m: info.delta_m, mode: info.mode }); });
+  },
+  onHeightEnd(p0, info) { const h = HD; HD = null; commitHeight(info.point_m, info, (h && h.pinId) || info.mark_id); },
+  onHeightCancel() { HD = null; liveEnd(); updateInset(); },
+  // ---------- 选中的地形操作：中心把手（挪）与高度把手（上下拖）
+  onOpMove(id, p, info) {
+    hint(null); liveEnd();
+    const t = (store.plan.terrain || []).find((x) => x.id === id);
+    if (t && isPin(t.at)) moveMark(t.at, (info && info.delta) || [0, 0]); else dragEnd({ type: "feature", plan_id: id }, p, info || {});
+  },
+  onOpMoveLive(id, p, info) { const d = (info && info.delta) || [0, 0]; hint(`→ 挪 ${Math.round(Math.hypot(d[0], d[1]))} m`); live(() => { const r = opMovePlan(id, p, info); if (r) showLive(r.plan); }); },
+  onOpHeight(id, value, { field } = {}) { setOpField(id, field, value); },
+  onOpHeightLive(id, value, { field } = {}) { live(() => showLive(opPreview(id, field, value))); },
   onInteriorLevel(k) { setInteriorLevel(k); },
   onDiff(id, ev) { const d = store.diffs.find((x) => x.id === id); if (d) popup(ev, diffButtons(d)); },
 };
@@ -783,8 +980,16 @@ export const profileHandlers = {
   onSpaceFloor(id, y) { runProfile("space_floor", id, y); },
   onSpaceHeight(id, h) { runProfile("space_height", id, h); },
   onDragHint: (t) => hint(t),
+  /** 地面线任意一点上下拖（docs/07 §4）：拖动中临时编译给 3D 小窗；松手在那儿放图钉 + 手调高度（同一处再拖 = 接着改它） */
+  onGroundDrag(pt, delta_m, { live: isLive, mode = "raise", radius_m = 12 } = {}) {
+    const point_m = toSite([pt.x, pt.z]), pinId = nearPin(point_m, Math.max(2, radius_m * 0.25));
+    if (isLive) { live(() => showLive(heightEdit(store.plan, { point_m, delta_m, radius_m, mode, pinId: pinId || undefined }).plan, { point: [pt.x, pt.z], radius_m, delta_m, mode })); return; }
+    commitHeight(point_m, { delta_m, radius_m, mode }, pinId);
+  },
+  onOpHeight(id, value, { field } = {}) { setOpField(id, field, value); },
   onDragLive(p) {
-    if (!p) { renderViews(); return; }
+    if (!p) { liveEnd(); renderViews(); return; }
+    if (p.kind === "op_height") { live(() => showLive(opPreview(p.id, p.field, p.value))); return; }
     if (!store.inset || !insetShown() || performance.now() < liveAt) return;
     const t0 = performance.now();
     try { const R = liveCompile(p.kind, p.id, p.value); if (R) store.inset.update(Object.assign(ctx(), { sid: R.sid, T: R.T })); } catch (e) { console.warn(e); }
@@ -799,23 +1004,65 @@ export const profileHandlers = {
   onPick(t, stratum) { if (t) select(Object.assign({}, t, t.id && !t.sid_id ? { sid_id: t.id } : {})); if (stratum && stratum !== store.stratum) setStratum(stratum); },
 };
 
-// ============================================================ 演示 / 截图（一律模拟 AI 或本地示例，不花钱）
-// ?demo=cards|pick|edit（模拟 draft「我要生成魔法学院」）| academy|harbor|sky|temple|cyber|village|maze（直接打开示例程序）| plan&plan=build/eval/<卡名> | export   [&view=…&level=k&inset=1]
+// ============================================================ 场景会话：存什么 / 怎么换回来（网络、自动保存、场景栏在 session.js）
+/** 当前场景要存的东西：程序 + 种子、三张候选、聊天（含引用与改动摘要）、给 AI 的历史、撤销栈（最近 30 步）、钉住的引用、视图状态 */
+export function sceneData() {
+  const C = store.cards;
+  return { v: 6, step: store.step, intent: store.intent, plan: store.plan, seed: store.seed, ignored: store.ignored, section: store.section,
+    cards: C ? { plans: C.plans, concepts: C.concepts, diversity: C.diversity, locked: C.locked } : null, variantN: store.variantN,
+    chat: store.chat, history: store.history, undo: store.undo.slice(-30), redo: store.redo.slice(-30), refs: store.refs.filter((r) => r.pinned), lastRefs: store.lastRefs || [],
+    view: { view: store.view, stratum: store.stratum, interiorLevel: store.interiorLevel } };
+}
+/** 换到一个场景：store 换成它存下的状态，重编译、重画聊天栏（d = {} 是一个空的新场景） */
+export function loadState(d = {}) {
+  liveEnd(); hidePopup(); note(null); HD = null;
+  const arr = (v) => (Array.isArray(v) ? v : []), v = d.view || {};
+  Object.assign(store, { plan: null, seed: d.seed ?? 7, ignored: arr(d.ignored), section: d.section || null, intent: d.intent || "", variantN: d.variantN || 0, comparing: false,
+    cards: d.cards && Array.isArray(d.cards.plans) && d.cards.plans.length ? Object.assign({}, d.cards, { compiled: null }) : null,
+    chat: arr(d.chat), history: arr(d.history), undo: arr(d.undo), redo: arr(d.redo), refs: arr(d.refs), lastRefs: arr(d.lastRefs), localFx: [], pending: null,
+    sel: null, diffs: [], readback: null, corrections: [], open: new Set(), collapsed: new Set(), closed: new Set(), tool: "move",
+    view: ["map", "profile", "eye", "three"].includes(v.view) ? v.view : "map", stratum: v.stratum || "ground", interiorLevel: v.interiorLevel | 0 });
+  try { if (d.plan) { store.plan = normalizePlan(d.plan).plan; recompute(); } } catch (e) { console.error(e); store.plan = null; }
+  if (!store.plan) Object.assign(store, { sid: null, T: null, checks: [], facts: {}, index: {}, warnings: [] });
+  setStep(store.plan ? (d.step === 2 && store.cards ? 2 : 3) : store.cards ? 2 : 1);
+  renderChat();
+  if (store.step === 2 && store.cards) { store.cards.compiled = store.cards.plans.map(compileCard); showCompare(); } else render();
+}
+
+// ============================================================ 演示 / 截图（一律模拟 AI 或本地示例，不花钱；场景与记忆存在浏览器里的 demo: 前缀下，不碰真实数据）
+// ?demo=cards|pick|edit（模拟 draft「我要生成魔法学院」）| academy|harbor|sky|temple|cyber|village|maze（直接打开示例程序）| plan&plan=build/eval/<卡名> | export
+// | refs（圈一块 + 加到对话 + 「这里做成夜市」+「还是太空了」）| height（俯视图拖一个点 +6 m）| scenes（两个场景切换）| memory（两条记忆）   [&view=…&level=k&inset=1&store=server]
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = (fn, ms = 8000) => new Promise((res, rej) => { const t0 = Date.now(); const tick = () => { let v = null; try { v = fn(); } catch { v = null; } if (v) res(v); else if (Date.now() - t0 > ms) rej(new Error("等不到界面就绪")); else setTimeout(tick, 30); }; tick(); });
+const DEMO_SQ = [[-95, 70], [-80, 66], [-62, 70], [-58, 86], [-62, 102], [-80, 106], [-98, 100], [-100, 85], [-95, 70]];
+async function sayAndWait(t) { say(t); await until(() => store.busy === 0 && !store.pending, 30000); }
 async function runDemo(stage, params) {
   const raw = params.get("plan") || "", file = /^[\w./-]+$/.test(raw) && !raw.includes("..") ? (raw.startsWith("build/") ? "../../../" + raw : raw) : null; // ?demo=plan&plan=<spec/examples/plans 下的文件名，或 build/eval/<卡名>（仓库根下的评测卡，都不带 .plan.json）>
-  if (SAMPLES[stage] || stage === "export" || file) {
-    await loadExample(file || SAMPLES[stage] || "academy");
+  const S6 = { refs: 1, height: 1, scenes: 1, memory: 1 };
+  if (SAMPLES[stage] || stage === "export" || file || S6[stage]) {
+    if (stage === "scenes") { await S.demoScenes(); } else await loadExample(file || SAMPLES[stage] || (stage === "scenes" ? "harbor" : "academy"));
     if (stage === "maze") {
       let sp = null; for (const e of expand(store.plan)) if (e.type === "space" && !sp) sp = e.node_id;
       if (sp) select({ type: "space", plan_id: sp, sid_id: (spaceOf({ plan_id: sp }) || {}).id });
       if (params.get("level") != null) setInteriorLevel(+params.get("level"));
-    } else {
+    } else if (!S6[stage]) {
       const rep = expand(store.plan).find((e) => e.type === "repeat" && e.instance_of == null);
       if (rep) { store.open.add(rep.node_id); renderSide(); }
     }
     if (stage === "export") { await sleep(30); openExport(); return; }
+    if (stage === "refs") {
+      mapHandlers.onRegion(DEMO_SQ, null); hidePopup();
+      await sayAndWait("这里做成夜市"); await sayAndWait("还是太空了");
+      const m = (store.plan.marks || [])[0]; if (m) select({ type: "mark", mark_id: m.id });
+    }
+    if (stage === "height") {
+      setTool("height");
+      const p0 = [-40, 60], point_m = toSite(p0);
+      mapHandlers.onHeightStart(p0, { target: { type: "ground" }, mark_id: null, point_m });
+      mapHandlers.onHeightDrag(p0, { delta_m: 6, radius_m: 14, mode: "raise", point_m, mark_id: null });
+      mapHandlers.onHeightEnd(p0, { delta_m: 6, radius_m: 14, mode: "raise", point_m, mark_id: null });
+    }
+    if (stage === "memory") { await S.demoMemory(); return; }
   } else {
     const intent = params.get("intent") || EXAMPLES[0];
     msg("user", intent); await onIntent(intent);
@@ -830,9 +1077,10 @@ async function runDemo(stage, params) {
       }
     }
   }
-  const view = params.get("view");
-  if (view === "profile") { const lm = MapView.landmarkOf(store.sid); if (lm) sectionTo({ type: "landmark", plan_id: lm.plan_id, sid_id: lm.id }); } // 剖面直接剖过主地标
+  const view = params.get("view"), hand = stage === "height" && (store.plan.terrain || []).find((t) => /^hand_/.test(t.id));
+  if (view === "profile") { const lm = MapView.landmarkOf(store.sid); if (hand) sectionTo({ type: "feature", plan_id: hand.id }); else if (lm) sectionTo({ type: "landmark", plan_id: lm.plan_id, sid_id: lm.id }); } // 剖面直接剖过主地标（height：剖过手调的那一处）
   if (view) setView(view);
+  if (hand && view === "profile") select({ type: "feature", plan_id: hand.id });
   if (params.get("inset") && !store.insetOn) toggleInset();
 }
 
@@ -844,15 +1092,16 @@ function onKey(e) {
     else if (store.comparing && store.plan) keepCurrent(); else if (store.tool !== "move") setTool("move"); else if (store.sel) select(null);
     return;
   }
-  if (typing || !store.plan) return;
-  const k = e.key.toLowerCase();
+  const k = e.key.toLowerCase(), emptyInput = document.activeElement === $("#input") && !$("#input").value; // 圈完输入框聚焦但还没打字：Ctrl+Z 照样撤销场景
+  if ((typing && !emptyInput) || !store.plan) return;
   if ((e.ctrlKey || e.metaKey) && (k === "z" || k === "y")) { e.preventDefault(); if (k === "y" || e.shiftKey) redo(); else undo(); return; }
+  if (typing) return;
   if (e.ctrlKey || e.metaKey || e.altKey || !$("#modal").hidden) return;
-  const tool = { v: "move", p: "path", r: "region", s: "section", e: "erase" }[k];
+  const tool = { v: "move", p: "path", r: "region", s: "section", e: "erase", h: "height" }[k];
   if (tool) { setTool(tool); return; }
   const view = { 1: "map", 2: "profile", 3: "eye", 4: "three" }[e.key];
   if (view && !store.comparing) { setView(view); return; }
-  if ((e.key === "Delete" || e.key === "Backspace") && store.sel) { e.preventDefault(); removeSelected(); }
+  if ((e.key === "Delete" || e.key === "Backspace") && store.sel) { e.preventDefault(); if (store.sel.type === "mark") removeMarkLocal(store.sel.mark_id); else removeSelected(); }
 }
 function bind() {
   document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
@@ -866,25 +1115,26 @@ function bind() {
   document.addEventListener("pointerdown", (ev) => { if (!$("#popup").hidden && !$("#popup").contains(ev.target)) hidePopup(); }, true);
   document.addEventListener("keydown", onKey);
   $("#composer").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("#input").value.trim(); if (!t) return; $("#input").value = ""; say(t); });
-  bindSettings();
+  bindComposer(); bindSettings();
 }
-/** ui.js 用的动作（ui.js 只 import store 和它，不逐个 import app.js 的函数） */
-export const actions = { edit, planOps, select, render, renderViews, note, setView, setInteriorLevel, levelName, kName, labelOf, removePlanItem, removeSelected,
-  applyFix, nextSeed, API, sys, ctx, nodeName, sectionSpec, sectionCtx, structTokens, spaceOf, mapHandlers, hidePopup, PARTS, treeIdOf, instanceIdOf, hlId, volOf, OPT, aiTag };
+/** ui.js / session.js 用的动作（它们只 import store 和它，不逐个 import app.js 的函数） */
+export const actions = { edit, planOps, select, render, renderViews, note, setView, setInteriorLevel, levelName, kName, labelOf, removePlanItem, removeSelected, undo, placeholder, markDirty,
+  applyFix, nextSeed, API, sys, msg, ctx, nodeName, sectionSpec, sectionCtx, structTokens, spaceOf, mapHandlers, hidePopup, PARTS, treeIdOf, instanceIdOf, hlId, volOf, OPT, aiTag, loadExample, setTool };
 async function start() {
   bind(); setStep(1); render();
   const params = new URLSearchParams(location.search), demo = params.get("demo");
   if (demo) store.mock = true; // 演示 / 截图一律走模拟 AI，不花钱
   await refreshAI();
   if (!store.ai) {
-    msg("ai", "本地服务没连上：请用 SceneDialog.exe 或「python desktop/app.py」启动，这个页面要靠它调 AI。");
-    const t = setInterval(async () => { await refreshAI(); if (store.ai) { clearInterval(t); sys("本地服务已连上。"); } }, 10000);
+    msg("ai", "本地服务没连上：请用 SceneDialog.exe 或「python desktop/app.py」启动，这个页面要靠它调 AI。", null, { keep: false });
+    const t = setInterval(async () => { await refreshAI(); if (store.ai) { clearInterval(t); sys("本地服务已连上。", false); } }, 10000);
   }
   addEventListener("focus", () => { refreshAI(); });
-  msg("ai", "说一句你想要的场景：我先想三个空间组织不同的概念，再各写成一段场景程序。之后在图上拖、在右边的场景树里改，只有说话、重出、换一批会调 AI。");
-  if (demo) runDemo(demo, params).catch((e) => sys("演示失败：" + e.message));
+  await S.initSessions({ demo, params });
+  if (demo) runDemo(demo, params).catch((e) => sys("演示失败：" + e.message, false));
 }
 start();
 
 // 调试 / 自动化测试用（唯一的全局）
-window.__scene = { store, edit, planOps, undo, redo, select, setView, setTool, setStratum, setInteriorLevel, say, pick, variants, loadExample, structTokens, moveIdOf, offsetAfter, profileOps, applyFix, removePlanItem, openExport, buildBrief, buildPackage, exportSid, render, ctx, sectionSpec, mapHandlers, profileHandlers, API, treeIdOf, instanceIdOf };
+window.__scene = { store, edit, planOps, undo, redo, select, setView, setTool, setStratum, setInteriorLevel, say, pick, variants, loadExample, structTokens, moveIdOf, offsetAfter, profileOps, applyFix, removePlanItem, openExport, buildBrief, buildPackage, exportSid, render, ctx, sectionSpec, mapHandlers, profileHandlers, API, treeIdOf, instanceIdOf,
+  addRef, refOf, takeRefs, describe, applyRevise, commitHeight, sceneData, loadState, S };

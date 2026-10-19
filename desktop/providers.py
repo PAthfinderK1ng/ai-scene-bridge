@@ -322,7 +322,10 @@ class DeepSeekClient:
                    salvage: Callable[[Any, list], tuple[dict, list, list]] | None = None) -> dict:
         """一次结构化调用（含至多一次回喂重试）。post(data) → (data, fixes, errors)。
         没有回喂预算（第二次请求撞上调用上限）时：salvage(第一轮后处理过的 data, errors) 能本地救回（去掉出错的少数节点）就用它；
-        救不回 → AIError(budget) 带上第一轮的 errors[:12] 与回包开头 sample，调用方写进 _steps[k].first_errors。"""
+        救不回 → AIError(budget) 带上第一轮的 errors[:12] 与回包开头 sample，调用方写进 _steps[k].first_errors。
+        system 可以是 (稳定前缀, 附加)：附加（用户偏好）接在前缀后面，前缀照样命中缓存。"""
+        if isinstance(system, (tuple, list)):
+            system = "\n\n".join(x for x in system if x)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
         usage = None
         first_errors: list[str] = []
@@ -449,7 +452,9 @@ class ClaudeClient:
 
     def structured(self, system: str, user_text: str, schema: dict, post: Callable[[Any], tuple[dict, list, list]], effort: str) -> dict:
         a = self.anthropic
-        kw = dict(model=self.model, max_tokens=self.MAX_TOKENS, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        base, extra = (system[0], system[1] if len(system) > 1 else "") if isinstance(system, (tuple, list)) else (system, "")
+        sys_blocks = [{"type": "text", "text": base, "cache_control": {"type": "ephemeral"}}] + ([{"type": "text", "text": extra}] if extra else [])  # 偏好放缓存断点之后
+        kw = dict(model=self.model, max_tokens=self.MAX_TOKENS, system=sys_blocks,
                   messages=[{"role": "user", "content": user_text}], output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}})
         t0 = time.time()
         resp = None

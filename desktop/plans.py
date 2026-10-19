@@ -30,7 +30,8 @@ def resource_root() -> str:
 
 
 def data_dir() -> str:
-    d = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-scene-bridge")
+    """数据目录：%LOCALAPPDATA%/ai-scene-bridge（配置、场景、记忆、导出、日志）；环境变量 SCENE_DIALOG_DATA_DIR 整个换掉它（测试用，不碰真实数据与密钥）"""
+    d = os.environ.get("SCENE_DIALOG_DATA_DIR") or os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-scene-bridge")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -323,7 +324,7 @@ def has_key(node: Any, key: str) -> bool:
 ROOT_LISTS = ("terrain", "nodes", "relations")
 ONE_GROUPS = ("site", "spawn", "lighting")
 LIST_GROUPS = ROOT_LISTS  # 旧名（外部脚本还在用）
-AI_FORBIDDEN = {"locks", "layout_seed", "one_liner", "skip", "overrides"}  # 人写的（锁、「换一个」的种子）、旧字段、实例改动（ops 写）：不给 AI 看
+AI_FORBIDDEN = {"locks", "layout_seed", "one_liner", "skip", "overrides", "marks"}  # 人写的（锁、「换一个」的种子、人画的标记）、旧字段、实例改动（ops 写）：不给 AI 写
 NO_SET_FIELDS = {"id", "locks", "layout_seed", "skip", "overrides"}  # set 不能直接碰（实例改动用 id[k]）
 CHILD_LISTS = ("children",)
 CHILD_ONE = ("child",)
@@ -539,7 +540,8 @@ def anchor_base(ref: Any) -> str | None:
 
 
 def index(plan: dict) -> dict:
-    """id → (类, 元素)。类 ∈ plan / site / spawn / lighting / terrain / node。根上的 name / concept / mood / palette 用 id "plan"。"""
+    """id → (类, 元素)。类 ∈ plan / site / spawn / lighting / terrain / node / mark。根上的 name / concept / mood / palette 用 id "plan"。
+    mark = 人画的标记（docs/07 §1.1，plan.marks）：可以被锚点引用，不能被 ops 改 / 删。"""
     out: dict = {"plan": ("plan", plan)}
     for g in ONE_GROUPS:
         if isinstance(plan.get(g), dict):
@@ -550,6 +552,9 @@ def index(plan: dict) -> dict:
     for n, *_ in walk_nodes(plan.get("nodes") or []):
         if isinstance(n.get("id"), str):
             out.setdefault(n["id"], ("node", n))
+    for m in plan.get("marks") or []:
+        if isinstance(m, dict) and isinstance(m.get("id"), str):
+            out.setdefault(m["id"], ("mark", m))
     return out
 
 
@@ -726,6 +731,9 @@ def check_ops(plan: dict, ops: Any, locked_ids: set | None = None) -> tuple[list
         base = anchor_base(op.get("id"))
         if kind in ("set", "remove") and (op.get("id") in locked_ids or base in locked_ids):
             fixes.append(f"{where}: {op.get('id')} 已锁住，不改")
+            continue
+        if kind in ("set", "remove") and (idx.get(base) or ("",))[0] == "mark":
+            errs.append(f"{where}: {base} 是人画的标记，只能当锚点用（at / area / along），不能改 / 删")
             continue
         if kind == "set":
             tid, field = op.get("id"), op.get("field")

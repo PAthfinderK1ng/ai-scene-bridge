@@ -674,3 +674,193 @@ export function ringPolyMtv(c, R, h, P) {
   if (inside && far - h < R - near) return { o: far - h, d: u, shrink: r2(h) }; // 套在孔里、只是四角伸进带子：报伸进去的深度（缩到内径以内就好），不报「往外推一整圈」
   return { o: R - near, d: u };
 }
+
+// ============================================================ SID 体块形体约定（v5，docs/06 §4.8；原在 views/map.js，四个视图共用；纯几何，不碰 DOM）
+/** 体块形体 */
+export const SHAPES = Object.freeze(["box", "cylinder", "cone", "dome", "pyramid", "wedge", "arch", "torus", "sphere", "prism"]);
+/** 路的样式 */
+export const PATH_STYLES = Object.freeze(["path", "road", "stairs", "ramp", "bridge", "rope_bridge", "tunnel", "canal", "portal"]);
+/** 屋顶（building / tower 才有） */
+export const ROOFS = Object.freeze(["gable", "hip", "flat", "dome", "spire", "none"]);
+const SHAPE_ALIAS = { cube: "box", block: "box", hemisphere: "dome", ring: "torus", ball: "sphere", ramp: "wedge", hex: "prism", polygon: "prism", cyl: "cylinder" };
+const ROOF_ALIAS = { cone: "spire", pointed: "spire", conical: "spire", pyramid: "hip", hipped: "hip", gabled: "gable", onion: "dome", dome: "dome", flat: "flat", none: "none", gable: "gable", hip: "hip", spire: "spire" };
+/** 俯视是圆的形体（占地按椭圆） */
+export const ROUND_SHAPES = new Set(["cylinder", "cone", "dome", "sphere", "torus", "prism"]);
+/** 规范化形体名（缺省 box） */
+export function shapeOf(v) { const s = String((v && v.shape) || "box").toLowerCase(); return SHAPES.includes(s) ? s : SHAPE_ALIAS[s] || "box"; }
+/** SID 原始尺寸 [宽, 总高（含屋顶）, 深] */
+function rawDims(v) {
+  const s = (v && Array.isArray(v.size)) ? v.size : [];
+  const w = Math.max(0.1, Number(s[0]) || 1), h = Math.max(0.05, Number(s[1]) || 1), d = Number(s[2]) > 0 ? Number(s[2]) : w;
+  return [w, h, d];
+}
+/**
+ * 体块三维尺寸 [宽 x, 墙身高 y, 深 z]：圆形体 size = [直径, 高, (直径 z)]、prism = [直径, 高]，深缺省 = 宽。
+ * SID v0.5：size[1] 是总高（含屋顶 roof_h），这里返回的 y 是去掉屋顶的墙身高——视图「墙身 + 屋顶」叠起来正好 = size[1]。
+ */
+export function volDims(v) {
+  const [w, h, d] = rawDims(v), r = roofOf(v);
+  return [w, r ? Math.max(0.05, h - r.h) : h, d];
+}
+/** prism 的边数（3–12，缺省 6） */
+export const prismSides = (v) => clamp(Math.round(Number(v && v.sides) || 6), 3, 12);
+/** 拱的腿厚（缺省宽的 18%，至少 0.6 m，最多宽的 45%） */
+export function archThickness(v) { const [w] = volDims(v); return clamp(Number(v.thickness) > 0 ? Number(v.thickness) : Math.max(0.6, w * 0.18), 0.2, w * 0.45); }
+/** 环的管径（平放 = 高；立起来 orient upright = 厚 size[2]；夹在直径的 6%–35%） */
+export function torusTube(v) { const [w, h, d] = volDims(v); return clamp(v && v.orient === "upright" ? d : h, w * 0.06, w * 0.35); }
+/** 立起来的环（torus + orient upright）：环面竖着，按 rotation_y 朝向 */
+export const isUpright = (v) => !!v && v.orient === "upright" && shapeOf(v) === "torus";
+/**
+ * 屋顶：只有 kind building / tower 有。缺省 building = gable、tower = spire；别名 cone → spire、pyramid → hip。
+ * SID v0.5：屋顶在 size[1]（总高）之内、顶部那一段，高 h = v.roof_h（引擎给）；没给时按引擎同一规则估：
+ * spire min(长边, 0.45 总高)、dome min(短边 / 2, 0.45 总高)、gable / hip min(0.35 短边, 0.4 总高)、flat min(0.5, 0.1 总高)（压顶板）、none 0。
+ * @returns {{type: string, h: number} | null}
+ */
+export function roofOf(v) {
+  if (!v || (v.kind !== "building" && v.kind !== "tower")) return null;
+  const raw = v.roof == null ? (v.kind === "tower" ? "spire" : "gable") : String(v.roof).toLowerCase(), type = ROOF_ALIAS[raw] || "gable";
+  const [w, h, d] = rawDims(v), mn = Math.min(w, d), mx = Math.max(w, d);
+  let rh = { gable: Math.min(mn * 0.35, h * 0.4), hip: Math.min(mn * 0.35, h * 0.4), dome: Math.min(mn / 2, h * 0.45), spire: Math.min(mx, h * 0.45), flat: Math.min(0.5, h * 0.1), none: 0 }[type];
+  if (Number(v.roof_h) >= 0 && v.roof_h != null) rh = Number(v.roof_h);
+  return { type, h: clamp(rh, 0, h * 0.9) };
+}
+/** 离地高度（米）：v.elev（底面离地，> 0 = 悬空） */
+export const elevOf = (v) => Math.max(0, Number(v && v.elev) || 0);
+/**
+ * 体块底面的世界高度：position[1] 是底面绝对高度；悬空（elev > 0）时至少是中心地面 + elev（引擎只给 elev 没抬 position[1] 时也对）。
+ * @param {object} v SID volume
+ * @param {object} [T] buildTerrain 结果
+ */
+export function volumeBase(v, T) {
+  const y = Number(v.position[1]), e = elevOf(v);
+  if (!T) return Number.isFinite(y) ? y : e;
+  const g = T.heightAt(v.position[0], v.position[2]);
+  if (!Number.isFinite(y)) return g + e;
+  return e > 0 ? Math.max(y, g + e) : y;
+}
+/** 体块最高点（墙身 + 屋顶） */
+export function volumeTop(v, T) { const r = roofOf(v); return volumeBase(v, T) + volDims(v)[1] + (r ? r.h : 0); }
+/** 局部 (lx, lz) → 世界 [x, z]（rotation_y 度，俯视逆时针为正；与 layout.boxCorners 同一约定） */
+export function volToWorld(v, lx, lz) {
+  const t = ((v.rotation_y || 0) * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+  return [v.position[0] + lx * c + lz * s, v.position[2] - lx * s + lz * c];
+}
+/** 体块俯视占地多边形（世界坐标）：圆形体 = 椭圆 20 点、prism = n 边形、其它 = 旋转矩形；pad 向外扩 */
+export function footprintPolygon(v, pad = 0) {
+  const sh = shapeOf(v), [w, , d] = volDims(v), rx = w / 2 + pad, rz = d / 2 + pad;
+  if (sh === "prism") { const n = prismSides(v); return Array.from({ length: n }, (_, k) => { const a = (2 * Math.PI * k) / n - Math.PI / 2; return volToWorld(v, rx * Math.cos(a), rx * Math.sin(a)); }); }
+  if (ROUND_SHAPES.has(sh)) return Array.from({ length: 20 }, (_, k) => { const a = (2 * Math.PI * k) / 20; return volToWorld(v, rx * Math.cos(a), rz * Math.sin(a)); });
+  return [[-rx, -rz], [rx, -rz], [rx, rz], [-rx, rz]].map(([x, z]) => volToWorld(v, x, z));
+}
+
+// ------------------------------------------------------------ SID 元素占地（地形块多边形 / 构成元素中心 / plan_id → SID id；原在 views/map.js）
+const validPoly_ = (p) => Array.isArray(p) && p.length >= 3 && p.every((q) => Array.isArray(q) && q.length >= 2 && Number.isFinite(q[0]) && Number.isFinite(q[1]));
+/** 特征的俯视多边形：有 polygon 用它；穹顶（hill / ridge 带 rx / rz）按椭圆采 24 点；只有半径的用圆 */
+export function featurePolygon(f) {
+  if (validPoly_(f.polygon)) return f.polygon;
+  const c = Array.isArray(f.center) ? [f.center[0], f.center[2]] : null;
+  if (!c) return null;
+  const rx = f.rx > 0 ? f.rx : f.radius, rz = f.rz > 0 ? f.rz : f.radius, A = f.angle || 0, ca = Math.cos(A), sa = Math.sin(A);
+  if (!(rx > 0 && rz > 0)) return null;
+  const out = [];
+  for (let k = 0; k < 24; k++) { const t = (2 * Math.PI * k) / 24, u = rx * Math.cos(t), v = rz * Math.sin(t); out.push([r2(c[0] + u * ca - v * sa), r2(c[1] + u * sa + v * ca)]); }
+  return out;
+}
+/** 构成图元素在地图上的中心（地形块 / 区域 / 空间等；拖动结果 = 它 + 平移量）：所有构件外接框的中心 */
+export function planCenter(sid, T, planId) {
+  const ps = [];
+  for (const f of (sid.terrain && sid.terrain.features) || []) if (f.plan_id === planId) { const p = featurePolygon(f); if (p) ps.push(...p); }
+  for (const r of sid.regions || []) if (r.plan_id === planId && validPoly_(r.polygon)) ps.push(...r.polygon);
+  for (const s of sid.spaces || []) if ((s.plan_id || s.id) === planId && validPoly_(s.polygon)) ps.push(...s.polygon);
+  for (const v of sid.volumes || []) if (v.plan_id === planId && v.importance === "landmark") ps.push([v.position[0], v.position[2]]);
+  if (!ps.length) for (const v of sid.volumes || []) if (v.plan_id === planId && Array.isArray(v.position)) ps.push(...footprintPolygon(v)); // 形体组（v5）：整组占地
+  if (!ps.length) return null;
+  const xs = ps.map((p) => p[0]), zs = ps.map((p) => p[1]);
+  return [r2((Math.min(...xs) + Math.max(...xs)) / 2), r2((Math.min(...zs) + Math.max(...zs)) / 2)];
+}
+/** 一个 plan_id 对应的全部 SID id（有 index 用 index，否则扫 SID） */
+export function sidIdsOf(sid, index, planId) {
+  if (index && index[planId] && Array.isArray(index[planId].sid_ids)) return index[planId].sid_ids;
+  const out = [], hit = (o) => o && (o.plan_id === planId || o.zone_id === planId);
+  for (const f of (sid.terrain && sid.terrain.features) || []) if (hit(f)) out.push(f.id);
+  for (const k of ["regions", "volumes", "paths", "markers", "spaces"]) for (const o of sid[k] || []) if (hit(o)) out.push(o.id);
+  return out;
+}
+/** 内容的取景框 [x, z, w, h]：形体底面 + 路 + 空间 + 出生点的包围盒，四周留 8% / 至少 6 m，不出场地边；内容太少（< 1/6 场地）时放大到 1/6，免得只剩一个点 */
+export function contentBox(sid, b, u) {
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  const put = (x, z) => { if (!Number.isFinite(x) || !Number.isFinite(z)) return; x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); };
+  for (const v of sid.volumes || []) {
+    if (!v.position || !v.size) continue;
+    const r = Math.hypot(v.size[0], v.size[2]) / 2;
+    put(v.position[0] - r, v.position[2] - r); put(v.position[0] + r, v.position[2] + r);
+  }
+  for (const p of sid.paths || []) for (const q of p.points || []) put(q[0], q[q.length - 1]);
+  for (const s of sid.spaces || []) for (const q of s.polygon || s.outline || []) put(q[0], q[1]);
+  for (const m of sid.markers || []) if (m.position) put(m.position[0], m.position[2]);
+  if (!Number.isFinite(x0)) return null;
+  const BW = b.max[0] - b.min[0], BH = b.max[2] - b.min[2];
+  let w = x1 - x0, h = z1 - z0;
+  const pad = Math.max(6, 0.08 * Math.max(w, h)), minS = Math.max(BW, BH) / 6;
+  let cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  w = Math.max(minS, w + 2 * pad); h = Math.max(minS, h + 2 * pad);
+  const PAD = 4 * u;
+  w = Math.min(w, BW + 2 * PAD); h = Math.min(h, BH + 2 * PAD);
+  cx = clamp(cx, b.min[0] - PAD + w / 2, b.max[0] + PAD - w / 2); cz = clamp(cz, b.min[2] - PAD + h / 2, b.max[2] + PAD - h / 2);
+  return [cx - w / 2, cz - h / 2, w, h];
+}
+
+/** 从 p 沿单位方向 u 走到多边形边上的距离（p 不在里面 = 0） */
+function reachIn(poly, p, u) {
+  if (!pointInPolygon(p, poly)) return 0;
+  let best = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length], e = [b[0] - a[0], b[1] - a[1]], den = u[0] * e[1] - u[1] * e[0];
+    if (Math.abs(den) < 1e-9) continue;
+    const w = [a[0] - p[0], a[1] - p[1]], t = (w[0] * e[1] - w[1] * e[0]) / den, s = (w[0] * u[1] - w[1] * u[0]) / den;
+    if (t > 0 && s >= -1e-9 && s <= 1 + 1e-9) best = Math.min(best, t);
+  }
+  return Number.isFinite(best) ? best : 0;
+}
+/**
+ * 锚在圈选（area 标记）里的重复放不下时怎么收（docs/07 §1.1：圈的范围是人给的边界）：直线 / 网格先缩间距，缩到实例挨着还放不下就少放几个；放射缩半径。
+ * 重复以 p 为中心对称排开，M = 它的坐标系（局部 x / z → 世界）；留 1 m 边。放得下返回 null。
+ * @param {number[][]} poly 圈选多边形（世界坐标） @param {number[]} p 重复中心 @param {number[]} M 2×2
+ * @param {"linear"|"grid"|"radial"} pat
+ * @param {{n: number, R: number, C: number, stepX: number, stepZ: number, radius: number, tsz: number[], axis: "x"|"z"}} o
+ * @returns {{stepX: number, stepZ: number, n?: number, R?: number, C?: number, radius?: number, how: string}|null}
+ */
+export function fitInArea(poly, p, M, pat, o) {
+  if (!Array.isArray(poly) || poly.length < 3 || !pointInPolygon(p, poly)) return null;
+  const dirOf = (lv) => { const v = apM(M, lv), L = Math.hypot(v[0], v[1]) || 1; return [v[0] / L, v[1] / L]; };
+  const halfAlong = (lv) => { const u = dirOf(lv); return Math.min(reachIn(poly, p, u), reachIn(poly, p, [-u[0], -u[1]])) - 1; };
+  const r1 = (v) => Math.round(v * 10) / 10;
+  /** 一条轴：k 个、间距 st、实例半宽 ch、可用半长 half → 新的 { st, k } 或 null（放得下） */
+  const axisFit = (k, st, ch, half) => {
+    if (k <= 1 || (k - 1) / 2 * st + ch <= half + 1e-6) return null;
+    const st2 = (2 * (half - ch)) / (k - 1);
+    if (st2 >= 2 * ch) return { st: r1(st2), k };
+    const k2 = Math.max(1, Math.floor(half / Math.max(0.1, ch)));
+    return { st: r1(2 * ch), k: Math.min(k, k2) };
+  };
+  const out = { stepX: o.stepX, stepZ: o.stepZ }, how = [];
+  if (pat === "linear") {
+    const z = o.axis === "z", st = z ? o.stepZ : o.stepX, f = axisFit(o.n, st, (z ? o.tsz[2] : o.tsz[0]) / 2, halfAlong(z ? [0, 1] : [1, 0]));
+    if (!f) return null;
+    out[z ? "stepZ" : "stepX"] = f.st; how.push(`间距 ${r1(st)} → ${f.st} m`);
+    if (f.k !== o.n) { out.n = f.k; how.push(`放不下 ${o.n} 个，放了 ${f.k} 个`); }
+  } else if (pat === "grid") {
+    const fx = axisFit(o.C, o.stepX, o.tsz[0] / 2, halfAlong([1, 0])), fz = axisFit(o.R, o.stepZ, o.tsz[2] / 2, halfAlong([0, 1]));
+    if (!fx && !fz) return null;
+    if (fx) { out.stepX = fx.st; how.push(`列距 ${r1(o.stepX)} → ${fx.st} m`); if (fx.k !== o.C) { out.C = fx.k; how.push(`${o.C} 列 → ${fx.k} 列`); } }
+    if (fz) { out.stepZ = fz.st; how.push(`行距 ${r1(o.stepZ)} → ${fz.st} m`); if (fz.k !== o.R) { out.R = fz.k; how.push(`${o.R} 行 → ${fz.k} 行`); } }
+  } else if (pat === "radial") {
+    let near = Infinity;
+    for (let k = 0; k < 16; k++) { const a = (k / 16) * 2 * Math.PI; near = Math.min(near, reachIn(poly, p, [Math.cos(a), Math.sin(a)])); }
+    const ch = Math.max(o.tsz[0], o.tsz[2]) / 2, R2 = r1(near - 1 - ch);
+    if (o.radius + ch <= near - 1 + 1e-6 || R2 < ch) return null; // 放得下；或者圈太小、缩了也没意义（交给摘要报「超出了圈的范围」）
+    out.radius = R2; how.push(`半径 ${r1(o.radius)} → ${R2} m`);
+  } else return null;
+  out.how = how.join("，");
+  return out;
+}

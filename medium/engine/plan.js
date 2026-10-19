@@ -5,11 +5,12 @@
 // 旋钮（从 schema 的 x-ui 生成）、拖动反算偏移、三张卡的结构差异。确定性：同 plan + seed → 同结果。本文件不调 AI。
 //
 // 对外：PLAN_SCHEMA / PLAN_GROUPS / DIRV、normalizePlan、compilePlan、applyOps、resolveTarget、atFromPoint、offsetFromPoint、expand、
-//       knobsFor、summarize、newElement、planDistance、distinctPlans、findNode；程序检查 programChecks / nodeLabel / findNodeIn（v5 第 1 轮从 program.js 挪来，program.js 超过 1200 行）。
+//       knobsFor、summarize、newElement、planDistance、distinctPlans、findNode；程序检查 programChecks / nodeLabel / findNodeIn（v5 第 1 轮从 program.js 挪来，program.js 超过 1200 行）；
+//       v6（docs/07）：标记 addMark / updateMark / removeMark、手调高度 heightEdit、worldToSite / siteToWorld；引用事实 describeRef 与改动摘要 diffCompiled（在 relations.js，这里转出）。
 
 import { clamp, r2 } from "./terrain.js";
 import { resolve } from "./sid.js";
-import { planGeo, relationChecks, planReach } from "./relations.js";
+import { planGeo, relationChecks, planReach, describeRef, diffCompiled } from "./relations.js";
 import { runProgram, walkNodes, NODE_CLASS, parseAnchor, size3, apM, invM, linkRepeat, DIRV as DIRV0 } from "./program.js";
 
 // ------------------------------------------------------------ schema（单一事实来源：spec/plan.schema.json）
@@ -23,7 +24,7 @@ const DEFS = PLAN_SCHEMA.definitions, XD = PLAN_SCHEMA["x-defaults"];
 export const PLAN_GROUPS = PLAN_SCHEMA["x-groups"];
 /** 方向 → 单位向量 [x, z]（北 = −z） */
 export const DIRV = DIRV0;
-const MAX_SHAPES = 600, MAX_TERRAIN = 16;
+const MAX_SHAPES = 600, MAX_TERRAIN = PLAN_SCHEMA.properties.terrain.maxItems || 24, MAX_MARKS = PLAN_SCHEMA.properties.marks.maxItems || 32;
 const RESERVED = new Set(["site", "spawn", "plan", "lighting", "root", "terrain", "relations", "look", "main_trail", "landmark_poi", "entry"]);
 const COORD_KEYS = new Set(["position", "pos", "x", "y", "z", "xz", "points", "coords", "coordinates", "polygon", "center", "centre", "location", "world"]);
 const DIR_LABEL = { C: "中", N: "北", NE: "东北", E: "东", SE: "东南", S: "南", SW: "西南", W: "西", NW: "西北" };
@@ -239,7 +240,7 @@ function canonRefs(src) {
     if (Array.isArray(n.children)) n.children.forEach(walk);
     walk(n.child);
   };
-  if (Array.isArray(p.terrain)) p.terrain.forEach((t) => fix(t, ["at", "from", "to"]));
+  if (Array.isArray(p.terrain)) p.terrain.forEach((t) => fix(t, ["at", "from", "to", "area", "along"]));
   if (Array.isArray(p.nodes)) p.nodes.forEach(walk);
   fix(p.spawn, ["at", "look_at"]);
   if (Array.isArray(p.relations)) p.relations.forEach((r) => fix(r, ["a", "b", "c"]));
@@ -270,6 +271,8 @@ export function normalizePlan(input) {
   site.ground = site.ground || "flat";
   site.layer_m = site.layer_m || 3;
   plan.site = site;
+  plan.marks = cleanMarks(plan.marks, site, warn);
+  if (!plan.marks.length) delete plan.marks;
   plan.terrain = Array.isArray(plan.terrain) ? plan.terrain.filter(isObj).slice(0, MAX_TERRAIN) : [];
   plan.nodes = Array.isArray(plan.nodes) ? plan.nodes.filter(isObj) : [];
   plan.relations = Array.isArray(plan.relations) ? plan.relations.filter((r) => isObj(r) && r.type && r.a && r.b) : [];
@@ -283,6 +286,9 @@ export function normalizePlan(input) {
     used.add(id);
     return id;
   };
+  // 标记先占 id（人给的优先）：没写 id 的按 mark_N 编号
+  const markType = new Map();
+  for (const m of plan.marks || []) { if (!m.id || used.has(m.id)) { let k = 1; while (used.has(`mark_${k}`)) k++; m.id = `mark_${k}`; } used.add(m.id); markType.set(m.id, m.type); }
   for (const t of plan.terrain) { if (!t.op) t.op = "raise"; t.id = claim(t.id, t.op); fillDefaults(t, (XD.terrain || {})[t.op]); }
   const fixNode = (n, parent) => {
     if (!n.type) { n.type = n.children ? "group" : "box"; warn(`「${n.label || n.id || "节点"}」没写类型，按 ${n.type} 处理`); }
@@ -306,24 +312,26 @@ export function normalizePlan(input) {
   // 基础形态自带的水面也能当锚点 / 范围：lake（ground = lake）、sea（ground = island / coast）
   const implicit = site.ground === "lake" ? "lake" : site.ground === "island" || site.ground === "coast" ? "sea" : null;
   if (implicit && !global.has(implicit) && !terrainIds.has(implicit)) { terrainIds.add(implicit); terrainIdx.set(implicit, -1); }
-  const exists = (ref, { spawn = true, terrain = true, tpl = false } = {}) => {
+  const exists = (ref, { spawn = true, terrain = true, tpl = false, marks = true } = {}) => {
     const A = parseAnchor(ref);
     if (!A) return false;
     if (A.base === "site") return !A.suffix || ["C", "N", "NE", "E", "SE", "S", "SW", "W", "NW"].includes(A.suffix);
     if (A.base === "spawn") return spawn;
+    if (markType.has(A.base)) return marks && A.k === null;
     if (terrain && terrainIds.has(A.base)) return A.k === null;
     if (global.has(A.base)) return A.k === null || global.get(A.base).type === "repeat";
     return tpl && tplIds.has(A.base);
   };
   const who = (n) => `「${n.label || n.id}」`;
-  // 地形操作：只能锚到场地与前面的地形操作
+  // 地形操作：只能锚到场地、前面的地形操作与标记；area 只认圈选、along 只认手绘线
   plan.terrain.forEach((t, i) => {
     for (const k of ["at", "from", "to"]) {
       if (t[k] === undefined) continue;
       const A = parseAnchor(t[k]);
-      const ok = A && (A.base === "site" ? exists(t[k]) : terrainIdx.has(A.base) && terrainIdx.get(A.base) < i);
-      if (!ok) { warn(`地形${who(t)}的 ${k}「${t[k]}」只能是场地或前面的地形操作，改到场地${k === "at" ? "中心" : ""}`); if (k === "at") t.at = "site.C"; else delete t[k]; }
+      const ok = A && (A.base === "site" ? exists(t[k]) : markType.has(A.base) ? A.k === null : terrainIdx.has(A.base) && terrainIdx.get(A.base) < i);
+      if (!ok) { warn(`地形${who(t)}的 ${k}「${t[k]}」只能是场地、前面的地形操作或标记，改到场地${k === "at" ? "中心" : ""}`); if (k === "at") t.at = "site.C"; else delete t[k]; }
     }
+    for (const [k, ty, nm] of [["area", "area", "圈选"], ["along", "trace", "手绘线"]]) if (t[k] !== undefined && markType.get(t[k]) !== ty) { warn(`地形${who(t)}的 ${k}「${t[k]}」不是${nm}标记，去掉了`); delete t[k]; }
     if (!t.at) t.at = "site.C";
   });
   // 节点引用
@@ -347,11 +355,12 @@ export function normalizePlan(input) {
         if (Array.isArray(n.via)) n.via = n.via.filter(okT);
         return;
       }
-      for (const k of ["from", "to"]) if (!n[k] || !exists(n[k])) { warn(`连接${who(n)}的 ${k}「${n[k] || ""}」不存在，这条连接去掉了`); dropLinks.add(n.id); }
+      const byTrace = n.along && markType.get(n.along) === "trace"; // 顺着人画的一笔：from / to 可省
+      for (const k of ["from", "to"]) if (byTrace ? n[k] !== undefined && !exists(n[k]) : !n[k] || !exists(n[k])) { if (byTrace) { warn(`连接${who(n)}的 ${k}「${n[k]}」不存在，去掉了（照样顺着手绘线走）`); delete n[k]; } else { warn(`连接${who(n)}的 ${k}「${n[k] || ""}」不存在，这条连接去掉了`); dropLinks.add(n.id); } }
       if (Array.isArray(n.via)) n.via = n.via.filter((v) => exists(v) || (warn(`连接${who(n)}经过的「${v}」不存在，跳过`), false));
     }
     for (const k of ["area", "along", "around", "under", "over"]) fixRef(n, k, { spawn: false });
-    if (n.along && (global.get(parseAnchor(n.along).base) || {}).type !== "link") { warn(`${who(n)}沿的「${n.along}」不是连接，去掉了`); delete n.along; }
+    if (n.along && markType.get(n.along) !== "trace" && (n.type === "link" || (global.get(parseAnchor(n.along).base) || {}).type !== "link")) { warn(`${who(n)}沿的「${n.along}」不是${n.type === "link" ? "手绘线" : "连接或手绘线"}，去掉了`); delete n.along; }
     if (isObj(n.connect) && n.connect.from !== undefined && !exists(n.connect.from)) { warn(`${who(n)}的连接起点「${n.connect.from}」不存在，去掉了`); delete n.connect.from; }
   });
   if (dropLinks.size) { const strip = (arr) => arr.filter((n) => !dropLinks.has(n.id)).map((n) => { if (n.children) n.children = strip(n.children); return n; }); plan.nodes = strip(plan.nodes); for (const id of dropLinks) global.delete(id); }
@@ -361,10 +370,10 @@ export function normalizePlan(input) {
   plan.spawn = isObj(plan.spawn) ? plan.spawn : {};
   if (!plan.spawn.at) plan.spawn.at = "site.S";
   else if (!exists(plan.spawn.at, { spawn: false })) { warn(`出生点的锚点「${plan.spawn.at}」不存在，改到场地南边`); plan.spawn.at = "site.S"; }
-  if (plan.spawn.look_at && !exists(plan.spawn.look_at, { spawn: false })) { warn(`出生点要看的「${plan.spawn.look_at}」不存在，去掉了`); delete plan.spawn.look_at; }
+  if (plan.spawn.look_at && !exists(plan.spawn.look_at, { spawn: false, marks: false })) { warn(`出生点要看的「${plan.spawn.look_at}」不存在，去掉了`); delete plan.spawn.look_at; }
   // 关系
   plan.relations = plan.relations.filter((r) => {
-    for (const k of ["a", "b", "c"]) if (r[k] !== undefined && !exists(r[k])) { warn(`关系「${r.type}」引用的「${r[k]}」不存在，这条关系去掉了`); return false; }
+    for (const k of ["a", "b", "c"]) if (r[k] !== undefined && !exists(r[k], { marks: false })) { warn(`关系「${r.type}」引用的「${r[k]}」不存在，这条关系去掉了`); return false; }
     if (r.type === "between" && !r.c) { warn("「之间」关系少一个目标，去掉了"); return false; }
     return true;
   });
@@ -550,18 +559,179 @@ export function atFromPoint(sid, T, plan, id, point) {
   return { at: f.kind === "instance" ? `${f.rep.id}[${f.k}]` : f.node.at || (id === "spawn" ? "site.S" : "site.C"), offset_m };
 }
 
+// ============================================================ 标记（人画的几何，docs/07 §1.1）与手调高度（§4）
+// 圈的一块（area）/ 画的一笔（trace）/ 点的一个位置（pin）：坐标是人给的（相对场地中心，x 东、z 南，米），AI 只引用 id。
+// 都是本地操作：不调 AI，返回新 plan（不改入参），最后过一遍 normalizePlan。
+const MARK_WORD = { area: "圈选", trace: "手绘线", pin: "图钉" };
+const HAND_LABEL = /^手调高度 (\d+)$/, HAND_ID = /^hand_\d+$/;
+/** 点列去重（相邻 < 0.3 m 的并掉）、多了就均匀抽到 ≤ max 个（保留首尾） */
+function thinPts(pts, max, closed) {
+  let out = [];
+  for (const q of pts) if (!out.length || Math.hypot(q[0] - out[out.length - 1][0], q[1] - out[out.length - 1][1]) >= 0.3) out.push(q);
+  if (closed && out.length > 3 && Math.hypot(out[0][0] - out[out.length - 1][0], out[0][1] - out[out.length - 1][1]) < 0.3) out.pop();
+  if (out.length > max) { const step = (out.length - 1) / (max - 1); out = Array.from({ length: max }, (_, k) => out[Math.round(k * step)]); }
+  return out;
+}
+const areaOf = (poly) => { let a = 0; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) a += poly[j][0] * poly[i][1] - poly[i][0] * poly[j][1]; return Math.abs(a) / 2; };
+/** normalizePlan 用：标记的几何夹进场地、去重抽稀、几何不全的丢掉、补名字 */
+function cleanMarks(list, site, warn) {
+  const hw = site.size_m[0] / 2, hd = site.size_m[1] / 2, out = [];
+  const cp = (q) => [r1(clamp(q[0], -hw, hw)), r1(clamp(q[1], -hd, hd))];
+  const n = { area: 0, trace: 0, pin: 0 };
+  for (const m of (Array.isArray(list) ? list : []).slice(0, MAX_MARKS)) {
+    if (!isObj(m) || !MARK_WORD[m.type]) continue;
+    const o = { id: m.id, type: m.type, label: m.label || `${MARK_WORD[m.type]} ${++n[m.type]}` };
+    if (!m.id) delete o.id;
+    if (m.type === "area") { const pts = thinPts((m.polygon_m || []).map(cp), 64, true); if (pts.length < 3 || areaOf(pts) < 4) { warn(`标记「${o.label}」圈的范围太小，去掉了`); continue; } o.polygon_m = pts; }
+    else if (m.type === "trace") { const pts = thinPts((m.path_m || []).map(cp), 64, false); if (pts.length < 2) { warn(`标记「${o.label}」只有一个点，去掉了`); continue; } o.path_m = pts; }
+    else { if (!Array.isArray(m.point_m)) { warn(`标记「${o.label}」没有位置，去掉了`); continue; } o.point_m = cp(m.point_m); }
+    out.push(o);
+  }
+  return out;
+}
+/** plan 里已经用了的 id（节点 / 地形操作 / 标记 / 保留字） */
+function takenIds(p) {
+  const s = new Set([...RESERVED, ...(p.terrain || []).map((t) => t && t.id), ...(p.marks || []).map((m) => m && m.id)]);
+  walkNodes(p.nodes || [], (n) => s.add(n.id));
+  return s;
+}
+const nextId = (taken, base) => { let k = 1; while (taken.has(`${base}_${k}`)) k++; return `${base}_${k}`; };
+/** 删标记：连同手调高度时在它上面加的地形操作（hand_*）一起删；别的引用交给 normalizePlan 降级 */
+function dropMark(p, id) {
+  const i = (p.marks || []).findIndex((m) => m && m.id === id);
+  if (i < 0) return false;
+  p.marks.splice(i, 1);
+  p.terrain = (p.terrain || []).filter((t) => !(t && t.at === id && HAND_ID.test(t.id || "")));
+  return true;
+}
+/**
+ * 加一个标记（人在图上圈 / 画 / 点的）。坐标相对场地中心（x 东、z 南，米）；点多了抽稀到 ≤ 64 个。
+ * @param {object} plan
+ * @param {{type: "area"|"trace"|"pin", label?: string, polygon_m?: number[][], path_m?: number[][], point_m?: number[]}} mark
+ * @returns {{plan: object, id: string|null, warnings: string[]}} id = 新标记的 id（mark_N）；几何不合法时 null
+ */
+export function addMark(plan, mark) {
+  const p = clone(plan) || {};
+  if (!isObj(mark) || !MARK_WORD[mark.type]) return { plan: normalizePlan(p).plan, id: null, warnings: ["标记类型只能是 area / trace / pin"] };
+  p.marks = Array.isArray(p.marks) ? p.marks : [];
+  const id = nextId(takenIds(p), "mark");
+  const same = p.marks.filter((m) => m && m.type === mark.type).length;
+  const m = { id, type: mark.type, label: (mark.label || `${MARK_WORD[mark.type]} ${same + 1}`).slice(0, 16) };
+  if (mark.type === "area") m.polygon_m = thinPts((mark.polygon_m || []).map((q) => [r1(q[0]), r1(q[1])]), 64, true);
+  else if (mark.type === "trace") m.path_m = thinPts((mark.path_m || []).map((q) => [r1(q[0]), r1(q[1])]), 64, false);
+  else m.point_m = Array.isArray(mark.point_m) ? [r1(mark.point_m[0]), r1(mark.point_m[1])] : null;
+  p.marks.push(m);
+  const n = normalizePlan(p);
+  return { plan: n.plan, id: (n.plan.marks || []).some((q) => q.id === id) ? id : null, warnings: n.warnings };
+}
+/**
+ * 改一个标记：patch 可以有 label / polygon_m / path_m / point_m（类型不变）。拖图钉 = 改 point_m（锚在它上面的手调高度跟着走）。
+ * @returns {object} 新 plan（找不到 id 时原样规范化返回）
+ */
+export function updateMark(plan, id, patch) {
+  const p = clone(plan) || {}, m = (p.marks || []).find((q) => q && q.id === id);
+  if (m && isObj(patch)) for (const k of ["label", "polygon_m", "path_m", "point_m"]) if (patch[k] !== undefined) m[k] = clone(patch[k]);
+  if (m && Array.isArray(m.polygon_m)) m.polygon_m = thinPts(m.polygon_m, 64, true);
+  if (m && Array.isArray(m.path_m)) m.path_m = thinPts(m.path_m, 64, false);
+  return normalizePlan(p).plan;
+}
+/** 删一个标记（连同在它上面手调高度加的地形操作）；锚在它上面的别的东西由 normalizePlan 降级（改到场地中心并提一句） */
+export function removeMark(plan, id) {
+  const p = clone(plan) || {};
+  dropMark(p, id);
+  return normalizePlan(p).plan;
+}
+/**
+ * 随意选点调高度（docs/07 §4）：在 point_m 放一个图钉，加一个人给的地形操作 { op: raise|lower|flatten, at: <图钉>, shape: circle, size_m: [2r, 2r], height_m|depth_m, edge: slope, edge_m: 0.4 r }。
+ * 同一个图钉（pinId，或 opId）连续拖 = 改同一个操作，不堆新的：delta_m 加在这个操作原来的量上（界面拖动时一直传拖动开始时的 plan）。
+ * mode：raise = 上下拖抬高 / 压低（量变成负的就换成 lower）；lower = 只压低（|delta|）；flatten = 削到图钉处原来的地面高（target at_point）再 ± delta。
+ * @param {object} plan
+ * @param {{point_m: number[], delta_m: number, radius_m?: number, mode?: "raise"|"lower"|"flatten", pinId?: string, opId?: string}} e
+ * @returns {{plan: object, pinId: string, opId: string}}
+ */
+export function heightEdit(plan, e = {}) {
+  const p = clone(plan) || {};
+  p.terrain = Array.isArray(p.terrain) ? p.terrain : [];
+  p.marks = Array.isArray(p.marks) ? p.marks : [];
+  const mode = ["raise", "lower", "flatten"].includes(e.mode) ? e.mode : "raise";
+  const R = clamp(Number(e.radius_m) || 12, 2, 100), dl = clamp(Number(e.delta_m) || 0, -80, 80);
+  const isPin = (id) => p.marks.some((m) => m && m.type === "pin" && m.id === id);
+  let op = e.opId ? p.terrain.find((t) => t && t.id === e.opId && (HAND_ID.test(t.id) || isPin(t.at))) : null; // 只改手调的（AI 的地形操作用 applyOps 改 height_m）
+  let pin = p.marks.find((m) => m && m.type === "pin" && m.id === (e.pinId || (op && op.at)));
+  if (!op && pin) op = p.terrain.find((t) => t && t.at === pin.id && HAND_ID.test(t.id || ""));
+  const taken = takenIds(p);
+  if (!pin) {
+    pin = { id: nextId(taken, "mark"), type: "pin", point_m: Array.isArray(e.point_m) ? [r1(e.point_m[0]), r1(e.point_m[1])] : [0, 0] };
+    taken.add(pin.id); p.marks.push(pin);
+  }
+  if (!op) {
+    let n = 0; for (const t of p.terrain) { const m = HAND_LABEL.exec((t && t.label) || ""); if (m) n = Math.max(n, Number(m[1])); }
+    op = { id: nextId(taken, "hand"), label: `手调高度 ${n + 1}` };
+    p.terrain.push(op);
+  }
+  if (!pin.label) pin.label = op.label;
+  const prev = op.op === "raise" ? op.height_m || 0 : op.op === "lower" ? -(op.depth_m || 0) : op.op === "flatten" ? (op.height_m || 0) - (op.depth_m || 0) : 0;
+  const was = op.op;
+  for (const k of ["height_m", "depth_m", "target", "offset_m", "polygon_m", "path_m", "rotate_deg", "area", "steps"]) delete op[k];
+  Object.assign(op, { at: pin.id, shape: "circle", size_m: [r1(2 * R), r1(2 * R)], edge: "slope", edge_m: r1(Math.max(0.5, 0.4 * R)) });
+  if (mode === "flatten") {
+    const v = r1((was === "flatten" ? prev : 0) + dl);
+    Object.assign(op, { op: "flatten", target: "at_point" });
+    if (v > 0) op.height_m = v; else if (v < 0) op.depth_m = -v;
+  } else {
+    const v = r1((was === "raise" || was === "lower" ? prev : 0) + (mode === "lower" ? -Math.abs(dl) : dl));
+    if (v >= 0) Object.assign(op, { op: "raise", height_m: v }); else Object.assign(op, { op: "lower", depth_m: -v });
+  }
+  const n = normalizePlan(p); // 新的手调操作排在最后（作用在 AI 的地形之上）；超过地形操作上限时被截掉，warnings 里有一句
+  return { plan: n.plan, pinId: pin.id, opId: op.id, warnings: n.warnings };
+}
+/**
+ * 世界坐标 → 场地坐标（场地中心为原点，x 东、z 南）。plan 编译出的 SID 场地中心就是原点（恒等）；导入的 SID 按 bounds 的中心平移。
+ * @param {object} sid
+ * @param {number[]} p [x, z]
+ * @returns {number[]}
+ */
+export function worldToSite(sid, p) { const b = sid && sid.bounds, cx = b ? (b.min[0] + b.max[0]) / 2 : 0, cz = b ? (b.min[2] + b.max[2]) / 2 : 0; return [r2(p[0] - cx), r2(p[1] - cz)]; }
+/** 场地坐标 → 世界坐标（worldToSite 的反） */
+export function siteToWorld(sid, p) { const b = sid && sid.bounds, cx = b ? (b.min[0] + b.max[0]) / 2 : 0, cz = b ? (b.min[2] + b.max[2]) / 2 : 0; return [r2(p[0] + cx), r2(p[1] + cz)]; }
+
 // ------------------------------------------------------------ applyOps
 const SPECIAL = { site: () => DEFS.site, spawn: () => DEFS.spawn, lighting: () => DEFS.lighting, plan: () => ({ properties: Object.fromEntries(["name", "concept", "key_structures", "mood", "palette", "lighting", "locks"].map((k) => [k, PLAN_SCHEMA.properties[k]])) }) };
-/** 按 field 路径（a.b.c）在 schema 里找定义；找不到返回 null */
+const IDX = /^\d+$/;
+/** 按 field 路径（a.b.c；数字段 = 数组下标，如 size_m.1、child.size_m.0）在 schema 里找定义；找不到 / 下标越界返回 null */
 function fieldDef(def, path) {
   let d = deref(def);
   for (const seg of path.split(".")) {
     if (!d) return null;
+    if (IDX.test(seg)) {
+      const arr = d.type === "array" ? d : (d.oneOf || []).map((a) => deref(a)).find((a) => a.type === "array");
+      if (!arr || (arr.maxItems != null && Number(seg) >= arr.maxItems)) return null;
+      d = deref(Array.isArray(arr.items) ? arr.items[Number(seg)] : arr.items) || {};
+      continue;
+    }
     if (d.oneOf) d = deref(d.oneOf.find((a) => deref(a).properties) || d.oneOf[0]);
     if (!d.properties || !(seg in d.properties)) return null;
     d = deref(d.properties[seg]);
   }
   return d;
+}
+const GEN2 = new Set(["courtyard", "water", "terraces", "scatter_houses", "grove", "field", "space"]);
+/**
+ * 改数组的一个分量（size_m.1）之前：把 holder[key] 展开成完整数组——原来是数组就保留、不够长按有效值补；
+ * 原来是一个数 / 没写，按类型的有效尺寸（size3）或 x-defaults 补齐。base = 重复实例的模板（overrides 里没写时从模板取）。
+ */
+function arrayFor(holder, base, key, i) {
+  const ctx = Object.assign({}, isObj(base) ? base : {}, holder), cur = ctx[key];
+  let full;
+  if (key === "size_m" && ctx.type && !ctx.op) { const s3 = size3(Object.assign({}, ctx, { orient: undefined })); full = GEN2.has(ctx.type) ? [s3[0], s3[2]] : s3; }
+  else {
+    const dflt = ctx.op ? (XD.terrain || {})[ctx.op] : ctx.type ? (XD.nodes || {})[ctx.type] : null;
+    full = typeof cur === "number" ? [cur, cur, cur] : dflt && Array.isArray(dflt[key]) ? dflt[key] : [];
+  }
+  const xs = ctx.type && PLAN_SCHEMA["x-size"] ? (PLAN_SCHEMA["x-size"][ctx.type] || []).length : 0;
+  const out = Array.isArray(cur) ? cur.slice() : [], L = Math.max(i + 1, out.length || (key === "size_m" && xs) || full.length || 2);
+  for (let k = out.length; k < L; k++) out.push(Number.isFinite(full[k]) ? full[k] : out.length ? out[out.length - 1] : 0);
+  return out;
 }
 /** 删掉一个节点后：指向它（或它子树里的节点）的锚点改到场地中心 / 父组原点；连接去掉；area / along / around / look_at 去掉——交给 normalizePlan 统一降级 */
 /**
@@ -581,19 +751,27 @@ export function applyOps(plan, ops) {
     if (op.op === "set") {
       const field = String(op.field || "");
       if (!field || field === "id") { warnings.push(`「${op.id}」不能改「${field}」`); continue; }
-      let obj, def;
+      let obj, def, base = null;
       if (SPECIAL[op.id]) { def = SPECIAL[op.id](); obj = op.id === "plan" ? p : (p[op.id] = isObj(p[op.id]) ? p[op.id] : {}); }
+      else if ((p.marks || []).some((m) => m && m.id === op.id)) { def = DEFS.mark; obj = p.marks.find((m) => m.id === op.id); if (field === "type") { warnings.push("标记不能改类型"); continue; } }
       else {
         const f = findNode(p, op.id);
         if (!f) { warnings.push(`要改的「${op.id}」不存在，跳过`); continue; }
         def = f.kind === "terrain" ? DEFS.terrain_op : DEFS.node;
-        if (f.kind === "instance") { const ov = (f.rep.overrides = isObj(f.rep.overrides) ? f.rep.overrides : {}); obj = ov[String(f.k)] = isObj(ov[String(f.k)]) ? ov[String(f.k)] : {}; }
+        if (f.kind === "instance") { const ov = (f.rep.overrides = isObj(f.rep.overrides) ? f.rep.overrides : {}); obj = ov[String(f.k)] = isObj(ov[String(f.k)]) ? ov[String(f.k)] : {}; base = f.rep.child; }
         else obj = f.node;
       }
       if (!fieldDef(def, field)) { warnings.push(`「${op.id}」没有「${field}」这个字段，跳过`); continue; }
       const segs = field.split("."), last = segs.pop();
-      let o = obj;
-      for (const sg of segs) { if (!isObj(o[sg])) o[sg] = {}; o = o[sg]; }
+      if (IDX.test(last) && (op.value === null || op.value === undefined)) { warnings.push(`「${op.id}」的「${field}」是数组的一个分量，不能删`); continue; }
+      let o = obj, b = base;
+      for (let si = 0; si < segs.length; si++) {
+        const sg = segs[si], nextIdx = IDX.test(si + 1 < segs.length ? segs[si + 1] : last);
+        if (IDX.test(sg)) { b = Array.isArray(b) ? b[Number(sg)] : null; if (!isObj(o[sg])) o[sg] = isObj(b) ? clone(b) : {}; o = o[sg]; continue; }
+        if (nextIdx) { o[sg] = arrayFor(o, b, sg, Number(si + 1 < segs.length ? segs[si + 1] : last)); b = b && b[sg]; o = o[sg]; continue; }
+        if (!isObj(o[sg])) o[sg] = {};
+        b = isObj(b) ? b[sg] : null; o = o[sg];
+      }
       if (op.value === null || op.value === undefined) delete o[last]; else o[last] = clone(op.value);
     } else if (op.op === "add") {
       if (!isObj(op.value)) { warnings.push("加的东西不是一个对象，跳过"); continue; }
@@ -602,6 +780,7 @@ export function applyOps(plan, ops) {
       const ins = (list) => { if (at === null || at >= list.length) list.push(v); else list.splice(Math.max(0, at), 0, v); };
       if (to === "root" || to === "nodes") ins(p.nodes);
       else if (to === "terrain") ins(p.terrain);
+      else if (to === "marks") { p.marks = Array.isArray(p.marks) ? p.marks : []; if (!v.id || takenIds(p).has(v.id)) v.id = nextId(takenIds(p), "mark"); ins(p.marks); }
       else if (to === "relations") { p.relations = Array.isArray(p.relations) ? p.relations : []; ins(p.relations); }
       else {
         const f = to && findNode(p, to);
@@ -615,6 +794,7 @@ export function applyOps(plan, ops) {
       const m = /^rel:(\d+)$/.exec(String(op.id));
       if (m) { const i = Number(m[1]); if (p.relations && p.relations[i]) p.relations.splice(i, 1); else warnings.push(`没有第 ${i} 条关系`); continue; }
       if (op.id === "spawn") { delete p.spawn; continue; }
+      if (dropMark(p, op.id)) continue;
       const f = findNode(p, op.id);
       if (!f) { warnings.push(`要删的「${op.id}」不存在`); continue; }
       if (f.kind === "instance") { const s = new Set(f.rep.skip || []); s.add(f.k); f.rep.skip = [...s].sort((a, b) => a - b); continue; }
@@ -628,7 +808,7 @@ export function applyOps(plan, ops) {
 }
 
 // ------------------------------------------------------------ 旋钮（从 schema + x-ui 生成）
-const GROUP_DEF = { node: "node", nodes: "node", terrain: "terrain_op", relation: "relation", relations: "relation", site: "site", spawn: "spawn" };
+const GROUP_DEF = { node: "node", nodes: "node", terrain: "terrain_op", relation: "relation", relations: "relation", site: "site", spawn: "spawn", mark: "mark", marks: "mark" };
 const groupDefOf = (group, schema) => {
   if (group === "look") return { properties: { lighting: schema.properties.lighting, palette: schema.properties.palette, mood: schema.properties.mood } };
   if (group === "plan") return { properties: { name: schema.properties.name, concept: schema.properties.concept, key_structures: schema.properties.key_structures } };
@@ -644,6 +824,7 @@ function refOptions(groups, plan, selfId, anchors) {
     if (g === "site") { out.push({ value: anchors ? "site.C" : "site", label: "场地中心", group: "site" }); if (anchors) for (const d of ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]) out.push({ value: `site.${d}`, label: `场地${DIR_LABEL[d]}边`, group: "site" }); }
     else if (g === "spawn") out.push({ value: "spawn", label: (plan && plan.spawn && plan.spawn.label) || "出生点", group: "spawn" });
     else if (g === "terrain") for (const t of (plan && plan.terrain) || []) { if (t.id !== selfId) out.push({ value: t.id, label: t.label || t.id, group: "terrain" }); }
+    else if (g === "marks") for (const m of (plan && plan.marks) || []) out.push({ value: m.id, label: m.label || m.id, group: "marks", type: m.type });
     else if (g === "nodes") walkNodes((plan && plan.nodes) || [], (n, p, inT) => { if (!inT && n.id !== selfId) out.push({ value: n.id, label: n.label || n.id, group: "nodes", type: n.type }); });
   }
   return out;
@@ -793,7 +974,7 @@ export function distinctPlans(plans, threshold = 1) {
   for (let i = 0; i < plans.length; i++) for (let j = i + 1; j < plans.length; j++) if (planDistance(plans[i], plans[j]) < threshold) return false;
   return true;
 }
-export { size3 };
+export { size3, describeRef, diffCompiled };
 
 // ============================================================ 程序检查（v5 第 1 轮从 program.js 挪来：program.js 超过 1200 行；解释在 program.js，检查在这里）
 /**

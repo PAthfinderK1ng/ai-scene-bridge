@@ -37,7 +37,8 @@
         "ignored_checks": { "type": "array", "items": { "type": "string" }, "description": "人标了「不重要」的检查 id" },
         "section": { "type": "object", "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上", "properties": { "mode": { "type": "string", "enum": ["trail", "line"] }, "line": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "直线模式的两个端点 [x, z]" }, "width_m": { "type": "number", "minimum": 2, "maximum": 60, "default": 12 } } },
         "plan_version": { "type": "integer", "description": "v0.5：2 = 由场景程序（plan v2）编译；resolve 按体块的 land 重新落地" },
-        "ground": { "type": "string", "description": "v0.5：plan.site.ground（flat / rolling / hills / mountain / canyon / lake / island / coast / desert / cavern / sky）" }
+        "ground": { "type": "string", "description": "v0.5：plan.site.ground（flat / rolling / hills / mountain / canyon / lake / island / coast / desert / cavern / sky）" },
+        "marks": { "type": "array", "description": "v0.6：人画的标记（plan.marks，docs/07 §1.1）：圈的一块 / 画的一笔 / 点的位置，坐标相对场地中心（x 东、z 南，米）。只供参考，不是几何（不出体块、不参与碰撞）", "items": { "type": "object", "required": ["id", "type"], "properties": { "id": { "type": "string" }, "type": { "type": "string", "enum": ["area", "trace", "pin"] }, "label": { "type": "string" }, "polygon_m": { "type": "array", "items": { "$ref": "#/definitions/vec2" } }, "path_m": { "type": "array", "items": { "$ref": "#/definitions/vec2" } }, "point_m": { "$ref": "#/definitions/vec2" } } } }
       }
     },
     "intent": {

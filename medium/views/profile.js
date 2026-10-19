@@ -3,7 +3,7 @@
 // 连接点、每层高把手。v5：带内形体按真实高度画轮廓（锥 / 尖顶三角、穹顶半圆、拱两腿 + 弧、环两截管、浮岛倒三角），悬空的画在空中。
 // 层号与俯视图统一：第 1 层 = 入口地面。纵向有夸张，标注一律写真实米数。
 // 拖动只改 DOM，节流 120 ms 调 onDragLive（给 3D 预览）；松手才回调。纯函数，不 import app.js / ui.js，不调 AI。
-import { svgel, spawnOf, spawnY, landmarkOf, SELECT_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth, shapeOf, volDims, roofOf, volumeBase, elevOf, volumeType, volumeColor, paletteOf, archThickness, torusTube, volToWorld, isUpright } from "./map.js";
+import { svgel, spawnOf, spawnY, landmarkOf, SELECT_COLOR, SECTION_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth, shapeOf, volDims, roofOf, volumeBase, elevOf, volumeType, volumeColor, paletteOf, archThickness, torusTube, volToWorld, isUpright, opHeightInfo } from "./map.js";
 import { sampleSection, projectToPath, SECTION_WIDTH } from "../engine/section.js";
 import { SPACE_LABEL, VIA_LABEL, STRATUM_LABEL, LAYOUT_LABEL, SKY_LAYOUT_LABEL, ROLE_LABEL, levelsOf, levelStep } from "../engine/interior.js";
 
@@ -15,6 +15,48 @@ const sgn = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v);
 export const SLOPE_STEPS = [[3, "缓"], [4, "中"], [5, "陡"]];
 /** 每层高的可调范围（与 terrain.js 的夹取一致） */
 export const LAYER_RANGE = [2.5, 6];
+
+// ------------------------------------------------------------ 高度笔刷与地形操作把手的数值（俯视图 bindMap 与剖面共用；docs/07 §4）
+/** 每个字段的可调范围（米） */
+export const OP_RANGE = { height_m: [-60, 150], depth_m: [0, 80], amplitude_m: [0, 30], step_h_m: [1, 12] };
+/** 「+12 m」/「深 4 m」/「起伏 3 m」/「每级 3 m」 */
+export const opValueText = (field, v) => (field === "depth_m" ? `深 ${fmt1(v)} m` : field === "amplitude_m" ? `起伏 ${fmt1(v)} m` : field === "step_h_m" ? `每级 ${fmt1(v)} m` : `${v > 0 ? "+" : v < 0 ? "−" : "±"}${fmt1(Math.abs(v))} m`);
+/** 「高度」笔刷（跨重绘保留）：半径（米，默认 12）与范围；滚轮 / [ ] 调 */
+export const heightBrush = { radius_m: 12, min: 2, max: 80 };
+/** 高度工具：屏幕上每拖 1 px = 0.1 m（100 px = 10 m），吸附 0.5 m */
+export const HEIGHT_M_PER_PX = 0.1;
+export const brushStep = (r, dir) => clampN(Math.round((r + dir * (r < 10 ? 1 : r < 30 ? 2 : 5)) * 2) / 2, heightBrush.min, heightBrush.max);
+const sgnM = (v) => `${v > 0 ? "+" : v < 0 ? "−" : "±"}${fmt1(Math.abs(v))} m`;
+/** 竖向拖动 dyPx（向下为正；mPerPx = 每单位多少米）+ 修饰键 → { delta_m（有符号，+ 抬高 / − 压低）, radius_m, mode }：Shift = flatten（纯削平到按下点高度，竖拖不叠加），Alt = 只压低 */
+export function heightStroke(dyPx, mods = {}, mPerPx = HEIGHT_M_PER_PX) {
+  // Shift = 纯削平到按下点的高度（docs/07 §4）：竖拖不叠加偏移
+  if (mods.shiftKey) return { delta_m: 0, radius_m: heightBrush.radius_m, mode: "flatten" };
+  const raw = Math.round(-dyPx * mPerPx * 2) / 2 || 0, delta_m = mods.altKey ? -Math.abs(raw) : raw;
+  return { delta_m, radius_m: heightBrush.radius_m, mode: delta_m < 0 || mods.altKey ? "lower" : "raise" };
+}
+/**
+ * 俯视图上的高度笔刷：圈（外圈 = 半径，内圈 = 60%：边上 40% 是平滑过渡）+ 数值。p = null 时藏起来。
+ * @param {SVGSVGElement} svg @param {SVGGElement|null} node 上次画的（没有就新建并挂到 svg 上） @param {number[]|null} p 世界 [x, z]
+ * @param {{mode: string, delta_m: number}|null} st 拖动中的数值（null = 只是悬停） @param {number} U 图上 1 单位字号
+ * @returns {SVGGElement|null} 笔刷节点（下次传回来）
+ */
+export function drawHeightBrush(svg, node, p, st, U) {
+  if (!p) { if (node) node.setAttribute("visibility", "hidden"); return node; }
+  const r = heightBrush.radius_m, col = !st ? "#555" : st.mode === "flatten" ? SECTION_COLOR : st.delta_m < 0 ? "#2a6aa6" : "#c0392b";
+  if (!node) {
+    node = svgel("g", { class: "height-brush", "pointer-events": "none" }, svgel("circle", { class: "brush-ring", fill: "none" }), svgel("circle", { class: "brush-core", fill: "none" }), svgel("circle", { class: "brush-dot" }),
+      svgel("text", { class: "brush-text", stroke: "#fff", "paint-order": "stroke", "font-weight": 700 }));
+    svg.append(node);
+  }
+  const [ring, core, dot, txt] = node.childNodes;
+  node.removeAttribute("visibility"); node.setAttribute("transform", `translate(${fmt1(p[0])} ${fmt1(p[1])})`); node.setAttribute("data-mode", st ? st.mode : "hover");
+  ring.setAttribute("r", fmt1(r)); ring.setAttribute("stroke", col); ring.setAttribute("stroke-width", fmt1(0.4 * U)); ring.setAttribute("fill", col); ring.setAttribute("fill-opacity", st ? 0.1 : 0.04);
+  core.setAttribute("r", fmt1(r * 0.6)); core.setAttribute("stroke", col); core.setAttribute("stroke-width", fmt1(0.25 * U)); core.setAttribute("stroke-dasharray", `${fmt1(U)} ${fmt1(0.7 * U)}`);
+  dot.setAttribute("r", fmt1(0.6 * U)); dot.setAttribute("fill", col);
+  txt.setAttribute("x", fmt1(r * 0.72 + 0.8 * U)); txt.setAttribute("y", fmt1(-r * 0.72)); txt.setAttribute("font-size", fmt1((st ? 3 : 2.3) * U)); txt.setAttribute("fill", col); txt.setAttribute("stroke-width", fmt1(0.7 * U));
+  txt.textContent = st ? `${st.mode === "flatten" ? `削平${st.delta_m ? " " + sgnM(st.delta_m) : ""}` : sgnM(st.delta_m)} · 半径 ${fmt1(r)} m` : `高度 · 半径 ${fmt1(r)} m`;
+  return node;
+}
 /** 坡度档位：按区间高亮一档（≤ 3.4 缓，≤ 4.4 中，再高陡）；亮着的不是整档时点它回到整档（act） */
 export function slopeChoices(layer) {
   const cur = Number(layer), k = !Number.isFinite(cur) ? -1 : cur <= 3.4 ? 0 : cur <= 4.4 ? 1 : 2;
@@ -37,6 +79,9 @@ export function spaceText(sp, n) {
  *   onDragHint(text|null) · onDragLive({kind, id, value}|null)（kind ∈ terrace | layer | landmark | space_floor | space_height）
  *   onSelect(target) 点一下（没拖）：target 同俯视图 {type, plan_id?, sid_id?, part?, sublevel?}
  *   onSectionMode("trail"|"line") · onSectionWidth(w) · onSectionWidthLive(w|null) · onSectionRotate(deg) · onSectionTool() · onSlope(layer_m)
+ *   onGroundDrag({d, x, z}, delta_m, { live, mode, radius_m })：地面线任意一点上下拖（x, z = 世界坐标；live = true 拖动中节流 120 ms、false 松手）；
+ *     Shift = flatten（削平到这点 + delta）、Alt = 只压低，半径 = 俯视图笔刷 heightBrush.radius_m；放弃（Esc / 拖回 0）调 onDragLive(null)
+ *   onOpHeight(opId, value, { field })：选中的地形操作的高度把手（value = field 的新值）；拖动中 onDragLive({kind: "op_height", id, value, field})
  * @returns {{ node: HTMLElement, stats: object, scale: { sx, sy, hy, pxPerM } }}
  */
 export function renderProfile(ctx, opts = {}) {
@@ -105,6 +150,9 @@ export function renderProfile(ctx, opts = {}) {
     const g = nearestGround(S.ground, p.d); if (!g) continue;
     s.append(svgel("circle", { cx: fmt1(sx(p.d)), cy: fmt1(sy(g.h)), r: 1.6, fill: p.kind === "river" ? "#4f86c6" : "#8b7d5b", stroke: "#fff", "stroke-width": 0.4 }, svgel("title", {}, p.kind === "river" ? "溪" : "路")));
   }
+
+  // 地面线任意一点可抓（docs/07 §4）：悬停出把手 + 当前高度；上下拖 = 在剖切线上这一点做「高度」操作（盖在体块下面，体块 / 平台照旧先接手势）
+  if (typeof opts.onGroundDrag === "function" && S.ground.length > 1) groundGrab(s, S, sx, sy, pxPerM, hint, opts);
 
   // 带内体块（房子 / 树 / 形体）：按形体画轮廓、按真实高度；悬空的画在空中（虚线吊到地面 + 「↑18 m」）。地标单独画
   const pal = paletteOf(sid), elevSeen = new Set(); // 「↑N m」每组一个（同一模板的实例算一组）
@@ -267,6 +315,10 @@ export function renderProfile(ctx, opts = {}) {
     });
   }
 
+  // 选中的地形操作：高度把手（上下拖改 height_m / depth_m …；投到剖切线上它中心的位置，横线 = 它的影响范围）
+  const opI = ctx.selected && ctx.selected.plan_id && typeof opts.onOpHeight === "function" ? opHeightInfo(ctx.plan || (sid.meta && sid.meta.plan), sid, ctx.selected.plan_id) : null;
+  if (opI && opI.field && S.path && S.path.length > 1) opHandle(s, S, opI, { sx, sy, pxPerM, total, drag, opts });
+
   // 每层高把手：左上角「每层高 3 m ↕」，上下拖等比缩放所有层线
   const topK = layerLines.length ? layerLines[layerLines.length - 1].k : 1, knobY = mT - 4;
   const knob = svgel("text", { x: 2, y: knobY, "font-size": 5.5, fill: "#6b7a4b", class: "h-layer", style: opts.onLayerHeight ? "cursor:ns-resize" : null }, `每层高 ${layer} m${opts.onLayerHeight ? " ↕" : ""} · 纵向有夸张`);
@@ -312,7 +364,7 @@ export function renderProfile(ctx, opts = {}) {
     cap.append(span(bits.join(" · ")));
   } else cap.append(span(`直线剖切 ${stats.length_m} m · 高差 ${stats.climb_m} m`));
   if (S.spaces.length) cap.append(span(`切到 ${S.spaces.length} 个空间${interior ? `（${interior} 段通道 / 房间）` : ""}${S.connectors.length ? ` · ${S.connectors.length} 个连接点` : ""}`));
-  if (Object.keys(opts).some((k) => k.startsWith("on") && !["onDragHint", "onDragLive", "onSelect"].includes(k))) cap.append(span("上下拖平台 / 顶边 / 空间改高度"));
+  if (Object.keys(opts).some((k) => k.startsWith("on") && !["onDragHint", "onDragLive", "onSelect"].includes(k))) cap.append(span(opts.onGroundDrag ? "上下拖地面线任意一点 / 平台 / 顶边 / 空间改高度（Shift 削平 · Alt 只压低）" : "上下拖平台 / 顶边 / 空间改高度"));
   const wrap = document.createElement("div");
   wrap.className = "wrap";
   wrap.append(s, cap);
@@ -457,3 +509,97 @@ function segButtons(items, cur, on) {
 }
 function button(text, on, cls, title) { const b = document.createElement("button"); b.type = "button"; b.textContent = text; if (cls) b.className = cls; if (title) b.title = title; b.addEventListener("click", on); return b; }
 function span(t) { const e = document.createElement("span"); e.textContent = t; return e; }
+
+// ---------- 随意选点调高度（docs/07 §4）
+const r2p = (v) => Math.round(v * 100) / 100;
+/** 笔刷权重：中心 60% 全量，外 40% 平滑过渡到 0（与引擎 edge slope 同一口径） */
+const brushW = (dist, r) => { if (dist >= r) return 0; if (dist <= r * 0.6) return 1; const t = (r - dist) / (r * 0.4); return t * t * (3 - 2 * t); };
+/** 一次高度操作后的地面（近似预览，真结果等引擎重算）：raise 只抬、lower 只压、flatten 拉向目标 */
+function brushGround(G, pt, ref, st) {
+  const tgt = ref + st.delta_m;
+  return G.map((g) => {
+    const w = brushW(Math.hypot(g.x - pt.x, g.z - pt.z), st.radius_m), h = g.h + (tgt - g.h) * w;
+    return { d: g.d, h: st.mode === "flatten" ? h : st.mode === "lower" ? Math.min(g.h, h) : Math.max(g.h, h), w };
+  }).filter((g, i, A) => g.w > 0 || (A[i - 1] && A[i - 1].w > 0) || (A[i + 1] && A[i + 1].w > 0)); // 只画变了的那一段（两头各多一点接上原地面）
+}
+/**
+ * 地面线抓取：透明粗线接手势；悬停显示把手与当前高度；按下 → 上下拖（纵向按剖面比例，吸附 0.5 m）→ 虚线预览改后的地面 + 「+4.5 m」；
+ * 拖动中节流调 onGroundDrag(pt, delta, {live: true})，松手调 {live: false}；Esc / 没拖出数值 → onDragLive(null)。
+ */
+function groundGrab(s, S, sx, sy, pxPerM, hint, opts) {
+  const G = S.ground.filter((g) => Number.isFinite(g.x) && Number.isFinite(g.z));
+  if (G.length < 2) return;
+  const line = (arr) => arr.map((g, i) => `${i ? "L" : "M"}${fmt1(sx(g.d))} ${fmt1(sy(g.h))}`).join("");
+  const hit = svgel("path", { d: line(G), fill: "none", stroke: "#000", "stroke-opacity": 0, "stroke-width": 7, "stroke-linecap": "round", class: "h-ground", "data-type": "ground_line", style: "cursor:ns-resize" }, svgel("title", {}, "地面：任意一点上下拖 = 抬高 / 压低（Shift 削平，Alt 只压低）"));
+  const ghost = svgel("path", { fill: "none", stroke: "#c0392b", "stroke-width": 1.1, "stroke-dasharray": "2 1.2", "pointer-events": "none", class: "ground-ghost", visibility: "hidden" });
+  const knob = svgel("g", { class: "ground-knob", "pointer-events": "none", visibility: "hidden" }, svgel("circle", { r: 2.2, fill: "#fff", stroke: "#c0392b", "stroke-width": 0.8 }),
+    svgel("text", { x: 3.4, y: -2.6, "font-size": 5, fill: "#c0392b", stroke: "#fff", "stroke-width": 1.2, "paint-order": "stroke", class: "ground-knob-text" }));
+  // 拖动中跟着指针的大号数值：剖面纵向有夸张（拖 1 px 比俯视图多出好几倍米数），旁边直接写出放大倍数
+  const tag = svgel("g", { class: "ground-live", "pointer-events": "none", visibility: "hidden" },
+    svgel("text", { "font-size": 8, "font-weight": 700, fill: "#c0392b", stroke: "#fff", "stroke-width": 1.6, "paint-order": "stroke", class: "ground-live-v" }),
+    svgel("text", { "font-size": 4.6, fill: "#7a3b2e", stroke: "#fff", "stroke-width": 1.2, "paint-order": "stroke", class: "ground-live-n" }));
+  const G1 = G[G.length - 1], hpm = (sx(G1.d) - sx(G[0].d)) / Math.max(0.01, G1.d - G[0].d), ex = pxPerM / Math.max(1e-6, hpm), VW = (s.viewBox && s.viewBox.baseVal && s.viewBox.baseVal.width) || 320;
+  const showTag = (c, big, small) => {
+    const right = c.x > VW - 110, x = right ? c.x - 5 : c.x + 6, y = Math.max(12, c.y - 4), [tv, tn] = tag.children;
+    for (const t of [tv, tn]) { t.setAttribute("x", fmt1(x)); t.setAttribute("text-anchor", right ? "end" : "start"); }
+    tv.setAttribute("y", fmt1(y)); tn.setAttribute("y", fmt1(y + 6)); tv.textContent = big; tn.textContent = small;
+    tag.removeAttribute("visibility");
+  };
+  s.append(hit, ghost, knob, tag);
+  const toSvg = (e) => { const m = s.getScreenCTM(); return m ? new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse()) : { x: e.clientX, y: e.clientY }; };
+  const at = (e) => { const x = toSvg(e).x; let best = G[0]; for (const g of G) if (Math.abs(sx(g.d) - x) < Math.abs(sx(best.d) - x)) best = g; return best; };
+  const show = (d, h, text) => { knob.removeAttribute("visibility"); knob.setAttribute("transform", `translate(${fmt1(sx(d))} ${fmt1(sy(h))})`); knob.lastChild.textContent = text; };
+  let busy = false;
+  hit.addEventListener("pointermove", (e) => { if (!busy) { const g = at(e); show(g.d, g.h, `${fmt1(g.h)} m`); } });
+  hit.addEventListener("pointerleave", () => { if (!busy) knob.setAttribute("visibility", "hidden"); });
+  hit.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation();
+    const g = at(e), y0 = toSvg(e).y, pt = { d: r2p(g.d), x: r2p(g.x), z: r2p(g.z) };
+    let st = null, sent = null, tLive = 0, timer = null, mods = { shiftKey: e.shiftKey, altKey: e.altKey }, dy = 0, cur = toSvg(e);
+    busy = true;
+    const extra = () => ({ mode: st.mode, radius_m: st.radius_m });
+    const sendLive = () => { timer = null; tLive = performance.now(); const sig = `${st.delta_m}|${st.mode}|${st.radius_m}`; if (sig !== sent) { sent = sig; opts.onGroundDrag(pt, st.delta_m, Object.assign({ live: true }, extra())); } };
+    const update = () => {
+      st = heightStroke(dy, mods, 1 / pxPerM);
+      const txt = st.mode === "flatten" ? `削平${st.delta_m ? ` ${sgn(st.delta_m)} m` : ""}` : `${st.delta_m >= 0 ? "+" : "−"}${Math.abs(st.delta_m)} m`;
+      show(g.d, g.h + st.delta_m, "");
+      const mpx = 1 / (pxPerM * (((s.getScreenCTM() || {}).d) || 1)), exTxt = ex > 1.3 ? `纵向放大 ×${fmt1(ex)}` : "";
+      showTag(cur, txt, [`半径 ${st.radius_m} m`, exTxt, `1 px ≈ ${Math.round(mpx * 100) / 100} m`].filter(Boolean).join(" · "));
+      ghost.removeAttribute("visibility"); ghost.setAttribute("d", line(brushGround(G, pt, g.h, st)));
+      hint(`地面 ${fmt1(g.h)} m → ${txt}${exTxt ? `（剖面${exTxt}：拖 1 px ≈ ${Math.round(mpx * 100) / 100} m，俯视图是 0.1 m）` : ""}`);
+      if (!timer) { const wait = LIVE_MS - (performance.now() - tLive); if (wait <= 0) sendLive(); else timer = setTimeout(sendLive, wait); }
+    };
+    const off = () => { busy = false; if (timer) clearTimeout(timer); timer = null; knob.setAttribute("visibility", "hidden"); ghost.setAttribute("visibility", "hidden"); tag.setAttribute("visibility", "hidden"); hint(null); for (const [k, f] of L) window.removeEventListener(k, f, true); };
+    const cancel = () => { off(); if (sent && typeof opts.onDragLive === "function") opts.onDragLive(null); };
+    const mv = (ev) => { cur = toSvg(ev); dy = cur.y - y0; mods = { shiftKey: ev.shiftKey, altKey: ev.altKey }; if (st || Math.abs(dy) >= 0.8 || mods.shiftKey) update(); };
+    const up = () => { const done = st && (st.delta_m !== 0 || st.mode === "flatten"); if (!done) return cancel(); off(); opts.onGroundDrag(pt, st.delta_m, Object.assign({ live: false }, extra())); };
+    const key = (ev) => { if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); cancel(); } else if ((ev.key === "Shift" || ev.key === "Alt") && st) { if (ev.key === "Alt") ev.preventDefault(); mods = { shiftKey: ev.shiftKey, altKey: ev.altKey }; update(); } };
+    const L = [["pointermove", mv], ["pointerup", up], ["pointercancel", cancel], ["keydown", key], ["keyup", key]];
+    for (const [k, f] of L) window.addEventListener(k, f, true);
+    if (mods.shiftKey) update();
+  });
+}
+/** 选中的地形操作在剖面上的高度把手：投到剖切线（夹在两端），横虚线 = 影响半径，橙色 ↕ 竖拖 */
+function opHandle(s, S, I, { sx, sy, pxPerM, total, drag, opts }) {
+  const pr = projectToPath(S.path, I.center), d = clampN(pr.d, 0, total), g = nearestGround(S.ground, d);
+  const yAbs = (v) => (I.field === "height_m" || I.field === "depth_m") && I.top != null ? I.top + (I.field === "depth_m" ? I.value - v : v - I.value) : (g ? g.h : 0) + (I.field === "amplitude_m" || I.field === "step_h_m" ? v : 0);
+  const x = sx(d), r = Math.max(2, I.radius || 0), xa = sx(clampN(d - r, 0, total)), xb = sx(clampN(d + r, 0, total)), far = pr.off > S.width_m / 2 + r;
+  const lineEl = svgel("line", { x1: fmt1(xa), x2: fmt1(xb), y1: fmt1(sy(yAbs(I.value))), y2: fmt1(sy(yAbs(I.value))), stroke: SELECT_COLOR, "stroke-width": 0.8, "stroke-dasharray": "2 1.2", "pointer-events": "none", class: "op-level" });
+  const knob = svgel("g", { "data-type": "op_height", "data-plan-id": I.id, "data-field": I.field, class: "op-height", style: "cursor:ns-resize", transform: `translate(${fmt1(x)} ${fmt1(sy(yAbs(I.value)))})`, opacity: far ? 0.6 : 1 },
+    svgel("rect", { x: -2.2, y: -4.5, width: 4.4, height: 9, rx: 2.2, fill: SELECT_COLOR, stroke: "#fff", "stroke-width": 0.5 }),
+    svgel("path", { d: "M-1.2 -1.4L0 -3.2L1.2 -1.4M-1.2 1.4L0 3.2L1.2 1.4", fill: "none", stroke: "#fff", "stroke-width": 0.6, "pointer-events": "none" }),
+    svgel("text", { x: 3.6, y: 1.8, "font-size": 5, "font-weight": 700, fill: SELECT_COLOR, stroke: "#fff", "stroke-width": 1.2, "paint-order": "stroke", "pointer-events": "none", class: "op-height-text" }, `${I.label} ${I.text}${far ? "（不在剖切带里）" : ""}`),
+    svgel("title", {}, `${I.label}：上下拖改${I.field === "depth_m" ? "深度" : "高度"}`));
+  s.append(lineEl, knob);
+  const [lo, hi] = OP_RANGE[I.field] || [-60, 150];
+  drag(knob, {
+    move: (dy) => {
+      const v = clampN(snap(I.value + (I.field === "depth_m" ? 1 : -1) * (dy / pxPerM)), lo, hi), y = fmt1(sy(yAbs(v)));
+      knob.setAttribute("transform", `translate(${fmt1(x)} ${y})`); lineEl.setAttribute("y1", y); lineEl.setAttribute("y2", y); knob.querySelector("text").textContent = `${I.label} ${opValueText(I.field, v)}`;
+      return { v, text: `${I.label}：${opValueText(I.field, v)}` };
+    },
+    live: (r) => ({ kind: "op_height", id: I.id, value: r.v, field: I.field }),
+    end: (r) => { if (r.v !== I.value) opts.onOpHeight(I.id, r.v, { field: I.field }); else if (typeof opts.onDragLive === "function") opts.onDragLive(null); },
+  });
+}

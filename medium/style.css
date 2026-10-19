@@ -124,7 +124,7 @@ button:disabled, .ubtn:disabled { opacity: .45; cursor: not-allowed; }
 #strata-switch button.on { background: #2a2622; color: #fff; border-color: #2a2622; }
 #strata-switch button i { position: absolute; right: -5px; top: -5px; font-style: normal; font-size: 10px; min-width: 14px; line-height: 14px; border-radius: 7px; background: var(--accent); color: #fff; }
 #strata-switch button i:empty { display: none; }
-/* 3D 小窗：俯视图里是可拖的浮窗（默认左上，位置记在本机）；剖面里嵌在剖面下方 */
+/* 3D 小窗：俯视图里是可拖的浮窗（默认右下、避开选中 / 标记，位置记在本机）；剖面里嵌在剖面下方 */
 #inset3d { position: absolute; left: 12px; top: 12px; width: 320px; height: 240px; background: #eef1f2; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,.12); z-index: 3; display: flex; flex-direction: column; transition: opacity .12s; }
 #inset3d[hidden] { display: none; }
 body:has(#modal:not([hidden])) #inset3d { visibility: hidden; } /* 弹窗开着时 3D 画布不透过遮罩 */
@@ -139,6 +139,7 @@ body:has(#modal:not([hidden])) #inset3d { visibility: hidden; } /* 弹窗开着�
 #inset3d.min .inset-bar { height: 24px; padding: 0 10px; cursor: pointer; font-size: 12px; }
 /* 图上拖 / 画 / 圈 / 剖切进行中：浮窗淡到 15%、不挡指针 */
 body.gesturing #inset3d:not(.docked) { opacity: .15; pointer-events: none; }
+body.gesturing.height-live #inset3d:not(.docked) { opacity: 1; }
 /* 剖面里：嵌在剖面卡片下方 */
 #inset3d.docked { position: static; width: 100%; height: 240px; flex: none; box-shadow: none; }
 #inset3d.docked .inset-bar { cursor: default; }
@@ -339,3 +340,79 @@ body:not(.has-scene) .tab, body.comparing .tab { visibility: hidden; }
 .chip.sm { font-size: 12px; padding: 2px 8px; }
 .sw-dot.dash { background: transparent !important; border: 1.5px dashed #2a6aa6; box-sizing: border-box; }
 g[data-elev-drag] { cursor: ns-resize; }
+
+/* ============================================================ v6（docs/07）：加到对话 / 场景栏 / 记忆 / 高度工具 */
+#top .sc-btn { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#top .sc-btn[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+#btn-memory i { font-style: normal; font-size: 11px; background: #eee9dd; border-radius: 999px; padding: 0 5px; margin-left: 2px; }
+#btn-memory i:empty { display: none; }
+/* 左侧场景栏 */
+#scenes { width: 210px; flex: none; display: flex; flex-direction: column; background: #f8f6f0; border-right: 1px solid var(--line); min-height: 0; }
+#scenes[hidden] { display: none; }
+.sc-head { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.sc-head .ubtn.sm, .sc-head .mini { font-size: 12px; padding: 2px 8px; }
+.mini { font: inherit; font-size: 11px; padding: 0 6px; border: 1px solid var(--line); border-radius: 5px; background: #fff; cursor: pointer; color: var(--muted); }
+.mini:hover { color: var(--text); background: #f0ede4; }
+.sc-list { flex: 1; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+.sc-row { display: grid; grid-template-columns: 54px 1fr; grid-template-rows: auto auto; gap: 2px 8px; padding: 6px; border: 1px solid transparent; border-radius: 8px; cursor: pointer; background: #fff; }
+.sc-row:hover { border-color: var(--line); }
+.sc-row.on { border-color: var(--accent); background: var(--accent-bg); }
+.sc-thumb { grid-row: 1 / 3; width: 54px; height: 54px; border-radius: 6px; object-fit: cover; background: #efe9dc; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--muted); }
+.sc-meta { display: flex; flex-direction: column; min-width: 0; }
+.sc-meta .sc-name { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sc-acts { display: flex; gap: 4px; visibility: hidden; }
+.sc-row:hover .sc-acts, .sc-row.on .sc-acts { visibility: visible; }
+.sc-edit { font: inherit; font-size: 13px; width: 100%; padding: 1px 4px; border: 1px solid var(--accent); border-radius: 4px; }
+/* 引用卡片（输入框上方）与 @ 补全 */
+#refs { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px 0; border-top: 1px solid var(--line); max-height: 132px; overflow-y: auto; }
+#refs[hidden] { display: none; }
+#refs + #composer { border-top: 0; }
+.ref { display: flex; align-items: center; gap: 5px; max-width: 100%; font-size: 12px; background: #eef3fd; border: 1px solid #c5d6f6; border-radius: 7px; padding: 2px 4px 2px 6px; }
+.ref.pinned { border-color: var(--blue); box-shadow: inset 3px 0 0 var(--blue); }
+.ref.gone { opacity: .55; text-decoration: line-through; }
+.ref .rk { font-size: 10px; color: #fff; background: var(--blue); border-radius: 3px; padding: 0 4px; flex: none; }
+.ref b { white-space: nowrap; flex: none; }
+.ref .rt { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ref button { font: inherit; font-size: 11px; border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 0 3px; flex: none; }
+.ref button:hover, .ref button.on { color: var(--blue); }
+#composer { position: relative; }
+#composer.drop { outline: 2px dashed var(--blue); outline-offset: -4px; }
+#at-list { position: absolute; left: 12px; right: 12px; bottom: calc(100% - 4px); background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: 4px; z-index: 8; max-height: 240px; overflow-y: auto; }
+#at-list[hidden] { display: none; }
+.at-item { display: flex; gap: 8px; align-items: baseline; padding: 3px 8px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+.at-item.on, .at-item:hover { background: var(--accent-bg); }
+/* 聊天：引用小标、改动摘要、记住这个 */
+.msg .who { display: flex; align-items: center; gap: 6px; }
+.mem-btn { font: inherit; font-size: 10px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--muted); cursor: pointer; visibility: hidden; }
+.msg:hover .mem-btn, .mem-btn:disabled { visibility: visible; }
+.refchips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 3px; }
+.refchip { font-size: 11px; color: var(--blue); background: #eef3fd; border-radius: 4px; padding: 0 5px; }
+.msg .effect { margin-top: 5px; padding-top: 4px; border-top: 1px dashed #c9d3b6; font-size: 12px; color: #2f5d2a; }
+.msg .effect.none { color: #8a5a00; border-top-color: #e6cf7a; }
+.msg .effect .fx-all { display: inline; }
+.msg .effect .fx-all > summary { display: inline; cursor: pointer; color: #1f6feb; list-style: none; white-space: nowrap; }
+.msg .effect .fx-all > summary::-webkit-details-marker { display: none; }
+.msg .effect .fx-all[open] > summary { color: #555; }
+.msg .effect .fx-all ul { margin: 4px 0 0; padding-left: 16px; }
+.msg .effect .fx-all li { margin: 1px 0; }
+.msg.mem-suggest { background: #fff8e1; }
+/* 场景树：加到对话 */
+.panel .irow button.addref { flex: none; font: inherit; font-size: 10px; padding: 0 4px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--blue); cursor: pointer; visibility: hidden; }
+.irow:hover button.addref, .item.open .irow button.addref { visibility: visible; }
+.panel .irow button.addref:hover { border-color: #c5d6f6; background: #eef3fd; }
+/* 高度工具 */
+#view-map[data-tool=height] svg.map { cursor: ns-resize; }
+/* 记忆面板 */
+.mem-add { display: flex; gap: 6px; margin: 10px 0; align-items: center; }
+.mem-add .mem-new { flex: 1; }
+.mem-list { display: flex; flex-direction: column; gap: 4px; max-height: 52vh; overflow-y: auto; }
+.mem-row { display: grid; grid-template-columns: auto auto 1fr auto; grid-template-rows: auto auto; gap: 2px 8px; align-items: center; padding: 5px 6px; border: 1px solid var(--line); border-radius: 7px; }
+.mem-row.off { opacity: .55; }
+.mem-row .mem-text { grid-column: 3; width: 100%; }
+.mem-row .x { grid-column: 4; grid-row: 1; border: 0; background: transparent; color: #a59d8c; cursor: pointer; font-size: 15px; }
+.mem-row .x:hover { color: var(--bad); }
+.mem-row .mem-meta { grid-column: 3 / 5; grid-row: 2; }
+.modal-card .txt { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; }
+.modal-card .actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.sc-head { white-space: nowrap; }
+.sc-local { padding: 4px 10px 0; }
