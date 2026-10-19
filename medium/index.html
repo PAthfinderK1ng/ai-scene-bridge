@@ -15,15 +15,15 @@
     <div class="brand">场景对话 <span class="tag" id="theme-tag">山地村落</span></div>
     <ol id="steps">
       <li data-step="1" title="一句话说你要什么">说</li>
-      <li data-step="2" title="三张完整的方案卡，挑一张">选</li>
-      <li data-step="3" title="最多四个问题，每个都可以「你定」">答</li>
-      <li data-step="4" title="在图上画一笔、圈一块、拖一下，随时可做">画</li>
-      <li data-step="5" title="把「我理解为」逐条点对">核</li>
-      <li data-step="6" title="导出给引擎 / 读回对比">出</li>
+      <li data-step="2" title="三张方案挑一张">选</li>
+      <li data-step="3" title="最多四个问题，都可以「你定」">答</li>
+      <li data-step="4" title="画一笔、圈一块或拖图钉">画</li>
+      <li data-step="5" title="右边「我理解为」逐条点对">核</li>
+      <li data-step="6" title="导出给引擎，搭完读回对比">出</li>
     </ol>
-    <div class="budget" id="budget" title="AI 最多问四个问题，每个都可以「你定」跳过">问题 0/4</div>
+    <div class="budget" id="budget" title="AI 最多问四个问题，每个都可以「你定」跳过" hidden>问题 0/4</div>
     <div class="spacer"></div>
-    <div class="meter" id="meter" title="这一轮沟通里人做了多少动作">指点 0 · 选择 0 · 打字 0 · 坐标 0</div>
+    <div class="meter" id="meter" title="这一轮你动了几次手。坐标永远是 0：这里不让人输坐标">你做的：指点 0 · 选择 0 · 打字 0 · 坐标 0</div>
     <button id="ai-status" class="pill" title="AI 设置">AI：…</button>
   </header>
 
@@ -32,7 +32,7 @@
       <div id="log" aria-live="polite"></div>
       <div id="chips"></div>
       <form id="composer">
-        <input id="input" type="text" placeholder="说一句你想要的场景，比如「我要生成山城村庄」" autocomplete="off" />
+        <input id="input" type="text" placeholder="或者自己说一句，比如「雾里的山寨，寨门在最低处」" autocomplete="off" />
         <button type="submit" id="send">发送</button>
       </form>
     </section>
@@ -45,14 +45,14 @@
         <button class="tab" data-view="three">3D 预览</button>
         <div class="spacer"></div>
         <div id="tools" class="disabled">
-          <button data-tool="select" class="tool active" title="点一下看它是什么，可确认 / 锁住">选择</button>
-          <button data-tool="path" class="tool" title="在图上画一笔，这就是主路">画路</button>
-          <button data-tool="region" class="tool" title="圈一块地，然后说它是什么">圈区域</button>
-          <button data-tool="pin" class="tool" title="拖动地标和入口">图钉</button>
-          <button data-tool="erase" class="tool" title="点掉一个区域，或把路恢复成算出来的">擦除</button>
+          <button data-tool="select" class="tool active" title="点一下看它是什么，可确认 / 锁住 (V)">选择</button>
+          <button data-tool="path" class="tool" title="在图上画一笔，这就是主路 (P)">画路</button>
+          <button data-tool="region" class="tool" title="圈一块地，然后说它是什么 (R)">圈区域</button>
+          <button data-tool="pin" class="tool" title="拖动地标和入口 (G)">图钉</button>
+          <button data-tool="erase" class="tool" title="点掉一个区域，或把路恢复成算出来的 (E)">擦除</button>
         </div>
         <button id="btn-variants" class="ubtn" disabled title="按一条变化轴再出三张">换一批</button>
-        <button id="btn-export" class="ubtn primary" disabled title="「我理解为」全部点对后才能导出">出 →</button>
+        <button id="btn-export" class="ubtn primary">出 →</button>
       </div>
       <div id="views">
         <div id="view-map" class="view active"></div>
@@ -63,22 +63,23 @@
         <div id="hint" class="hint-bar" hidden></div>
       </div>
       <aside id="side">
+        <div id="side-empty" class="hint">挑一张方案后，这里列出：我对它的理解（逐条点「对」）、程序算出的关系检查、我替你假设的默认值、色板。</div>
         <section class="panel" id="p-understand">
-          <h3>我理解为 <span class="count" id="understand-count"></span></h3>
-          <div class="hint">每条点「对」确认；点「▾」看替代解释；「🔒」后出变体不动它。</div>
+          <h3 title="对的点「对」（对 = 锁住，换一批时不动它），全对了才能「出」；不对点「不是」换个说法。">我理解为 <span class="count" id="understand-count"></span></h3>
+          <div class="hint">对的点「对」（对 = 锁住，换一批时不动它），全对了才能「出」；不对点「不是」换个说法。</div>
           <ul id="understanding"></ul>
         </section>
         <section class="panel" id="p-relations">
-          <h3>关系检查</h3>
+          <h3 title="程序按几何算出来的 ✓ / ✗，每条带原因和修法">关系检查</h3>
           <ul id="relations"></ul>
         </section>
         <section class="panel" id="p-assumptions">
-          <h3>我假设了</h3>
+          <h3 title="你没说的，我按默认填了。点一下可以改。">我假设了</h3>
           <div class="hint">你没说的，我按默认填了。点一下可以改。</div>
           <ul id="assumptions"></ul>
         </section>
         <section class="panel" id="p-palette">
-          <h3>参考与色板</h3>
+          <h3 title="给一张参考图，我从里面取色；不给就用风格板。">参考与色板</h3>
           <div class="hint">给一张参考图，我从里面取色；不给就用风格板。</div>
           <div id="reference"></div>
           <div id="palette"></div>
@@ -93,12 +94,13 @@
     <form method="dialog" id="settings-form">
       <h3>AI 设置</h3>
       <p class="hint">密钥只存在本机 <code>%LOCALAPPDATA%\ai-scene-bridge\config.json</code>，由本地 Python 服务代为调用，网页永远拿不到明文。没有密钥时用内置的模拟 AI（脚本），整条流程照样能走。</p>
-      <label>Anthropic API Key <input id="s-key" type="password" placeholder="sk-ant-…" autocomplete="off" /></label>
+      <label class="row"><span>Anthropic API Key</span> <input id="s-key" type="password" placeholder="sk-ant-…" autocomplete="off" /><button type="button" id="s-show" class="ubtn" title="只切换输入框的显示方式，密钥不会出现在消息或日志里">显示</button></label>
       <div id="s-key-hint" class="hint"></div>
-      <label>模型 <input id="s-model" type="text" value="claude-opus-5-5" /></label>
-      <label class="row"><input id="s-mock" type="checkbox" /> 强制使用模拟 AI（不联网）</label>
+      <label class="row"><span>模型</span> <input id="s-model" type="text" list="s-models" value="claude-opus-5-5" /><datalist id="s-models"></datalist></label>
+      <label class="row"><input id="s-mock" type="checkbox" /> 强制使用模拟 AI（没有密钥时自动模拟）</label>
       <div class="actions">
         <button type="button" id="s-test" class="ubtn">测试密钥</button>
+        <button type="button" id="s-clear" class="ubtn">清除密钥</button>
         <span id="s-test-result" class="hint"></span>
         <span class="spacer"></span>
         <button type="button" id="s-cancel" class="ubtn">取消</button>

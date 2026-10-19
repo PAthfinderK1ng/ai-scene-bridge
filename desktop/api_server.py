@@ -69,9 +69,36 @@ def _score(root: str, payload: dict) -> dict:
 def _ai_error_types():
     try:
         import anthropic
-        return (anthropic.APIError,)
+        return (anthropic.APIError,)  # APIStatusError（有状态码）与 APIConnectionError / APITimeoutError（没有）的共同基类
     except Exception:
         return (type("_Never", (Exception,), {}),)
+
+
+# 按 HTTP 状态码给人看得懂的诊断（来源：claude-api 技能 shared/error-codes.md）
+AI_HINTS = {
+    400: "请求被 API 拒绝：多半是参数或 schema 的问题，把 message 原文发给开发者",
+    401: "密钥无效、已撤销或格式不对：到 AI 设置里重新粘贴",
+    402: "账户计费问题：到 console.anthropic.com 看余额 / 付款方式",
+    403: "这把密钥没有权限用这个模型或功能",
+    404: "模型名不存在或你的组织不可用：检查 AI 设置里的模型名（默认 claude-opus-5-5）",
+    413: "请求过大",
+    429: "触发限流：等几十秒再试",
+    500: "Anthropic 服务异常：稍后重试",
+    529: "Anthropic 过载：稍后重试",
+}
+RETRYABLE = {408, 409, 429, 500, 529}
+
+
+def ai_error_payload(e: Exception) -> dict:
+    """把 anthropic 的异常整理成前端能诊断的 JSON：状态码、错误类型、request_id、是否可重试、一句中文提示。"""
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    etype = (body.get("error") or {}).get("type") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
+    is_timeout = type(e).__name__ == "APITimeoutError"
+    is_conn = status is None
+    hint = AI_HINTS.get(status) or ("等太久没回：模型思考 + 三张卡输出可能超过 180 s，再试一次或降低 effort" if is_timeout else "连不上 api.anthropic.com：检查网络 / 代理" if is_conn else "")
+    return {"error": "ai", "message": getattr(e, "message", None) or str(e), "status": status, "type": etype or type(e).__name__,
+            "request_id": getattr(e, "request_id", None), "retryable": is_conn or status in RETRYABLE, "hint": hint}
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -136,8 +163,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if isinstance(result, dict):
                 result.setdefault("_ms", int((time.time() - t0) * 1000))
             self._json(200, result)
-        except _ai_error_types() as e:  # anthropic 的 API 错误：把状态码和消息透出
-            self._json(502, {"error": "ai", "message": str(e), "status": getattr(e, "status_code", None)})
+        except ai_service.AIError as e:  # 200 回来了但不能用：拒绝 / 截断 / 不合 schema
+            self._json(502, {"error": "ai_" + e.kind, "kind": e.kind, "message": str(e), **e.detail})
+        except _ai_error_types() as e:  # anthropic 的 API 错误：状态码、类型、request_id、提示一起透出
+            self._json(502, ai_error_payload(e))
         except (ValueError, KeyError, TypeError) as e:
             self._json(400, {"error": "bad request", "message": f"{type(e).__name__}: {e}"})
         except Exception as e:  # noqa: BLE001
@@ -167,9 +196,20 @@ def r_config_test(root, payload):
         return {"ok": False, "message": "没有密钥"}
     import anthropic
     client = anthropic.Anthropic(api_key=cfg["api_key"], timeout=30.0, max_retries=0)
+    model = (payload.get("model") or cfg.get("model") or ai_service.DEFAULT_MODEL).strip()
     t0 = time.time()
-    resp = client.messages.create(model=cfg.get("model") or ai_service.DEFAULT_MODEL, max_tokens=16, messages=[{"role": "user", "content": "回复 ok"}])
-    return {"ok": True, "model": resp.model, "ms": int((time.time() - t0) * 1000), "text": "".join(b.text for b in resp.content if b.type == "text")}
+    try:
+        # 最短的一条：不传 thinking / 采样参数（Opus 5.5 会 400），effort=low 让它少想；max_tokens 要装得下思考 + 回复
+        resp = client.messages.create(model=model, max_tokens=256, output_config={"effort": "low"}, messages=[{"role": "user", "content": "只回复两个字母：ok"}])
+    except anthropic.APIError as e:
+        p = ai_error_payload(e)
+        return {"ok": False, **p, "message": (p["hint"] + "（" + p["message"] + "）") if p["hint"] else p["message"]}
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    if resp.stop_reason == "refusal":
+        return {"ok": False, "message": "模型拒绝了测试请求（stop_reason=refusal）", "model": resp.model}
+    u = resp.usage
+    return {"ok": True, "model": resp.model, "ms": int((time.time() - t0) * 1000), "text": text, "request_id": getattr(resp, "_request_id", None),
+            "usage": {"input": u.input_tokens, "output": u.output_tokens}}
 
 
 def r_ai_draft(root, payload):

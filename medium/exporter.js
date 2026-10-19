@@ -2,6 +2,7 @@
 // 包里是：scene.sid.json（意图）+ views/*.png（俯视 / 剖面 / 第一眼）+ BRIEF.md（人和 AI 都能读的交代）+ PROTOCOL.md。
 import { ARCH_LABEL, TOD_LABEL } from "./cards.js";
 import { LANDMARK_LABEL, PLACEMENT_LABEL, SPAWN_LABEL } from "./views/map.js";
+import { slopeLabel } from "./views/profile.js";
 
 export function download(name, blob) {
   const a = document.createElement("a");
@@ -69,7 +70,7 @@ export function buildBrief({ sid, card, facts = {}, checks = [], understanding =
   lines.push(`- 原型：${ARCH_LABEL[card.archetype] || card.archetype}；${p.terraces} 层台地，每层 ${p.layer_height_m} m（terrain.features 里每层一个 plateau 多边形，\`level\` 是层号）。`);
   lines.push(`- 地标：${lm.label}（${LANDMARK_LABEL[lm.kind] || lm.kind}），在${PLACEMENT_LABEL[lm.placement] || lm.placement}，尺寸 ${lm.size_m.join("×")} m（volumes 里 importance=landmark）。`);
   lines.push(`- 玩家出生点：${SPAWN_LABEL[card.spawn.placement] || card.spawn.placement}（markers 里 player_spawn，rotation_y 朝向地标）。${eye.landmark_visible ? `第一眼能看见地标，在画面${eye.landmark_screen}，仰角约 ${eye.landmark_elev_deg}°。` : eye.landmark_visible === false ? "第一眼看不见地标（设计者已知悉）。" : ""}`);
-  if (t.length_m != null) lines.push(`- 主路 main_trail：${t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m，约 ${Math.round(t.steps_estimate || 0)} 级台阶；最大坡度 ${Math.round((t.max_slope || 0) * 100) / 100}。请做成石阶 + 歇脚平台，不要做成斜坡。`);
+  if (t.length_m != null) lines.push(`- 主路 main_trail：${t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m，约 ${Math.round(t.steps_estimate || 0)} 级台阶；最陡 ${slopeLabel(t.max_slope || 0)}。请做成石阶 + 歇脚平台，不要做成斜坡。`);
   if (p.stream) lines.push("- 溪 stream（paths kind=river）走谷底，宽 4 m，水面低于两岸 0.5 m。");
   if (facts.perTerrace) lines.push(`- 民居 ${facts.houses || 0} 栋：${Object.entries(facts.perTerrace).map(([l, n]) => `${+l + 1} 层 ${n} 栋`).join("，")}。每栋 volumes 里有确切 position / size / rotation_y；长边平行等高线，门（−z 面）朝下坡或朝路。`);
   if (card.regions && card.regions.some((r) => r.kind !== "other")) lines.push(`- 特殊区域：${card.regions.filter((r) => r.kind !== "other").map((r) => `${r.terrace + 1} 层 ${r.label || r.kind}（${r.kind}）`).join("、")}。`);

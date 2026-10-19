@@ -10,15 +10,32 @@ ai_service.py — 「场景对话」的 Claude 调用层（跑在本地 Python �
 没有密钥时走 MockAI（确定性脚本），整条链路照样能跑。
 配置：%LOCALAPPDATA%/ai-scene-bridge/config.json {"api_key": "...", "model": "claude-opus-5-5", "mock": false}
 或环境变量 ANTHROPIC_API_KEY。
+
+真模型调用路径（对照 claude-api 技能文档核过，anthropic SDK 1.15.0）：
+- 不传 thinking（Opus 5.5 思考常开，disabled / budget_tokens 都 400）、不传 temperature / top_p / top_k（400）；深度只用 output_config.effort。
+- 结构化输出用 output_config.format；schema 先经 schema_lite.api_schema 剥掉 API 不支持的 minimum / maximum / pattern / minItems(>1) / maxItems
+  （SDK 只在 messages.parse() 自动剥；create() 原样发会 400），模型回来后本地校验 + 夹取。
+- 默认开服务端 refusal fallback（betas=server-side-fallback-2026-07-01 + fallbacks="default"）；beta 被 400 时退回普通 messages.create 且本进程内不再试。
+- stop_reason 先看再读 content：refusal → AIError(refusal, 带 stop_details.category)；max_tokens → AIError(truncated)。
+- usage 记 input / output / cache_read / cache_write / request_id / 耗时 / 是否 fallback 代答 / 按 Opus 5.5 定价估算的费用。
 """
 from __future__ import annotations
 
 import copy
 import json
 import os
+import sys
+import time
 from typing import Any
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import schema_lite  # noqa: E402
+
 DEFAULT_MODEL = "claude-opus-5-5"
+# 美元 / 百万 token。来源：claude-api 技能 shared/model-migration.md「Migrating to Claude Opus 5.5」：$4 / $20，5 分钟缓存写 $5（1.25×），缓存读 $0.20（0.05×）。
+PRICING_USD_PER_MTOK = {"claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_write": 5.0, "cache_read": 0.20}}
 
 ARCHETYPES = ["slope_zigzag", "ring_terrace", "valley_two_banks"]
 PLACEMENTS = ["top", "ridge_end", "cliff_edge", "plaza"]
@@ -101,6 +118,33 @@ REVISE_SCHEMA = {
     "additionalProperties": False,
 }
 
+# 系统提示里的示例卡：一张完整、合 CARD_SCHEMA 的山城卡（测试会校验它）。只示范结构与文案口吻，不含任何坐标。
+EXAMPLE_CARD = {
+    "name": "之字叠落型",
+    "one_liner": "从南边山脚抬头，一条之字石阶把五层木屋串到顶上的寺庙，夕阳打在寺的青瓦上。",
+    "archetype": "slope_zigzag",
+    "params": {"entry_side": "S", "terraces": 5, "layer_height_m": 3.5, "plateau_width": "medium", "stream": False},
+    "landmark": {"kind": "temple", "label": "山顶寺", "placement": "top", "size_m": [8, 9, 8]},
+    "spawn": {"placement": "valley_bottom"},
+    "regions": [
+        {"terrace": 0, "kind": "farmland", "density": 0.3, "label": "山脚菜地"},
+        {"terrace": 1, "kind": "other", "density": 0.7, "label": "下村"},
+        {"terrace": 2, "kind": "other", "density": 1.0, "label": "中村"},
+        {"terrace": 3, "kind": "gathering", "density": 1.2, "label": "寺前聚落"},
+        {"terrace": 4, "kind": "plaza", "density": 0, "label": "寺前平台"},
+    ],
+    "palette": [
+        {"role": "roof", "hex": "#4A4A4A", "note": "青瓦"},
+        {"role": "wall", "hex": "#D9C9A3", "note": "夯土墙"},
+        {"role": "stone", "hex": "#9A9890", "note": "石阶"},
+        {"role": "foliage", "hex": "#4F6B3A", "note": "松杉"},
+        {"role": "mist", "hex": "#E8A86A", "note": "黄昏天光"},
+    ],
+    "lighting": {"time_of_day": "dusk"},
+    "mood": ["宁静", "叠落", "仰望"],
+    "summary": "单面坡之字上山，地标寺在顶层中央，入口在南边山脚，上密下疏，顶层留平台。",
+}
+
 SYSTEM_PROMPT = """你是「场景对话」里的山地村落结构设计师。人用一句话或一个动作表达意图，你只做结构级决定，几何由程序算。
 
 铁律：
@@ -119,7 +163,15 @@ SYSTEM_PROMPT = """你是「场景对话」里的山地村落结构设计师。�
 - valley_two_banks：一条溪从山上下来，两岸各一片坡，一座桥把两边接起来。
 placement：top 顶层台地中央 / ridge_end 顶层台地的尽头 / cliff_edge 顶层朝入口的崖边（最醒目） / plaza 中层广场。
 spawn：valley_bottom 入口侧山脚 / side_slope 侧坡半山 / summit 山顶俯视全村 / S E W 指定边。
-region kind：other 民居 / gathering 聚集 / plaza 广场（不放房） / forest 林子（只有树） / farmland 农田 / terrace 梯田。"""
+region kind：other 民居 / gathering 聚集 / plaza 广场（不放房） / forest 林子（只有树） / farmland 农田 / terrace 梯田。
+
+取值范围（程序会校验，越界会被夹回）：terraces 3–7 的整数；layer_height_m 2.5–6；regions[].terrace 0–6 且 < terraces；density 0–1.6；palette 恰好 5 项、hex 形如 #RRGGBB；mood ≤ 4 条。
+
+一张完整的示例卡（口吻与完整度照它来；三张卡不要都抄它的结构）：
+""" + json.dumps(EXAMPLE_CARD, ensure_ascii=False) + """
+
+再说一遍最要紧的两条：三张卡在「原型 / 地标位置 / 台地层数 / 入口方位」里至少两项不同，不许只换名字和颜色；
+你不写任何坐标、高度、角度，只写上面这些枚举、整数和颜色。"""
 
 
 # ------------------------------------------------------------ 配置
@@ -312,41 +364,117 @@ class MockAI:
 
 
 # ------------------------------------------------------------ 真 AI
+class AIError(RuntimeError):
+    """HTTP 200 回来了但结果不能用：kind ∈ refusal / truncated / empty / bad_json / schema。detail 原样透给前端做诊断。"""
+
+    def __init__(self, kind: str, message: str, **detail: Any):
+        super().__init__(message)
+        self.kind = kind
+        self.detail = detail
+
+
+def estimate_cost_usd(usage: dict | None, model: str | None = None) -> float | None:
+    """按 PRICING_USD_PER_MTOK 估费用；模型不在表里（或没有 usage）返回 None，报告里留空。"""
+    if not usage:
+        return None
+    key = next((k for k in PRICING_USD_PER_MTOK if (model or usage.get("model") or "").startswith(k)), None)
+    if not key:
+        return None
+    p = PRICING_USD_PER_MTOK[key]
+    n = lambda k: float(usage.get(k) or 0)  # noqa: E731
+    return round((n("input") * p["input"] + n("output") * p["output"] + n("cache_write") * p["cache_write"] + n("cache_read") * p["cache_read"]) / 1e6, 6)
+
+
+def _usage_of(resp: Any, ms: int) -> dict:
+    u = getattr(resp, "usage", None)
+    g = lambda k: getattr(u, k, None)  # noqa: E731
+    served_by_fallback = any(getattr(it, "type", None) == "fallback_message" for it in (g("iterations") or []))
+    out = {"input": g("input_tokens"), "output": g("output_tokens"), "cache_read": g("cache_read_input_tokens"), "cache_write": g("cache_creation_input_tokens"),
+           "model": getattr(resp, "model", None), "stop_reason": getattr(resp, "stop_reason", None), "request_id": getattr(resp, "_request_id", None), "ms": ms, "fallback_used": served_by_fallback}
+    out["cost_usd"] = estimate_cost_usd(out)
+    return out
+
+
+def _is_beta_rejection(e: Any) -> bool:
+    """服务端 fallback 这个 beta 不开放时的 400：错误信息提到 anthropic-beta 头或 fallbacks 参数。其它 400 是我们的请求有错，要抛出去。"""
+    body = getattr(e, "body", None)
+    msg = str((body.get("error") or {}).get("message") if isinstance(body, dict) and isinstance(body.get("error"), dict) else "") + " " + str(e)
+    low = msg.lower()
+    return "anthropic-beta" in low or "fallback" in low
+
+
 class ClaudeAI:
     name = "claude"
+    fallback_beta_ok = True  # 服务端 fallback beta 被 400 后本进程内不再带它（省一次往返）
+    MAX_TOKENS = 16000  # 含思考 token；三张卡 JSON 约 3k，留足余量
 
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, timeout: float = 180.0, max_retries: int = 2):
         import anthropic  # 延迟导入：没装 / 没密钥时不影响服务启动
         self.anthropic = anthropic
-        self.client = anthropic.Anthropic(api_key=api_key, timeout=90.0, max_retries=2)
+        # timeout 是单次请求的秒数；SDK 对 408/409/429/5xx/超时/断连自动重试 max_retries 次，最坏墙钟 = timeout × (max_retries + 1)
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=max_retries)
         self.model = model or DEFAULT_MODEL
 
-    def _structured(self, user_text: str, schema: dict, effort: str = "medium") -> dict:
-        """结构化输出；Opus 5.5 默认带服务端 refusal fallback，被拒绝或不支持时退回普通调用。"""
-        a = self.anthropic
-        kwargs = dict(
+    def _request_kwargs(self, user_text: str, schema: dict, effort: str) -> dict:
+        return dict(
             model=self.model,
-            max_tokens=16000,
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            max_tokens=self.MAX_TOKENS,
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],  # 系统提示 > 512 token，Opus 5.5 可缓存
             messages=[{"role": "user", "content": user_text}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema_lite.api_schema(schema)}},
         )
+
+    def _structured(self, user_text: str, schema: dict, effort: str = "medium") -> dict:
+        """结构化输出一次调用：带服务端 refusal fallback → 退回普通调用 → 看 stop_reason → 解析 → 本地校验 / 夹取 → 附 usage。"""
+        a = self.anthropic
+        kwargs = self._request_kwargs(user_text, schema, effort)
+        t0 = time.time()
+        resp = None
+        if ClaudeAI.fallback_beta_ok:
+            try:
+                resp = self.client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs)
+            except a.BadRequestError as e:
+                if not _is_beta_rejection(e):
+                    raise
+                ClaudeAI.fallback_beta_ok = False
+        if resp is None:
+            resp = self.client.messages.create(**kwargs)
+        usage = _usage_of(resp, int((time.time() - t0) * 1000))
+        stop = getattr(resp, "stop_reason", None)
+        if stop == "refusal":  # 先看 stop_reason 再读 content；stop_details 可能为 None
+            sd = getattr(resp, "stop_details", None)
+            cat, expl = getattr(sd, "category", None), getattr(sd, "explanation", None)
+            raise AIError("refusal", "模型拒绝了这个请求" + (f"（类别 {cat}）" if cat else "") + (f"：{expl}" if expl else ""), category=cat, explanation=expl, usage=usage)
+        text = next((b.text for b in (getattr(resp, "content", None) or []) if getattr(b, "type", None) == "text"), "")
+        if stop == "max_tokens":
+            raise AIError("truncated", f"输出到 {usage.get('output')} token 被截断（max_tokens={self.MAX_TOKENS}），JSON 不完整；可换更低 effort 或减少要求", usage=usage, sample=text[-200:])
+        if not text:
+            raise AIError("empty", f"模型没有返回文本块（stop_reason={stop}）", usage=usage)
         try:
-            resp = self.client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs)
-        except a.BadRequestError as e:
-            if "fallback" in str(e).lower() or "beta" in str(e).lower():
-                resp = self.client.messages.create(**kwargs)
-            else:
-                raise
-        if resp.stop_reason == "refusal":
-            raise RuntimeError("模型拒绝了这个请求：" + (getattr(getattr(resp, "stop_details", None), "explanation", "") or ""))
-        text = next((b.text for b in resp.content if b.type == "text"), "")
-        data = json.loads(text)
-        data["_usage"] = {"input": getattr(resp.usage, "input_tokens", None), "output": getattr(resp.usage, "output_tokens", None), "cache_read": getattr(resp.usage, "cache_read_input_tokens", None), "model": resp.model}
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise AIError("bad_json", f"模型输出不是合法 JSON：{e}", usage=usage, sample=text[:300]) from e
+        fixes = schema_lite.clamp(schema, data)
+        errors = schema_lite.validate(schema, data)
+        if errors:
+            raise AIError("schema", "模型输出不符合 schema：" + "；".join(errors[:6]), errors=errors, usage=usage)
+        data["_usage"] = usage
+        if fixes:
+            data["_fixes"] = fixes
         return data
 
     def draft(self, intent: str, axis: str | None, targets: list[dict] | None, locked: dict | None) -> dict:
-        parts = [f"用户的一句话：「{intent}」", "请给出 3 张结构不同的方案卡。"]
+        parts = [
+            f"用户的一句话：「{intent}」",
+            "请给出 3 张结构不同的方案卡（至少在 原型 / 地标位置 / 台地层数 / 入口方位 中的两项不同）。",
+            "可选的词：原型 archetype ∈ slope_zigzag（单面坡之字叠落）/ ring_terrace（半山广场环台）/ valley_two_banks（溪谷双坡一桥）；"
+            "地标 kind ∈ temple 寺 / pagoda 塔 / tree 大树 / wheel 水车 / gate 寨门；"
+            "地标 placement ∈ top 顶层中央 / ridge_end 顶层尽头 / cliff_edge 顶层朝入口的崖边 / plaza 中层广场；"
+            "出生点 spawn.placement ∈ valley_bottom 入口侧山脚 / side_slope 侧坡半山 / summit 山顶 / S E W 指定边；"
+            "region kind ∈ other 民居 / gathering 聚集 / plaza 广场 / forest 林子 / farmland 农田 / terrace 梯田；"
+            "time_of_day ∈ dawn / morning / noon / afternoon / dusk / night / overcast。",
+            "把这句话里的时段、有没有溪、地标是什么、规模（小村 3–4 层 / 大寨 5–7 层）、陡缓（layer_height_m 大则陡）都落到字段上；没说的你定。",
+        ]
         if axis:
             parts.append(f"这批只在「{axis}」这一条轴上不同，其它结构尽量与下面的当前卡一致。")
         if targets:
@@ -363,8 +491,10 @@ class ClaudeAI:
         parts = [
             "当前卡：\n" + json.dumps(card, ensure_ascii=False),
             "人的动作（已由程序转成结构化事实，不是像素）：\n" + json.dumps(action, ensure_ascii=False),
-            "请只输出对当前卡的结构 patch（能不改的字段不要出现在 patch 里），一句复述，必要时一个带 2–4 个选项的追问。"
-            "如果这个动作无法翻成结构级改动（例如模糊的形容词），understood=false、ask_to_point=true，并在 restatement 里问清是位置、大小还是长相的事。",
+            "请只输出对当前卡的结构 patch，一句复述，必要时一个带 2–4 个选项的追问。"
+            "patch 只放真的要改的字段：能不改的字段不要出现在 patch 里（不要把整张卡抄回来，不要重复当前值）；"
+            "动作已由程序处理（handled_by_program=true）或只是画一笔 / 拖图钉时，patch 留空对象 {}。"
+            "如果这个动作无法翻成结构级改动（例如模糊的形容词），understood=false、ask_to_point=true、patch={}，并在 restatement 里问清是位置、大小还是长相的事。",
         ]
         if locked and locked.get("fields"):
             parts.append("已锁定、不可改的字段：" + json.dumps(locked["fields"], ensure_ascii=False))
@@ -379,5 +509,5 @@ def get_ai(cfg: dict | None = None):
         return MockAI()
     try:
         return ClaudeAI(cfg["api_key"], cfg.get("model") or DEFAULT_MODEL)
-    except Exception:
-        return MockAI()
+    except ImportError as e:  # 有密钥却没装 SDK：明说，不悄悄退回模拟（否则人以为在用真模型）
+        raise RuntimeError("anthropic SDK 未安装：在仓库根目录执行 .venv\\Scripts\\pip install anthropic，或在 AI 设置里勾「模拟」") from e

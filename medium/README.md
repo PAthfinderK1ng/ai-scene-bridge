@@ -27,7 +27,10 @@
 ```
 medium/
   index.html / style.css        界面骨架与样式
-  app.js                        流程控制器（说选答画核出）、手势、换一批、出
+  app.js                        流程控制器（说选答画核出）、手势、换一批
+  questions.js                  答：四个问题（坡度 / 规模 / 地标 / 入口）与「问完了」、快捷 chip
+  exportflow.js                 出：导出弹窗、读回比对、红点三选一（按意图修 / 接受引擎版 / 不重要）
+  settings.js                   右上角 AI 状态 pill 与「AI 设置」弹窗（密钥先测后存、模型、强制模拟）
   scene.js                      引擎适配层：卡 + 人的覆盖（路 / 区域 / 图钉 / 不重要）→ SID；自动补支路
   api.js                        /api/* 调用（AI 代理、读回评分、配置）
   cards.js / panels.js          方案卡与差异标签；右栏三面板 + 色板 / 风格板

@@ -57,8 +57,11 @@ export class Scene {
     if (this.user.trail) { this._applyUserTrail(); this._relayout(); }
     if (this.user.regions.length) this._applyUserRegions();
     if (this.user.trail || this.user.regions.length) this._reanalyze();
+    this._landmarkLevel();
     return this;
   }
+  /** 事实：地标落在第几层台地（0 起；台地外为 null），面板 / 擦除文案用 */
+  _landmarkLevel() { const L = this.landmark(); const tt = L && this.T && this.T.terraceAt(L.position[0], L.position[2]); this.facts.landmark_level = tt ? tt.level : null; }
 
   _applyUserTrail() {
     const mt = this.mainTrail();
@@ -91,6 +94,7 @@ export class Scene {
     const per = {}; for (const h of houses) { const t = this.T.terraceAt(h.position[0], h.position[2]); const l = t ? t.level : (h.terrace_level ?? 0); per[l] = (per[l] || 0) + 1; }
     this.facts.perTerrace = per;
     this.facts.checks_ok = A.checks.filter((c) => c.ok).length; this.facts.checks_total = A.checks.length;
+    this._landmarkLevel();
   }
 
   // ---------- 人的覆盖
@@ -109,6 +113,8 @@ export class Scene {
     if (Math.hypot(t[i][0] - oldXZ[0], t[i][1] - oldXZ[1]) <= 8) t[i] = [newXZ[0], newXZ[1]];
   }
   clearPins() { this.user.landmark = null; this.user.spawn = null; return this.rebuild(); }
+  /** 只清一枚图钉（"landmark" | "spawn"），另一枚的覆盖保留 */
+  clearPin(kind) { if (kind !== "landmark" && kind !== "spawn") return this; this.user[kind] = null; return this.rebuild(); }
   /** 某栋房子人确认了：不再由布局重放 */
   lockVolume(id, on = true) { const v = this.sid.volumes.find((x) => x.id === id); if (!v) return this; if (on) { v.generated = false; v.locked = true; } else { v.generated = true; delete v.locked; } return this.rebuild(); }
   removeVolume(id) { this.sid.volumes = this.sid.volumes.filter((x) => x.id !== id); return this.rebuild(); }

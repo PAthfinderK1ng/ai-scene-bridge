@@ -1,9 +1,9 @@
 // views/eye.js — 「第一眼」：从出生点 1.7 m 眼高朝地标看过去的示意透视。
 // 不是渲染器：按方位角分列扫地形，得到远 / 中 / 近三层山脊轮廓；房子和地标按方位 / 仰角投成矩形。
 // 目的是把 P2（想象与实际的落差）里最关键的一眼——玩家进场看到什么——先在沟通阶段摆出来。
-import { svgel, landmarkOf, spawnOf, paletteOf } from "./map.js";
+import { svgel, landmarkOf, spawnOf, paletteOf, mainTrailOf, EYE_FOV_DEG } from "./map.js";
 
-const FOV = 80, VFOV_UP = 28, VFOV_DOWN = 16, COLS = 112, MAXR = 180;
+const FOV = EYE_FOV_DEG, VFOV_UP = 28, VFOV_DOWN = 16, COLS = 112, MAXR = 180, EYE_M = 1.7;
 const deg = (r) => (r * 180) / Math.PI;
 const fmt1 = (v) => Math.round(v * 10) / 10;
 
@@ -19,7 +19,7 @@ export function renderEye(ctx) {
   if (!sp) { s.append(svgel("text", { x: 10, y: 20, "font-size": 8 }, "还没有出生点")); wrap.append(s); return { node: wrap, facts: {} }; }
 
   const ex = sp.position[0], ez = sp.position[2];
-  const eyeH = T.heightAt(ex, ez) + 1.7;
+  const eyeH = T.heightAt(ex, ez) + EYE_M;
   // 朝向：有地标就看地标，否则按 marker 的 rotation_y
   let a0;
   if (lm) a0 = Math.atan2(lm.position[2] - ez, lm.position[0] - ex);
@@ -60,6 +60,52 @@ export function renderEye(ctx) {
     s.append(svgel("path", { d, fill: color, opacity: 0.95 }));
   }
 
+  // 视平线（仰角 0° = 眼高）；文字类标注收进 anno，画在体块之后才不被房子盖住
+  const anno = svgel("g", { class: "anno", "pointer-events": "none" });
+  const ol = { stroke: "#000", "stroke-width": 1.2, "paint-order": "stroke", "stroke-opacity": 0.6 };
+  s.append(svgel("line", { x1: 0, x2: Wv, y1: fmt1(horizonY), y2: fmt1(horizonY), stroke: "#fff", "stroke-dasharray": "3 2", opacity: 0.6, "pointer-events": "none" }));
+  anno.append(svgel("text", Object.assign({ x: Wv - 3, y: fmt1(horizonY - 2), "font-size": 5, "text-anchor": "end", fill: "#fff" }, ol), `视平线 ${EYE_M} m`));
+
+  // 主路投影：沿主路每 2 m 采样，投到画面；被更近的地形挡住 / 出视野处断开；越远越细
+  const colOf = (az) => Math.round(((deg(norm(az - a0)) + FOV / 2) / FOV) * (COLS - 1));
+  const trail = mainTrailOf(sid);
+  if (trail && trail.points && trail.points.length > 1) {
+    const proj = T.sampleProfile(trail.points, 2).map((p) => {
+      const r = Math.hypot(p.x - ex, p.z - ez);
+      if (r < 0.5 || r > MAXR) return null;
+      const az = Math.atan2(p.z - ez, p.x - ex);
+      if (Math.abs(deg(norm(az - a0))) >= FOV / 2) return null;
+      const e = deg(Math.atan2(p.h + 0.05 - eyeH, r));
+      const c = colOf(az);
+      if (c >= 0 && c < COLS && colDist[c] < r - 1 && skyline[c] > e) return null; // 被前面的山脊挡住
+      return { x: sx(az), y: Math.min(Hv, sy(Math.max(e, -VFOV_DOWN))), r };
+    });
+    const road = svgel("g", { class: "trail", "pointer-events": "none" });
+    for (let i = 1; i < proj.length; i++) {
+      const a = proj[i - 1], q = proj[i];
+      if (!a || !q) continue;
+      const w = 2 - (1.4 * Math.min(1, (a.r + q.r) / 2 / 60));
+      road.append(svgel("line", { x1: fmt1(a.x), y1: fmt1(a.y), x2: fmt1(q.x), y2: fmt1(q.y), stroke: pal.stone, "stroke-width": fmt1(w), "stroke-linecap": "round", opacity: 0.95 }));
+    }
+    s.append(road);
+  }
+
+  // 距离刻度 10 / 20 / 40 / 80 m（画面中央列，按脚下地面仰角；5 m 在眼高 1.7 m 下仰角 −19°，出下边界，不画）与 10 m 处的 1.7 m 小人
+  for (const r of [10, 20, 40, 80]) {
+    const gx = ex + Math.cos(a0) * r, gz = ez + Math.sin(a0) * r;
+    const h = T.inside(gx, gz) ? T.heightAt(gx, gz) : 0;
+    const e = deg(Math.atan2(h - eyeH, r));
+    if (e < -VFOV_DOWN || e > VFOV_UP) continue;
+    const y = sy(e);
+    s.append(svgel("line", { x1: Wv / 2 - 4, x2: Wv / 2 + 4, y1: fmt1(y), y2: fmt1(y), stroke: "#fff", "stroke-width": 0.8, opacity: 0.9, "pointer-events": "none" }));
+    anno.append(svgel("text", Object.assign({ x: Wv / 2 + 6, y: fmt1(y + 1.8), "font-size": 5, fill: "#fff" }, ol), `${r} m`));
+    if (r === 10) {
+      const yh = sy(Math.min(VFOV_UP, deg(Math.atan2(h + EYE_M - eyeH, r))));
+      const px = Wv / 2 - 14;
+      s.append(svgel("line", { x1: px, x2: px, y1: fmt1(y), y2: fmt1(yh + 1.5), stroke: "#fff", "stroke-width": 1, opacity: 0.9 }), svgel("circle", { cx: px, cy: fmt1(yh), r: 1.5, fill: "#fff", opacity: 0.9 }));
+    }
+  }
+
   // 体块：按距离远→近
   const vols = (sid.volumes || []).filter((v) => v.position && v.size).map((v) => ({ v, dist: Math.hypot(v.position[0] - ex, v.position[2] - ez) })).filter((o) => o.dist > 1 && o.dist < MAXR).sort((a, b) => b.dist - a.dist);
   let landmarkVisible = null, landmarkScreen = null;
@@ -94,6 +140,8 @@ export function renderEye(ctx) {
     if (isLm) s.append(svgel("text", { x: (x0 + x1) / 2, y: Math.max(8, yt - 3), "font-size": 7, "text-anchor": "middle", fill: "#4a1a10", "font-weight": 700 }, `${v.label || "地标"}${blocked ? "（被挡住）" : ""}`));
   }
 
+  s.append(anno);
+
   // 雾：越远越白（简单叠一层渐变）
   const fog = svgel("linearGradient", { id: "eye-fog", x1: 0, y1: 0, x2: 0, y2: 1 });
   fog.append(svgel("stop", { offset: 0, "stop-color": pal.mist, "stop-opacity": 0.35 }), svgel("stop", { offset: 0.6, "stop-color": pal.mist, "stop-opacity": 0 }));
@@ -101,7 +149,6 @@ export function renderEye(ctx) {
   s.append(svgel("rect", { width: Wv, height: Hv, fill: "url(#eye-fog)", "pointer-events": "none" }));
   // 画幅三分线（左 / 中 / 右）
   for (const x of [Wv / 3, (Wv * 2) / 3]) s.append(svgel("line", { x1: x, x2: x, y1: 0, y2: Hv, stroke: "#fff", "stroke-width": 0.4, opacity: 0.5, "stroke-dasharray": "2 3" }));
-  s.append(svgel("text", { x: 4, y: Hv - 4, "font-size": 6, fill: "#333", opacity: 0.8 }, `从入口看 · 视野 ${FOV}° · 眼高 1.7 m`));
 
   const where = landmarkScreen ? (landmarkScreen.x < Wv / 3 ? "左" : landmarkScreen.x > (Wv * 2) / 3 ? "右" : "正中") : null;
   const facts = { landmark_visible: landmarkVisible, landmark_screen: where, landmark_dist_m: landmarkScreen ? Math.round(landmarkScreen.dist) : null, landmark_elev_deg: landmarkScreen ? fmt1(landmarkScreen.elev) : null, time_of_day: tod };
@@ -109,6 +156,7 @@ export function renderEye(ctx) {
   cap.className = "caption";
   if (lm && landmarkScreen) cap.append(span(`第一眼：${lm.label || "地标"} 在画面${where}${landmarkScreen.top < 0 ? "（出框，太近或太高）" : ""}`), span(`距离约 ${facts.landmark_dist_m} m`), span(`仰角 ${facts.landmark_elev_deg}°`), span(landmarkVisible ? "可见 ✓" : "被地形 / 房子挡住 ✗"));
   else cap.append(span("地标不在视野里"));
+  cap.append(span(`视野 ${FOV}° · 眼高 ${EYE_M} m · 中线刻度 10 / 20 / 40 / 80 m`));
   wrap.append(s, cap);
   return { node: wrap, facts };
 }

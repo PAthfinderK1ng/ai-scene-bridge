@@ -2,6 +2,21 @@
 // 所有文案都从「卡 + 引擎事实」生成，不写死几何。
 import { el, ARCH_LABEL, TOD_LABEL, WIDTH_LABEL } from "./cards.js";
 import { LANDMARK_LABEL, PLACEMENT_LABEL, SPAWN_LABEL } from "./views/map.js";
+import { slopeLabel } from "./views/profile.js";
+
+/** 引擎内部 id → 人话：terrace_3（第 4 层）→ 第 4 层台地，main_trail → 主路，house_2_1 → 第 3 层第 2 栋 */
+export function humanize(s) {
+  return String(s || "")
+    .replace(/(\S+?)\s*terrace_(w_|e_)?(\d+)（第 (\d+) 层([^）]*)）/g, "$1第 $4 层台地$5")
+    .replace(/terrace_(w_|e_)?(\d+)/g, (_, side, n) => `${side === "w_" ? "西坡" : side === "e_" ? "东坡" : ""}第 ${+n + 1} 层台地`)
+    .replace(/main_trail/g, "主路")
+    .replace(/house_(\d+)_(\d+)/g, (_, l, i) => `第 ${+l + 1} 层第 ${+i + 1} 栋`)
+    .replace(/tree_\w+/g, "一棵树")
+    .replace(/spur_\w+/g, "支路");
+}
+
+/** 主路步行时间（分钟）：平路 70 m/min，每爬 10 m 多一分钟，最少半分钟 */
+export function walkMinutes(t) { if (!t) return 0; return Math.max(0.5, Math.round(((t.length_m || 0) / 70 + (t.climb_m || 0) / 10) * 10) / 10); }
 
 // ------------------------------------------------------------ 我理解为
 /**
@@ -25,13 +40,14 @@ export function understandingItems(ctx) {
       p.layer_height_m > 3 ? { label: `更缓（每层 ${Math.max(2.5, p.layer_height_m - 1.5)} m）`, patch: { params: { layer_height_m: Math.max(2.5, p.layer_height_m - 1.5) } } } : null,
       { label: p.plateau_width === "wide" ? "台地窄一点" : "台地宽一点", patch: { params: { plateau_width: p.plateau_width === "wide" ? "medium" : p.plateau_width === "medium" ? "wide" : "medium" } } },
     ].filter(Boolean) });
-  items.push({ key: "landmark", text: `${lmLabel}（${LANDMARK_LABEL[card.landmark.kind] || card.landmark.kind}）在${PLACEMENT_LABEL[card.landmark.placement] || card.landmark.placement}`, detail: facts.landmark_level != null ? `落在第 ${facts.landmark_level + 1} 层，高 ${card.landmark.size_m[1]} m` : "", lockable: true,
+  const lvl = facts.landmark_level, lmH = (card.landmark.size_m || [])[1] || 0;
+  items.push({ key: "landmark", text: `${lmLabel}（${LANDMARK_LABEL[card.landmark.kind] || card.landmark.kind}）在${PLACEMENT_LABEL[card.landmark.placement] || card.landmark.placement}`, detail: lvl != null ? `落在第 ${lvl + 1} 层（+${Math.round(lvl * (p.layer_height_m || 0))} m），高 ${lmH} m ≈ ${Math.max(1, Math.round(lmH / 4))} 栋民居高` : `高 ${lmH} m，不在任何台地上`, lockable: true,
     alternatives: Object.entries(PLACEMENT_LABEL).filter(([k]) => k !== card.landmark.placement && (k !== "plaza" || card.archetype === "ring_terrace")).map(([k, l]) => ({ label: `放到${l}`, patch: { landmark: { placement: k } } }))
       .concat(Object.entries(LANDMARK_LABEL).filter(([k]) => k !== card.landmark.kind).map(([k, l]) => ({ label: `换成${l}`, patch: { landmark: { kind: k, label: l } } }))) });
   const vis = eye.landmark_visible == null ? "" : eye.landmark_visible ? `，第一眼就看见它（画面${eye.landmark_screen || "中"}，仰角 ${eye.landmark_elev_deg}°）` : "，但第一眼看不见它（被挡住）";
   items.push({ key: "spawn", text: `玩家从${SPAWN_LABEL[card.spawn.placement] || card.spawn.placement}进来${vis}`, detail: eye.landmark_dist_m != null ? `到${lmLabel}直线约 ${eye.landmark_dist_m} m` : "", lockable: true,
     alternatives: Object.entries(SPAWN_LABEL).filter(([k]) => k !== card.spawn.placement).map(([k, l]) => ({ label: `入口改到${l}`, patch: { spawn: { placement: k } } })) });
-  if (t.length_m != null) items.push({ key: "trail", text: `主路${ctx.userTrail ? "按你画的走" : t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m`, detail: `约 ${Math.round(t.steps_estimate || 0)} 级台阶，最大坡度 ${Math.round((t.max_slope || 0) * 100) / 100}${t.max_slope > 0.7 ? "（偏陡）" : ""}`, lockable: true,
+  if (t.length_m != null) items.push({ key: "trail", text: `主路${ctx.userTrail ? "按你画的走" : t.folds === 0 ? "直上" : `之字 ${t.folds} 折`}，${Math.round(t.length_m)} m，爬升 ${Math.round(t.climb_m)} m`, detail: `约 ${Math.round(t.steps_estimate || 0)} 级台阶 · 走约 ${walkMinutes(t)} 分钟 · 最陡 ${slopeLabel(t.max_slope || 0)}${t.max_slope > 0.7 ? "（偏陡，会做成台阶）" : ""}`, lockable: true,
     alternatives: [[0, "直上"], [2, "之字 2 折"], [3, "之字 3 折"], [5, "盘绕 5 折"]].filter(([f]) => f !== t.folds || ctx.userTrail).map(([f, l]) => ({ label: `主路改成${l}`, action: { trail_folds: f } })).concat(ctx.userTrail ? [{ label: "恢复算出来的路", action: { trail_reset: true } }] : []) });
   if (facts.perTerrace) {
     const levels = Object.keys(facts.perTerrace).map(Number).sort((a, b) => a - b);
@@ -45,34 +61,54 @@ export function understandingItems(ctx) {
   return items;
 }
 
+/** 「我理解为」列表：每条「对」（对 = 锁住，再点取消）/「不是」（看替代解释）两键一行 */
 export function renderUnderstanding(ul, items, st, cb) {
   ul.replaceChildren();
   for (const it of items) {
     const confirmed = st.confirmed.has(it.key), locked = st.locked.has(it.key);
     const li = el("li", { class: confirmed ? "confirmed" : "" },
       el("span", { class: confirmed ? "ok" : "warn" }, confirmed ? "✓" : "?"),
-      el("div", { class: "t" }, it.text, locked ? el("span", { class: "badge lock" }, "锁") : null, it.detail ? el("span", { class: "d" }, it.detail) : null),
-      el("div", { style: "display:flex;gap:3px;flex:none;flex-wrap:wrap;justify-content:flex-end;max-width:92px" },
-        el("button", { class: confirmed ? "on" : "", onclick: () => cb.confirm(it.key), title: "对，就是这样" }, "对"),
-        it.alternatives.length ? el("button", { onclick: (ev) => cb.flip(it, ev), title: "不是这样，看替代解释" }, "▾") : null,
-        it.lockable ? el("button", { class: locked ? "on" : "", onclick: () => cb.lock(it.key), title: "锁住：出变体时不动它" }, "🔒") : null,
+      el("div", { class: "t" }, it.text, locked ? el("span", { class: "badge lock", title: "换一批时不动它" }, "锁") : null, it.detail ? el("span", { class: "d" }, it.detail) : null),
+      el("div", { style: "display:flex;gap:3px;flex:none" },
+        el("button", { class: confirmed ? "on" : "", onclick: () => cb.confirm(it.key), title: confirmed ? "取消确认（也解锁）" : "对，就是这样（对 = 锁住，换一批时不动它）" }, "对"),
+        it.alternatives.length ? el("button", { onclick: (ev) => cb.flip(it, ev), title: "不是这样，看替代解释" }, "不是") : null,
       ));
     ul.append(li);
   }
 }
 
 // ------------------------------------------------------------ 关系检查
+/**
+ * 关系检查列表：✗ 永远展开在最前；全 ✓ 时折成一行「n 项关系都成立」+「展开」；有 ✗ 时其余 ✓ 合并成一行。
+ * st = { ignored: Set, expanded: boolean }，cb = { fix, ignore, unignore, toggle }
+ */
 export function renderChecks(ul, checks, st, cb) {
   ul.replaceChildren();
   if (!checks || !checks.length) { ul.append(el("li", {}, el("div", { class: "t hint" }, "还没有可检查的关系"))); return; }
-  for (const c of checks) {
-    const ignored = st.ignored.has(c.id);
-    const li = el("li", { class: ignored ? "ignored" : "" },
+  const isIgnored = (c) => st.ignored.has(c.id);
+  const row = (c) => {
+    const ignored = isIgnored(c);
+    return el("li", { class: ignored ? "ignored" : "" },
       el("span", { class: c.ok ? "ok" : c.severity === "warn" ? "warn" : "bad" }, c.ok ? "✓" : "✗"),
-      el("div", { class: "t" }, c.text, c.detail ? el("span", { class: "d" }, c.detail) : null,
+      el("div", { class: "t" }, humanize(c.text), c.detail ? el("span", { class: "d" }, humanize(c.detail)) : null,
         !c.ok && !ignored && c.fixes && c.fixes.length ? el("div", { class: "fixes" }, c.fixes.map((f, i) => el("button", { onclick: () => cb.fix(c, i) }, f.label)), el("button", { onclick: () => cb.ignore(c.id) }, "不重要")) : null,
         ignored ? el("span", { class: "d" }, "你说不重要 · ", el("button", { onclick: () => cb.unignore(c.id) }, "重新算")) : null));
-    ul.append(li);
+  };
+  const toggleBtn = (label) => el("button", { onclick: () => cb.toggle && cb.toggle(), title: label === "展开" ? "逐条看每项关系" : "收起成一行" }, label);
+  const bad = checks.filter((c) => !c.ok && !isIgnored(c));
+  const ignoredOnes = checks.filter((c) => !c.ok && isIgnored(c));
+  const good = checks.filter((c) => c.ok);
+  if (!bad.length && !ignoredOnes.length && !st.expanded) {
+    ul.append(el("li", { class: "confirmed", title: good.map((c) => humanize(c.text)).join(" · ") }, el("span", { class: "ok" }, "✓"), el("div", { class: "t" }, `${checks.length} 项关系都成立`), toggleBtn("展开")));
+    return;
+  }
+  for (const c of bad) ul.append(row(c));
+  for (const c of ignoredOnes) ul.append(row(c));
+  if (st.expanded) {
+    for (const c of good) ul.append(row(c));
+    ul.append(el("li", {}, el("div", { class: "t hint" }, "每条 ✓ / ✗ 都是程序按几何算的"), toggleBtn("收起")));
+  } else if (good.length) {
+    ul.append(el("li", { class: "confirmed", title: good.map((c) => humanize(c.text)).join(" · ") }, el("span", { class: "ok" }, "✓"), el("div", { class: "t" }, `其余 ${good.length} 项 ✓`), toggleBtn("展开")));
   }
 }
 
