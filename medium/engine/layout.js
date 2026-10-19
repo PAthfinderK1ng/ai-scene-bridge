@@ -16,7 +16,7 @@ const NO_HOUSE_KINDS = new Set(["forest", "plaza", "farmland", "terrace", "water
 const DEG = Math.PI / 180;
 const DEFAULTS = Object.freeze({
   seed: 1,            // 随机种子
-  density: 1,         // 全局密度倍率（diversity 的 density 轴乘在这里）
+  density: 1,         // 全局密度倍率（sid.meta.density_scale）
   inset: 2,           // 台地多边形内缩（米）
   pathClearance: 2.5, // 到路：≥ 路宽/2 + 2.5
   streamClearance: 3, // 到溪：≥ 宽/2 + 3
@@ -203,23 +203,37 @@ export function layoutHouses(sid, T, opts = {}) {
       for (const t of scatterTrees(rg, T, density, seed, { paths, avoid: [...obstacles.map((ob) => ob.rect), ...placed, ...treeRects] })) { volumes.push(t); treeRects.push(boxCorners(t.position, t.size, 0)); }
       return;
     }
-    if (NO_HOUSE_KINDS.has(rg.kind) || density <= 0) return;
+    // 区域带建筑类型（plan 的 buildings）时，按它的 form / 尺寸放；没有时是默认民居。plaza 等「不放房」的区域给了建筑类型也放。
+    const B = normBuilding(rg.building);
+    if ((!B && NO_HOUSE_KINDS.has(rg.kind)) || density <= 0) return;
     const rand = rng(seed);
     const centroid = polygonCentroid(rg.polygon);
-    const spacing = spacingForDensity(density);
+    const foot = B ? Math.hypot(B.size[0], B.size[2]) : 0;
+    const spacing = Math.max(spacingForDensity(density), foot * 1.05);
     // 窄台地（环带 / 溪谷两岸只有 8–10 m 宽）：内缩按宽度自适应，房子进深也跟着收，否则一栋都放不下。
-    // 不跨崖仍由下面的「四角同一台地」保证。
+    // 不跨崖仍由下面的「四角同一台地」保证（吊脚楼例外：它就是要跨坡）。
     const meanWidth = regionMeanWidth(rg.polygon);
     const inset = clamp(meanWidth * 0.15, 0.5, o.inset);
     const depthMax = Math.max(HOUSE_SIZES.depth[0] - 0.5, meanWidth - 2 * inset - 0.5);
-    const R = { rg, rand, centroid, density, minCenterDist: spacing * o.minDistFactor, oo: Object.assign({}, o, { inset }), centers: [], n: 0 };
+    const R = { rg, rand, centroid, density, B, form: B ? B.form : "house", minCenterDist: spacing * o.minDistFactor, oo: Object.assign({}, o, { inset }), centers: [], n: 0 };
     houseRegions.push(R);
+    const sizeOf = () => {
+      if (!B) return [r2(lerpRange(HOUSE_SIZES.width, rand())), r2(lerpRange(HOUSE_SIZES.height, rand())), r2(lerpRange([Math.min(HOUSE_SIZES.depth[0], depthMax), Math.min(HOUSE_SIZES.depth[1], depthMax)], rand()))];
+      const k = 0.92 + rand() * 0.16, kh = 0.95 + rand() * 0.1, round = B.shape === "cylinder";
+      const w = r2(B.size[0] * k), d = round ? w : r2(B.form === "stilt_house" || B.form === "courtyard" ? B.size[2] * k : Math.min(B.size[2] * k, Math.max(depthMax, B.size[2] * 0.6)));
+      return [w, r2(B.size[1] * kh), d];
+    };
+    // 吊脚楼：先沿区域朝下坡的边找位置（房子前半截悬在坡上、门朝坡下），再铺普通网格
+    if (R.form === "stilt_house") for (const c of stiltEdgeSpots(rg.polygon, T, B.size[2], spacing / 2)) {
+      if (R.centers.some(([cx, cz]) => Math.hypot(cx - c.p[0], cz - c.p[1]) < R.minCenterDist)) { reject("too_close"); continue; }
+      const why = tryHouse(R, c.p[0], c.p[1], sizeOf(), { facing: c.n, faces: "downhill" });
+      if (why) reject(why);
+    }
     // 泊松盘近似：候选点铺到 spacing/2 的抖动网格并种子化打乱，再用「中心距 ≥ minCenterDist」筛，密度由此可控
     for (const [x, z] of shuffle(jitteredGrid(rg.polygon, spacing / 2, rand), rand)) {
       if (R.centers.some(([cx, cz]) => Math.hypot(cx - x, cz - z) < R.minCenterDist)) { reject("too_close"); continue; }
       // 尺寸与朝向先定（它们决定 OBB），再逐条规则检查
-      const size = [r2(lerpRange(HOUSE_SIZES.width, rand())), r2(lerpRange(HOUSE_SIZES.height, rand())), r2(lerpRange([Math.min(HOUSE_SIZES.depth[0], depthMax), Math.min(HOUSE_SIZES.depth[1], depthMax)], rand()))];
-      const why = tryHouse(R, x, z, size, null);
+      const why = tryHouse(R, x, z, sizeOf(), null);
       if (why) reject(why);
     }
     // 窄带兜底：这一块一栋都没放下（或不到 2 栋）时，沿带长方向找最宽处，用最小的房子再放
@@ -237,24 +251,42 @@ export function layoutHouses(sid, T, opts = {}) {
   }
 
   /** 放一栋：朝向按规则（12 m 内朝路 / 朝下坡 / 朝外）；facing 给定时用它。成功返回 null，否则返回淘汰原因 */
-  function tryHouse(R, x, z, size, facingIn) {
-    const px = r2(x), pz = r2(z), rg = R.rg;
+  function tryHouse(R, x, z, size, facingIn, form = R.form) {
+    const px = r2(x), pz = r2(z), rg = R.rg, B = R.B;
     const F = facingIn || houseFacing(T, px, pz, roads, R.centroid, o.faceRoadWithin);
     const rotation_y = facingToRotation(F.facing);
     const rect = boxCorners([px, 0, pz], size, rotation_y);
-    const why = checkHouse(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds, R.oo);
+    const why = form === "stilt_house" ? checkStilt(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds)
+      : checkHouse(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds, R.oo);
     if (why) return why;
     const level = rg.level;
-    counters[level] = (counters[level] || 0) + 1;
-    // terrace_level / region_id 是 schema 字段；level / terrace_id / faces_toward 是引擎附加（level 为 terrace_level 的别名）
-    volumes.push({
-      id: `house_${level}_${counters[level]}`, kind: "building", shape: "box",
-      position: [px, r2(T.heightAt(px, pz)), pz], size, rotation_y,
-      label: "民居", importance: "secondary", color_role: "wall", generated: true,
-      terrace_level: level, region_id: rg.id, terrace_id: rg.terraceId, level, faces_toward: F.faces,
-    });
+    const base = { kind: "building", importance: "secondary", color_role: "wall", generated: true, terrace_level: level, region_id: rg.id, terrace_id: rg.terraceId, level, faces_toward: F.faces };
+    const plan = B ? { form, roof: B.roof, floors: B.floors, plan_id: B.plan_id, label: B.label } : { label: "民居" };
+    if (rg.zone_id) plan.zone_id = rg.zone_id;
+    const push = (pos, sz, extra = {}) => {
+      counters[level] = (counters[level] || 0) + 1;
+      // terrace_level / region_id 是 schema 字段；level / terrace_id / faces_toward 是引擎附加（level 为 terrace_level 的别名）
+      // 谷 / 盆地底的层号是负的：id 写成 house_m2_1（id 只能小写字母、数字、下划线）
+      volumes.push(Object.assign({ id: `house_${levelTag(level)}_${counters[level]}` }, base, { shape: B ? B.shape : "box", position: pos, size: sz, rotation_y }, plan, extra));
+      perTerrace[level] = (perTerrace[level] || 0) + 1;
+    };
+    if (form === "stilt_house") {
+      // 底面取上坡角（四角地面最高处），柱脚高 = 上坡角 − 下坡角
+      const hs = rect.map(([cx, cz]) => T.heightAt(cx, cz)), top = Math.max(...hs);
+      push([px, r2(top), pz], size, { stilt_m: r2(top - Math.min(...hs)) });
+    } else if (form === "courtyard") {
+      // 院落：一组四栋围合（前后两进 + 左右厢房），共用朝向，组号 courtyard
+      const k = r2(clamp(Math.min(size[0], size[2]) * 0.28, 3.5, 6)), t = (rotation_y * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+      const at = (lx, lz) => { const wx = px + lx * c + lz * s, wz = pz - lx * s + lz * c; return [r2(wx), r2(T.heightAt(wx, wz)), r2(wz)]; };
+      const group = `court_${levelTag(level)}_${(counters[level] || 0) + 1}`;
+      push(at(0, -size[2] / 2 + k / 2), [size[0], size[1], k], { courtyard: group, wing: "front" });
+      push(at(0, size[2] / 2 - k / 2), [size[0], r2(size[1] * 1.1), k], { courtyard: group, wing: "back" });
+      push(at(-size[0] / 2 + k / 2, 0), [k, r2(size[1] * 0.9), r2(size[2] - 2 * k - 0.3)], { courtyard: group, wing: "left" });
+      push(at(size[0] / 2 - k / 2, 0), [k, r2(size[1] * 0.9), r2(size[2] - 2 * k - 0.3)], { courtyard: group, wing: "right" });
+    } else {
+      push([px, r2(T.heightAt(px, pz)), pz], size, form !== R.form ? { form } : {});
+    }
     placed.push(rect); R.centers.push([px, pz]); R.n++;
-    perTerrace[level] = (perTerrace[level] || 0) + 1;
     return null;
   }
   /** 兜底放房：区域内 1.5 m 网格点按「离边最远」排序（带的中线优先），房子取最小宽、进深按当地带宽收（≥ 3.5 m）；
@@ -264,7 +296,8 @@ export function layoutHouses(sid, T, opts = {}) {
     const rg = R.rg, inset = 0.5;
     const pts = interiorPoints(rg.polygon, 1.5).filter((q) => q.d >= 2.2).sort((a, b) => b.d - a.d || a.p[0] - b.p[0] || a.p[1] - b.p[1]);
     const oo = R.oo; R.oo = Object.assign({}, oo, { inset });
-    const h = r2((HOUSE_SIZES.height[0] + HOUSE_SIZES.height[1]) / 2);
+    const h = R.B ? R.B.size[1] : r2((HOUSE_SIZES.height[0] + HOUSE_SIZES.height[1]) / 2);
+    const form = R.form === "courtyard" ? "house" : R.form; // 院落放不下一整组时退成单栋
     for (const { p, d } of pts) {
       if (R.n >= target) break;
       if (R.centers.some(([cx, cz]) => Math.hypot(cx - p[0], cz - p[1]) < R.minCenterDist * 0.7)) continue;
@@ -276,7 +309,7 @@ export function layoutHouses(sid, T, opts = {}) {
       const opts = [rule];
       if (dh && rule.faces !== "downhill") opts.push({ facing: dh, faces: "downhill" });
       if (out && rule.faces !== "outward") { const m = Math.hypot(out[0], out[1]); opts.push({ facing: [out[0] / m, out[1] / m], faces: "outward" }); }
-      for (const F of opts) if (!tryHouse(R, p[0], p[1], size, F)) { filled++; break; }
+      for (const F of opts) if (!tryHouse(R, p[0], p[1], size, F, form)) { filled++; break; }
     }
     R.oo = oo;
   }
@@ -284,6 +317,59 @@ export function layoutHouses(sid, T, opts = {}) {
 }
 
 function lerpRange([a, b], t) { return a + (b - a) * t; }
+const levelTag = (lv) => (lv < 0 ? "m" + -lv : String(lv));
+
+// ------------------------------------------------------------ 建筑形制（plan 的 buildings）
+/** 形制 → 体块形状：圆楼 / 井 / 树是圆柱，其余是盒子 */
+export const FORM_SHAPE = Object.freeze({ round_house: "cylinder", well: "cylinder", tree: "cylinder" });
+/** 区域上的建筑类型规范化：{ form, size: [w,h,d], floors, roof, label, plan_id, shape }；没有或不合法返回 null */
+function normBuilding(b) {
+  if (!b || typeof b !== "object") return null;
+  const size = Array.isArray(b.size) ? b.size : Array.isArray(b.size_m) ? b.size_m : null;
+  if (!size || size.length !== 3 || !size.every((v) => Number.isFinite(v) && v > 0)) return null;
+  const form = b.form || "house";
+  return { form, size: size.map(Number), floors: b.floors || 1, roof: b.roof || "gable", label: b.label || "民居", plan_id: b.plan_id || b.id || null, shape: FORM_SHAPE[form] || "box" };
+}
+/**
+ * 吊脚楼的落位：沿多边形的边每 step 米取一点，只留「外侧朝下坡」的边（外法线与下坡方向夹角 < 60°），
+ * 中心从边往里退 0.2 × 进深（前 0.3 进深悬在坡上），门朝外法线。顺序固定（沿边），确定性。
+ * @returns {{p: number[], n: number[]}[]}
+ */
+function stiltEdgeSpots(poly, T, depth, step) {
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1e-6) continue;
+    let n = [(b[1] - a[1]) / L, -(b[0] - a[0]) / L];
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    if (pointInPolygon([mid[0] + n[0] * 0.3, mid[1] + n[1] * 0.3], poly)) n = [-n[0], -n[1]];
+    for (let t = step / 2; t < L; t += step) {
+      const q = [a[0] + ((b[0] - a[0]) * t) / L, a[1] + ((b[1] - a[1]) * t) / L];
+      const dh = downhillDir(T, q[0] + n[0] * 2, q[1] + n[1] * 2);
+      if (!dh || dh[0] * n[0] + dh[1] * n[1] < 0.5) continue;
+      const p = [q[0] - n[0] * depth * 0.2, q[1] - n[1] * depth * 0.2];
+      if (pointInPolygon(p, poly)) out.push({ p, n });
+    }
+  }
+  return out;
+}
+/** 吊脚楼检查：中心在区域内，上坡角在区域的台地上，四角高差 ≤ 1.3 层（柱脚不超过一层多），其余（路 / 溪 / 地标 / 房 / 树）同普通房子 */
+function checkStilt(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bounds) {
+  for (const [x, z] of rect) if (x < bounds.min[0] || x > bounds.max[0] || z < bounds.min[2] || z > bounds.max[2]) return "out_of_bounds";
+  if (!pointInPolygon([px, pz], rg.polygon) || distToPolygon([px, pz], rg.polygon) < 0.3) return "outside_region";
+  const hs = rect.map(([x, z]) => T.heightAt(x, z)), top = Math.max(...hs), k = hs.indexOf(top);
+  if (top - Math.min(...hs) > 1.3 * T.layer) return "too_steep";
+  if (rg.terraceId) { const t = T.terraceAt(rect[k][0], rect[k][1]); if (!t || t.id !== rg.terraceId) return "cross_level"; }
+  else if (rg.floorOnly && rect.some(([x, z]) => T.terraceAt(x, z))) return "cross_level";
+  for (const p of paths) {
+    const need = (p.width || 2) / 2 + (p.kind === "river" ? DEFAULTS.streamClearance : DEFAULTS.pathClearance);
+    if (rectToPolylineDist(rect, p.points) < need) return p.kind === "river" ? "near_stream" : "near_path";
+  }
+  for (const ob of obstacles) if (rectToRectDist(rect, ob.rect) < ob.clearance) return "near_landmark";
+  for (const other of placed) if (rectToRectDist(rect, other) < DEFAULTS.houseGap) return "overlap";
+  for (const tr of treeRects) if (rectToRectDist(rect, tr) < DEFAULTS.houseGap) return "near_tree";
+  return null;
+}
 /** 多边形的「平均宽度」= 2·面积 / 周长（长条形区域时就是它的宽） */
 function regionMeanWidth(poly) { const A = Math.abs(polygonArea(poly)); let P = 0; for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; P += Math.hypot(a[0] - b[0], a[1] - b[1]); } return P > 0 ? (2 * A) / P : 0; }
 /** 多边形内 step 网格点（行优先）及其离边距离 d */
@@ -303,9 +389,10 @@ function resolveRegions(sid, T) {
   if (Array.isArray(sid.regions) && sid.regions.length) {
     list = sid.regions.filter((r) => r && Array.isArray(r.polygon) && r.polygon.length >= 3).map((r) => {
       const c = polygonCentroid(r.polygon);
-      const t = typeof r.terrace_level === "number" ? T.terraces.find((tt) => tt.level === r.terrace_level && pointInPolygon(c, tt.polygon)) || T.terraces.find((tt) => tt.level === r.terrace_level) : T.terraceAt(c[0], c[1]);
+      // floor_of：谷 / 盆地底上的区域，不挂到任何台地上（按真实地面布房）
+      const t = r.floor_of ? null : r.terrace_id ? T.terraces.find((tt) => tt.id === r.terrace_id) || null : typeof r.terrace_level === "number" ? T.terraces.find((tt) => tt.level === r.terrace_level && pointInPolygon(c, tt.polygon)) || T.terraces.find((tt) => tt.level === r.terrace_level) : T.terraceAt(c[0], c[1]);
       const level = t ? t.level : typeof r.terrace_level === "number" ? r.terrace_level : T.levelAt(c[0], c[1]);
-      return { id: r.id, kind: r.kind || "other", polygon: r.polygon, density: typeof r.density === "number" ? r.density : 1, level, terraceId: t ? t.id : null };
+      return { id: r.id, kind: r.kind || "other", polygon: r.polygon, density: typeof r.density === "number" ? r.density : 1, level, terraceId: t ? t.id : null, building: r.building || null, zone_id: r.plan_id || null, floorOnly: !!r.floor_of };
     });
   } else {
     list = T.terraces.map((t) => ({ id: "r_" + t.id, kind: "other", polygon: t.polygon, density: 1, level: t.level, terraceId: t.id }));
@@ -323,7 +410,7 @@ function checkHouse(rect, px, pz, rg, T, paths, obstacles, placed, treeRects, bo
   else {
     // 区域没有对应台地（基准面 / 用户随手圈的）：四角台地相同还不够——贴着台地脚时房角会落在坡裙上，再要求四角层号一致且四角都不陡
     const lv = T.levelAt(rect[0][0], rect[0][1]);
-    for (const id of ids) if (id !== ids[0]) return "cross_level";
+    for (const id of ids) if (id !== ids[0] || (rg.floorOnly && id)) return "cross_level";
     for (const [x, z] of rect) { if (T.levelAt(x, z) !== lv) return "cross_level"; if (T.slopeAt(x, z) > o.maxSlope) return "too_steep"; }
   }
   if (T.slopeAt(px, pz) > o.maxSlope) return "too_steep";

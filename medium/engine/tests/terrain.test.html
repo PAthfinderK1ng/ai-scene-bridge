@@ -1,8 +1,8 @@
 <!doctype html><meta charset="utf-8"><pre id="out">running</pre>
 <script type="module">
 import { test, run, assert, close, between } from "./harness.js";
-import { buildTerrain, generateArchetype, ARCHETYPES, pointInPolygon, polygonArea, DEFAULT_BOUNDS, MIN_BAND, MIN_BAND_HARD } from "../terrain.js";
-import { villageSid, valleySid } from "./fixtures.js";
+import { buildTerrain, pointInPolygon, polygonArea, DEFAULT_BOUNDS, MIN_BAND, MIN_BAND_HARD } from "../terrain.js";
+import { villageSid, valleySid, generateArchetype, ARCHETYPES } from "./fixtures.js";
 
 test("之字坡原型：4 层台地，高度递增，均在 bounds 内", () => {
   const g = generateArchetype("slope_zigzag", { terraces: 4, layer_height_m: 3 }, DEFAULT_BOUNDS, 1);

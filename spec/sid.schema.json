@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/PAthfinderK1ng/ai-scene-bridge/spec/sid.schema.json",
-  "title": "Scene Intent Document (SID) v0.1（含 v0.3 增补）",
-  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。v0.3 增补（全部可选，sid_version 仍为 0.1）：多层空间 spaces、连接点 markers[kind=connector]、自选剖切 meta.section、台地单独调高 features[].user_height、人拖过的体块 volumes[].user_moved、主路绕行 paths[].detour_around。",
+  "title": "Scene Intent Document (SID) v0.1（含 v0.3 / v0.4 增补）",
+  "description": "引擎无关的声明式场景意图文件。单位米，+Y 上，右手系（同 glTF），-Z 为北。位置为底面中心。v0.3 增补（全部可选，sid_version 仍为 0.1）：多层空间 spaces、连接点 markers[kind=connector]、自选剖切 meta.section、台地单独调高 features[].user_height、人拖过的体块 volumes[].user_moved、主路绕行 paths[].detour_around。v0.4 增补（全部可选）：SID 由构成图 plan 编译而来（spec/plan.schema.json，meta.plan 是那份 plan），每个生成物带 plan_id 指回 plan 里的元素；区域带建筑类型 regions[].building；体块带形制 form / roof / floors；空间带内部布局 passages / rooms / links / entrance / goal / facts。",
   "type": "object",
   "required": ["sid_version", "meta", "volumes"],
   "additionalProperties": false,
@@ -24,7 +24,14 @@
         "description": { "type": "string" },
         "layer_height_m": { "type": "number", "minimum": 0.5, "default": 3, "description": "一「层」等于多少米；界面上高度以层显示（D15）" },
         "archetype": { "type": "string", "description": "地形原型名（slope_zigzag / ring_terrace / valley_two_banks），由「场景对话」写入" },
-        "card": { "type": "object", "description": "「场景对话」当前方案卡（结构级参数，LLM 只改这里，不写坐标）" },
+        "card": { "type": "object", "description": "（v3，已不用）「场景对话」的方案卡" },
+        "plan": { "type": "object", "description": "v0.4：这份 SID 由哪份构成图编译而来（spec/plan.schema.json，规范化后的；没有坐标）" },
+        "plan_mode": { "type": "boolean", "description": "v0.4：由 plan 编译（路 / 地标 / 出生点由编译决定，resolve 只重放房子与检查）" },
+        "plan_warnings": { "type": "array", "items": { "type": "string" }, "description": "编译时的本地降级说明（引用不存在、成环、越界夹回…）" },
+        "focus": { "type": "string", "description": "主地标的 volume id（出生点第一眼看的那个）" },
+        "trail_target": { "type": "string", "description": "主路终点的 volume id（主路通向地标时）" },
+        "seed": { "type": "integer", "description": "编译 / 布局用的随机种子" },
+        "ignored_checks": { "type": "array", "items": { "type": "string" }, "description": "人标了「不重要」的检查 id" },
         "section": {
           "type": "object",
           "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上",
@@ -114,7 +121,7 @@
             "required": ["id", "kind", "center", "radius", "height"],
             "properties": {
               "id": { "$ref": "#/definitions/id" },
-              "kind": { "type": "string", "enum": ["hill", "pit", "plateau", "cliff", "ridge"] },
+              "kind": { "type": "string", "enum": ["hill", "pit", "plateau", "cliff", "ridge", "valley", "basin"], "description": "valley / basin / pit 有 polygon 时是负的平底（height < 0）" },
               "center": { "$ref": "#/definitions/vec3" },
               "radius": { "type": "number", "exclusiveMinimum": 0 },
               "height": { "type": "number", "description": "正为凸起，负为凹陷" },
@@ -129,7 +136,15 @@
               },
               "level": { "type": "integer", "minimum": 0, "description": "层号（0 = 最低），height = level × meta.layer_height_m" },
               "skirt": { "type": "number", "minimum": 0, "description": "台地边缘坡面宽度（米），默认 clamp(height×0.8, 2, 10)" },
-              "user_height": { "type": "boolean", "description": "人在剖面上单独调过这一层的高度：height 是实际值，重算 / 换参数（同原型）时沿用" }
+              "user_height": { "type": "boolean", "description": "人在剖面上单独调过这一层的高度：height 是实际值，重算 / 换参数（同原型）时沿用" },
+              "plan_id": { "type": "string", "description": "v0.4：来自 plan.terrain 的哪一块（台地 id = <plan_id>_<k>）" },
+              "override": { "type": "boolean", "description": "v0.4：按顺序压上去的平顶（落在多边形内时高度就是它的 height，之前的叠加作废）" },
+              "rx": { "type": "number", "description": "椭圆穹顶沿长轴的半径（米）" },
+              "rz": { "type": "number", "description": "椭圆穹顶沿短轴的半径（米）" },
+              "angle": { "type": "number", "description": "椭圆长轴方向（弧度，atan2(z, x)）" },
+              "step": { "type": "integer", "description": "台地带 / 环台的第几级（0 = 最低 / 最外）" },
+              "ring": { "type": "boolean", "description": "环台的一圈（多边形带一条零宽缝：外圈 + 反向内圈）" },
+              "cliff": { "type": "boolean", "description": "崖：坡裙极窄" }
             }
           }
         }
@@ -160,7 +175,17 @@
           "terrace_level": { "type": "integer", "description": "所在台地层号" },
           "region_id": { "type": "string" },
           "kind_hint": { "type": "string", "description": "地标种类（temple/pagoda/tree/wheel/gate）等语义提示" },
-          "user_moved": { "type": "boolean", "description": "人在俯视图上拖过（id 改为 u_house_<n>、generated 去掉）：重排不动它，y 跟着地面走" }
+          "user_moved": { "type": "boolean", "description": "人在俯视图上拖过（id 改为 u_house_<n>、generated 去掉）：重排不动它，y 跟着地面走" },
+          "plan_id": { "type": ["string", "null"], "description": "v0.4：地标 = plan.landmarks 的 id；房子 = plan.buildings 的 id（建筑类型）" },
+          "zone_id": { "type": "string", "description": "v0.4：房子所在的 plan 区域 id" },
+          "form": { "type": "string", "enum": ["house", "stilt_house", "courtyard", "round_house", "tower", "hall", "pavilion", "gate", "bridge", "stage", "wall", "well", "tree", "statue", "custom"], "description": "v0.4：形制（决定体块怎么画：屋顶 / 柱脚 / 圆形）" },
+          "roof": { "type": "string", "enum": ["gable", "hip", "flat", "pyramid", "round", "none"] },
+          "floors": { "type": "integer", "minimum": 1 },
+          "stilt_m": { "type": "number", "minimum": 0, "description": "吊脚楼的柱脚高（底面取上坡角，= 上坡角 − 下坡角地面高）" },
+          "courtyard": { "type": "string", "description": "院落组号（一组四栋围合）" },
+          "wing": { "type": "string", "enum": ["front", "back", "left", "right"], "description": "院落里的哪一栋" },
+          "span_ends": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "桥的两头 [x, z]（form bridge）" },
+          "rests_on": { "type": "string", "description": "立在哪个体块身上（plan 里 place.rel = above 且目标是地标，如桥心楼阁在风雨桥上）：y = 它的桥面 / 顶面，和它不算重叠" }
         }
       }
     },
@@ -199,7 +224,23 @@
           "label": { "type": "string" },
           "notes": { "type": "string" },
           "terrace_level": { "type": "integer", "description": "这个区域对应的台地层号" },
-          "user_set": { "type": "boolean", "description": "人圈出来 / 改过标签的区域（重算时保留）" }
+          "user_set": { "type": "boolean", "description": "人圈出来 / 改过标签的区域（重算时保留）" },
+          "plan_id": { "type": "string", "description": "v0.4：来自 plan.zones 的哪一个区域" },
+          "use": { "type": "string", "description": "v0.4：plan 里的用途（housing / market / plaza / farm / terrace_farm / forest / temple / dock / yard / ruins / other）" },
+          "terrace_id": { "type": "string", "description": "这个区域对应的台地 feature id" },
+          "floor_of": { "type": "string", "description": "v0.4：区域在谷 / 盆地 / 坑的底上（plan 地形 id）：布房只放在不属于任何台地的真实地面" },
+          "building": {
+            "type": "object",
+            "description": "v0.4：区域里放什么建筑（plan.buildings 的一种）：布房按它的形制与尺寸",
+            "properties": {
+              "form": { "type": "string" },
+              "size": { "$ref": "#/definitions/vec3", "description": "[宽, 高, 深]（米）" },
+              "floors": { "type": "integer" },
+              "roof": { "type": "string" },
+              "label": { "type": "string" },
+              "plan_id": { "type": ["string", "null"] }
+            }
+          }
         }
       }
     },
@@ -224,7 +265,13 @@
           "generated": { "type": "boolean" },
           "user_drawn": { "type": "boolean", "description": "人画的一笔（经简化 / 吸附），重算时保留" },
           "detour_around": { "type": "array", "items": { "$ref": "#/definitions/id" }, "description": "主路为躲开这几栋人放的房子（user_moved / locked）绕了路（引擎算，只读）" },
-          "facts": { "type": "object", "description": "引擎算出的路径事实（length_m / climb_m / folds / max_slope / steps_estimate）" }
+          "facts": { "type": "object", "description": "引擎算出的路径事实（length_m / climb_m / folds / max_slope / steps_estimate）" },
+          "plan_id": { "type": ["string", "null"], "description": "v0.4：来自 plan.paths / plan.water 的哪一条（main_trail 是第一条路）" },
+          "style": { "type": "string", "enum": ["winding", "stairs", "zigzag", "straight", "bridge", "tunnel"], "description": "v0.4：路的走法" },
+          "nodes": { "type": "array", "items": { "type": "string" }, "description": "v0.4：经过的 plan 节点（spawn / 元素 id）" },
+          "tunnel": { "type": "boolean" },
+          "fallback": { "type": ["string", "null"], "description": "路由退回的原因（如「直上石阶」）" },
+          "auto_spur": { "type": "boolean", "description": "引擎自动补的支路（重算先清再补）" }
         }
       }
     },
@@ -251,7 +298,8 @@
           "top_y": { "type": "number", "description": "连接点上端高度（米）" },
           "bottom_y": { "type": "number", "description": "连接点下端高度（米）；position 是下端" },
           "generated": { "type": "boolean", "description": "引擎自动放的连接点（重算时按主路重新选位置）" },
-          "user_moved": { "type": "boolean", "description": "人拖过的连接点：重算只改两端高度，不动位置" }
+          "user_moved": { "type": "boolean", "description": "人拖过的连接点：重算只改两端高度，不动位置" },
+          "plan_id": { "type": ["string", "null"], "description": "v0.4：出生点为 spawn；连接点为所连空间的 plan id" }
         }
       }
     },
@@ -264,7 +312,7 @@
         "properties": {
           "id": { "$ref": "#/definitions/id" },
           "stratum": { "type": "string", "enum": ["underground", "sky"] },
-          "kind": { "type": "string", "enum": ["cave", "tunnel", "cellar", "crypt", "platform", "walkway", "island", "bridge"], "description": "地下：cave 溶洞 / tunnel 地道 / cellar 地窖 / crypt 地宫；空中：platform 平台 / walkway 栈道 / island 浮岛 / bridge 天桥" },
+          "kind": { "type": "string", "enum": ["cave", "tunnel", "cellar", "crypt", "mine", "maze", "platform", "walkway", "island", "bridge"], "description": "地下：cave 溶洞 / tunnel 地道 / cellar 地窖 / crypt 地宫 / mine 矿洞 / maze 迷宫；空中：platform 平台 / walkway 栈道 / island 浮岛 / bridge 天桥（v0.4 由 layout 推出）" },
           "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" }, "description": "俯视多边形 [x, z]" },
           "floor_y": { "type": "number", "description": "可走地面的绝对高度（米）" },
           "height": { "type": "number", "exclusiveMinimum": 0, "description": "地下为净高；空中为板面以上可用高度（板厚 1 m 在板面之下）" },
@@ -277,7 +325,102 @@
           "generated": { "type": "boolean", "description": "由卡片 levels 生成（重算时重放）" },
           "user_set": { "type": "boolean", "description": "人在地下 / 天上层圈出来或接管的空间（重算时保留）" },
           "user_height": { "type": "boolean", "description": "人在剖面上调过 floor_y / height（重算不覆盖）" },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "plan_id": { "type": "string", "description": "v0.4：来自 plan.spaces 的哪一个" },
+          "layout": { "type": "string", "enum": ["chamber", "corridor", "maze", "galleries", "halls", "network", "rooms"], "description": "v0.4：内部布局（docs/04 §8、docs/05 §4）" },
+          "branching": { "type": "string", "enum": ["low", "medium", "high"] },
+          "sublevels": { "type": "integer", "minimum": 1, "maximum": 3, "description": "内部叠几层；第 k 层底面 = floor_y + k ×（净高 + 岩层 / 板厚）" },
+          "corridor_m": { "type": "number", "exclusiveMinimum": 0, "description": "走廊宽（米）" },
+          "corridor_width": { "type": "number", "exclusiveMinimum": 0, "description": "（同 corridor_m，docs/04 的旧名）" },
+          "size_m": { "oneOf": [{ "type": "number" }, { "$ref": "#/definitions/vec2" }], "description": "外轮廓大小（米）：边长或 [宽, 深]" },
+          "layout_seed": { "type": "integer", "minimum": 0, "description": "内部布局的种子（「换一个」换它）" },
+          "offset_m": { "$ref": "#/definitions/vec2", "description": "人在图上拖过的平移 [dx, dz]" },
+          "axis_deg": { "type": "number", "description": "内部布局的主轴方向（度）" },
+          "connect_from": { "type": "string", "description": "plan 里 connect.from 指向的元素 id（入口靠近它）" },
+          "connect_space": { "$ref": "#/definitions/id", "description": "connect.from 是另一个空间时，连接点接到那个空间（spaces[].id）" },
+          "user_polygon": { "type": "boolean", "description": "人拖过外轮廓角点：重算保留外轮廓，只在里面铺内部" },
+          "room_graph": {
+            "type": "object",
+            "description": "plan 给的房间清单与连线（rooms 布局；\"entry\" 是保留节点 = 从地面下来的入口）",
+            "properties": {
+              "rooms": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"] },
+                    "size_m": { "type": "number", "exclusiveMinimum": 0 }
+                  }
+                }
+              },
+              "links": { "type": "array", "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string" } } }
+            }
+          },
+          "passages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["points", "width"],
+              "properties": {
+                "id": { "type": "string" },
+                "sublevel": { "type": "integer", "minimum": 0 },
+                "points": { "type": "array", "minItems": 2, "items": { "$ref": "#/definitions/vec2" } },
+                "width": { "type": "number", "exclusiveMinimum": 0 },
+                "floor_y": { "type": "number" },
+                "height": { "type": "number", "exclusiveMinimum": 0 },
+                "style": { "type": "string", "enum": ["walkway", "rope_bridge"], "description": "空中：栈道 / 索桥" },
+                "between": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string" }, "description": "rooms 布局：这条走廊连的两个房间 id" },
+                "user_drawn": { "type": "boolean" }
+              }
+            }
+          },
+          "rooms": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["polygon"],
+              "properties": {
+                "id": { "type": "string" },
+                "sublevel": { "type": "integer", "minimum": 0 },
+                "polygon": { "type": "array", "minItems": 3, "items": { "$ref": "#/definitions/vec2" } },
+                "floor_y": { "type": "number" },
+                "height": { "type": "number" },
+                "role": { "type": "string", "enum": ["entry", "goal", "stope", "hall", "side", "chamber", "named"], "description": "入口 / 终点室 / 采场 / 厅 / 耳室 / 小室 / plan 给名字的房间" },
+                "label": { "type": "string" }
+              }
+            }
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "at": { "$ref": "#/definitions/vec2" },
+                "from": { "type": "integer", "minimum": 0, "description": "下（小）的内部层号" },
+                "to": { "type": "integer", "minimum": 0 },
+                "via": { "type": "string", "enum": ["ladder", "ramp", "winze", "stairs"], "description": "层间连接：梯子 / 坡道 / 暗井 / 楼梯" }
+              }
+            }
+          },
+          "entrance": { "$ref": "#/definitions/vec2", "description": "入口 [x, z]（地面连接点落在这里）" },
+          "goal": { "oneOf": [{ "$ref": "#/definitions/vec2" }, { "type": "null" }], "description": "终点 [x, z]；没有终点（单室等）为 null" },
+          "facts": {
+            "type": "object",
+            "description": "内部事实（引擎算，给 BRIEF 与清单关键值）",
+            "properties": {
+              "passage_m": { "type": "number", "minimum": 0, "description": "通道总长（米）" },
+              "rooms": { "type": "integer", "minimum": 0 },
+              "dead_ends": { "type": "integer", "minimum": 0 },
+              "loops": { "type": "integer", "minimum": 0 },
+              "longest_route_m": { "type": "number", "minimum": 0, "description": "入口到终点的最短可走路线长（米）" },
+              "cells": { "type": "integer", "minimum": 0, "description": "迷宫格数" },
+              "sublevels": { "type": "integer", "minimum": 1, "maximum": 3 }
+            }
+          }
         }
       }
     },

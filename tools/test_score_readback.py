@@ -11,7 +11,7 @@ test_score_readback.py — score_readback.py 的自测（不需要浏览器 / �
   2. 构造的最小山地场景（3 层台地 + 2 栋房 + 地标 + 出生点 + 主路）→ 按 PROTOCOL 3.2 生成理想读回 → 全部合格；
      再逐项破坏：房子挪到下一层台地 → level_ok false；地标前放 20 m 高体块 → visible_from_spawn.readback false；
      删掉主路（台地墙坡度 > 0.7）→ trail_connected.readback false；颜色 ΔE > 10 → color_ok false
-  3. desktop/api_server._score 把新字段透出
+  3. desktop/app._score 把新字段透出
   4. 几何小函数：高度函数、CIE76、路段盒子 → 中心线
 """
 from __future__ import annotations
@@ -211,11 +211,11 @@ def main() -> int:
     r = row(score(flat, rb), "house_1_1")
     check("没有地形特征 → 台地层不计分", r["level_ok"] is None and score(flat, rb)["summary"]["level_ok_rate_pct"] is None)
 
-    # ------------------------------------------------ 3. desktop/api_server._score 透出新字段
+    # ------------------------------------------------ 3. desktop/app._score 透出新字段
     sys.path.insert(0, os.path.join(ROOT, "desktop"))
     os.environ.setdefault("LOCALAPPDATA", os.environ.get("TEMP", HERE))
-    import api_server  # noqa: E402
-    out = api_server._score(ROOT, {"intent": sid, "readback": rb3, "auto_map": True})
+    import app  # noqa: E402
+    out = app._score(ROOT, {"intent": sid, "readback": rb3, "auto_map": True})
     check("_score：summary 含 visible_from_spawn / trail_connected / level_ok_rate_pct / color_ok_rate_pct", all(k in out["summary"] for k in ("visible_from_spawn", "trail_connected", "level_ok_rate_pct", "color_ok_rate_pct")) and out["summary"]["visible_from_spawn"]["readback"] is False)
     check("_score：rows 含 level_ok / color_ok / delta_e 且可 JSON 序列化", all("level_ok" in r and "color_ok" in r and "delta_e" in r for r in out["rows"]) and json.dumps(out) is not None)
 

@@ -324,6 +324,49 @@ export function routeStream(T, bounds) {
   return pts;
 }
 
+/**
+ * 水路：from → to 的 A*，不限坡度，代价偏向低处（每步 × (1 + 2 × 高出最低处的层数)），所以会顺着谷底走。
+ * 结果简化到 ≤ 32 点，首尾等于 from / to。确定性（无随机）。
+ * @param {object} T buildTerrain 结果
+ * @param {number[]} from [x,z]
+ * @param {number[]} to [x,z]
+ * @param {{res?: number, maxPoints?: number}} [opts]
+ * @returns {number[][]}
+ */
+export function routeWater(T, from, to, opts = {}) {
+  const res = opts.res || 3, maxPoints = opts.maxPoints || 32;
+  const L = makeLattice(T, res), N = L.nx * L.nz;
+  let hmin = Infinity;
+  for (let i = 0; i < N; i++) hmin = Math.min(hmin, L.h[i]);
+  const layer = T.layer || 3, start = L.nearest(from), goal = L.nearest(to);
+  const g = new Float64Array(N).fill(Infinity), parent = new Int32Array(N).fill(-1), closed = new Uint8Array(N);
+  const gx = goal % L.nx, gz = (goal / L.nx) | 0, heur = (idx) => Math.hypot((idx % L.nx) - gx, ((idx / L.nx) | 0) - gz) * res;
+  const heap = makeHeap();
+  g[start] = 0; heap.push(heur(start), start);
+  while (heap.size) {
+    const cur = heap.pop();
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    if (cur === goal) break;
+    const ci = cur % L.nx, cj = (cur / L.nx) | 0;
+    for (const [di, dj] of DIRS) {
+      const ni = ci + di, nj = cj + dj;
+      if (ni < 0 || nj < 0 || ni >= L.nx || nj >= L.nz) continue;
+      const n = nj * L.nx + ni;
+      if (closed[n]) continue;
+      const len = res * (di && dj ? SQRT2 : 1), ng = g[cur] + len * (1 + (2 * (L.h[n] - hmin)) / layer);
+      if (ng < g[n] - 1e-12) { g[n] = ng; parent[n] = cur; heap.push(ng + heur(n), n); }
+    }
+  }
+  if (!closed[goal]) return [from.slice(), to.slice()];
+  const raw = [];
+  for (let c = goal; c !== -1; c = parent[c]) raw.push(L.world(c));
+  raw.reverse();
+  raw[0] = from.slice(); raw[raw.length - 1] = to.slice();
+  const smooth = raw.map((p, i) => { if (i === 0 || i === raw.length - 1) return p; const a = raw[i - 1], c = raw[i + 1]; return [(a[0] + p[0] + c[0]) / 3, (a[1] + p[1] + c[1]) / 3]; });
+  return simplifyToMax(smooth, maxPoints, 1.0).map(([x, z]) => [r2(x), r2(z)]);
+}
+
 // ------------------------------------------------------------ 桥
 /**
  * 路过溪的地方 = 桥：每条可走的路（非 river）与每条溪的线段交点。确定性：按路在 paths 里的顺序、沿路的先后。

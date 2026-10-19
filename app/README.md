@@ -4,7 +4,7 @@
 
 ## 启动
 
-**桌面版**：双击 `dist\SIDEditor\SIDEditor.exe`（独立窗口，用系统自带的 WebView2，不需要浏览器）。没有 dist 目录就先双击 `desktop\build.bat` 打包一次（需要本机 Python 3.10+，会自动建 `.venv` 并装 pywebview、PyInstaller），产物约几十 MB。桌面壳的源码在 `desktop/sid_editor.py`。
+**桌面版**：双击 `dist\SIDEditor\SIDEditor.exe`（独立窗口，用系统自带的 WebView2，不需要浏览器）。没有 dist 目录就先双击 `desktop\build.bat` 打包一次（需要本机 Python 3.10+，会自动建 `.venv` 并装 pywebview、PyInstaller），产物约几十 MB。（v4 起桌面壳是「场景对话」：`desktop/app.py`，界面在 `medium/`；本目录是早期的 SID 编辑器，网页版仍可用。）
 
 **网页版**：双击仓库根目录的 `run-editor.bat`，或在仓库根目录执行：
 

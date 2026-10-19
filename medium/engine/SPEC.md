@@ -29,7 +29,7 @@
 
 ### 接口
 ```js
-import { buildTerrain, generateArchetype, ARCHETYPES } from "./terrain.js";
+import { buildTerrain, MIN_BAND, MIN_BAND_HARD } from "./terrain.js";
 const T = buildTerrain(sid, { res: 2 });   // res = 网格米数
 T.heightAt(x, z)            // 双线性插值，米
 T.gradientAt(x, z)          // [dh/dx, dh/dz]
@@ -44,8 +44,9 @@ T.inside(x, z)              // 是否在 bounds 内
 T.grid                      // { xmin, zmin, res, nx, nz, h: Float32Array }
 ```
 
-### 原型（LLM 选原型和参数，引擎生成多边形）
+### 原型（v3；v4 起只在 tests/fixtures.js 里给测试造样例，产品地形来自 plan.js）
 ```js
+import { generateArchetype, ARCHETYPES } from "./tests/fixtures.js";
 generateArchetype(name, params, bounds, seed) → {
   features,                 // 写进 sid.terrain.features 的数组（含 polygon / level / center / radius / height）
   stream,                   // [[x,z],...] 或 null（溪流中心线，自北向南）
@@ -137,18 +138,15 @@ strokeToPolygon(points, { T, maxPoints = 10 }) → { polygon, area_m2, levels_to
 - 吸附：起 / 终点距 anchors 中某点 ≤ snap 米则精确替换为该点。
 - 简化：Douglas–Peucker，容差自适应使点数 ≤ maxPoints。
 
-## 6. 候选差异与变化轴（diversity.js）
+## 6. 候选差异（v4 起在 plan.js）
 
+原 diversity.js 已删除。「换一批 / 三张卡够不够不同」改成按 plan 的构成算，不用编译：
 ```js
-import { signature, distance, distinctEnough, axisOverrides, AXES } from "./diversity.js";
-signature(resolvedSid) → { archetype, landmark: [x,z], levels, houses, entry_bearing_deg, palette_lab: [L,a,b] }
-distance(sigA, sigB) → number        // 加权：地标位移/30 + |levels 差| + |houses 差|/15 + bearing 差/90 + ΔE/30
-distinctEnough(sigs, threshold = 1.0) → boolean   // 两两 distance 都 ≥ threshold
-axisOverrides(axis, base) → [override, override, override]
+import { planDistance, distinctPlans } from "./plan.js";
+planDistance(planA, planB) → number   // 地形种类 ×1.2 + 地标 / 建筑形制 ×0.8 + 空间布局 ×0.6 + 区域用途 ×0.4 + 路的走法 ×0.3 + 水 ×0.5（各为多重集 Jaccard 距离）
+                                      // + |总高差差|/4 + |场地边长差|/80 + 时段不同 0.2 + 入口方向不同 0.2 + |地形块数差|/5
+distinctPlans(plans, threshold = 1) → boolean
 ```
-`AXES = { landmark: "地标位置", terraces: "台地层数", entry: "入口方位", density: "密度", palette: "色板冷暖" }`
-- landmark → `landmark.placement` ∈ [top, ridge_end, cliff_edge]；terraces → [n−1, n, n+1] 夹在 3..7；entry → [S, E, W]；density → 全局 density × [0.6, 1, 1.4]；palette → `paletteShift` 的 [cool, neutral, warm]。
-- override 的形状与 Draft 卡片参数一致（见第 8 节），由调用方合并进卡片参数再重算。
 
 ## 7. 颜色（color.js）
 
@@ -161,36 +159,21 @@ hexToLab(hex) → [L, a, b]；deltaE(hexA, hexB) → number（CIE76）
 ```
 角色启发式：foliage = 最绿（a* 最负）；wall = 最亮；roof = 最暗且饱和度低；stone = 中灰；mist = 最亮且饱和度最低（可与 wall 相同则取次亮）。
 
-## 8. SID 组装（sid.js）
+## 8. SID 文档工具（sid.js）
 
 ```js
-import { newDoc, resolve, applyCard, applyPatch, snapshot, restore, THEME, setTerraceHeight, resetTerraceHeight } from "./sid.js";
+import { newDoc, resolve, snapshot, restore, THEME, setTerraceHeight, resetTerraceHeight, landmarkDoor, rotationToward, riversOf, expandedFootprint } from "./sid.js";
 newDoc(theme = THEME.mountain_village) → sid                         // 含默认调色板、bounds、meta.layer_height_m
-applyCard(sid, card) → sid        // 把 LLM 的卡片提案（第 8 节 Card 结构）落成 terrain.features / markers / regions / style
-resolve(sid, { seed }) → { sid, T, checks, facts }                 // 跑 layout → routing → relations，写回 volumes/paths/relations（generated）
-// facts.bridges = [{ path, at: [x,z], dir: [dx,dz], width }]：路过溪处 = 桥（routing.pathCrossings；6 m 内算一座）。
-// A* 对溪面 + 1 m 内的格点加 3 步长代价（opts.wet），路要过溪就直着过一次，不顺着溪床走。
-applyPatch(sid, patch) → sid      // LLM 的 Revise 结构 patch（只允许改参数 / 放置类 / 密度 / 调色板 / 文案 / levels）
-setTerraceHeight(sid, featureId, h) → sid   // 剖面拖平台段：只改这一层，0.5 m 吸附，写 user_height，skirt 重算
-resetTerraceHeight(sid, featureId) → sid    // 「恢复」：height = level × 层高，去掉 user_height
+resolve(sid, { seed, autoSpur = true }) → { sid, T, checks, facts, ms } // 布房 → 支路 → 空间刷新 → relations → validate
+setTerraceHeight(sid, featureId, h) / resetTerraceHeight(sid, featureId)
 snapshot(sid) / restore(json)
 ```
-- **台地单独调高**：`features[].user_height: true` 的高度不被覆盖；`applyCard` / `applyPatch` 重新生成地形时，**同原型**同 id 的台地沿用它（换原型则丢弃）。resolve 时房子贴新高度、主路 / 支路重算、`user_moved` 的体块 y 跟到地面。
-- **多层空间**：Card 可选 `levels`（≤ 3 项，见 §10）。`applyCard` 删掉上次生成的空间与连到它们的连接点，保留 `user_set` 的空间与它们的连接点，再按 levels 生成（`generated: true`）。resolve 在主路 / 支路之后、布房之前调 `refreshSpaces`（generated 空间按当前地形重算 floor_y，连接点按主路重新选位置、重算两端高度），房子避开连接点 3×3 m；checks 末尾追加 `spaceChecks`；`facts.spaces = { total, underground, sky, connectors }`。
-- `meta.section`（剖切设置）原样保留，引擎不改它。
-**Card（LLM Draft 的一张卡）**：
-```json
-{ "name": "环湾叠落型", "one_liner": "...", "archetype": "ring_terrace",
-  "params": { "entry_side": "S", "terraces": 4, "layer_height_m": 3, "plateau_width": "medium", "stream": false },
-  "landmark": { "kind": "temple", "label": "山顶寺", "placement": "top", "size_m": [8, 9, 8] },
-  "spawn": { "placement": "valley_bottom" },
-  "regions": [ { "terrace": 0, "kind": "other", "density": 0.6, "label": "下村" }, { "terrace": 3, "kind": "plaza", "density": 0, "label": "顶台" } ],
-  "palette": [ { "role": "roof", "hex": "#4A4A4A", "note": "青瓦" }, ... 5 项 ],
-  "lighting": { "time_of_day": "dusk" }, "mood": ["宁静"], "summary": "一句话" }
-```
-`landmark.placement ∈ top|ridge_end|cliff_edge|plaza|entry`（entry = 村口，原型的 `spots.entry`）；`spawn.placement ∈ valley_bottom|side_slope|summit|S|E|W`。
-可选 `"levels": [{ "stratum": "underground", "kind": "cave", "anchor": "landmark", "depth_layers": 2, "size": "medium", "connect": "stairs", "label": "寺下溶洞" }]`（§10）。
-resolve 之后 SID 里：`terrain.features`（原型生成）、`markers`（spawn、landmark 为 volume + marker poi）、`regions`（每层一个 + LLM 指定的 kind/density）、`volumes`（地标 + 房子 + 树，房子 `generated: true`）、`paths`（主路 `main_trail`，溪 `stream`）、`relations`、`constraints`（locked、must_reach）。
+- Card（applyCard / applyPatch / normalizeCard）随 v4 删除：场景由 plan 编译（§13）。
+- **两种模式**：`meta.plan_mode`（plan 编译出来的 SID）下 resolve 不碰路、地标、出生点（它们由编译决定），只清 / 重放 generated 的房子与树、自动支路，检查里没有 `landmark_on_top`（换成 plan.js 的放置检查），`trail_reaches_landmark` 看主路自己的终点（`meta.trail_target`）；旧模式（测试夹具直接摆的 SID）还按「出生点 → 地标门前」算主路 `main_trail`。
+- 多个地标时主地标 = `meta.focus`（出生点第一眼看的那个）；房子 = 非地标的 building。
+- regions[].building（plan 的建筑类型）决定布房的形制与尺寸（§2、§13）；volumes 带 `form / roof / floors / label / plan_id / zone_id`。
+- facts 另有 `forms`（按形制计数）、`stilt_houses`（柱脚 > 0.5 m 的吊脚楼数）、`bridges`（路过溪处）、`spaces`（interior.spaceFacts 的汇总对象）。
+- 空间直接用 interior.js：resolve 在布房前 `refreshSpaces`，检查末尾接 `spaceChecks`（spaces_connected / interior_connected / spaces_clear_of_terrain）；没有本地桩。
 
 ## 9. 测试约定
 
@@ -206,33 +189,26 @@ run();
 ```
 跑：`python tools/run_browser_test.py medium/engine/tests/xxx.test.html`。确定性测试必须包含「同参数两次结果相同」。几何测试用 `fixtures.js` 里的 `villageSid()`（slope_zigzag、4 层、入口南）与 `valleySid()`。
 
-## 10. 多层空间（strata.js，D18）
+## 10. 地下 / 空中空间（interior.js，v4，docs/05 §4；原 strata.js 已并入）
 
-地面之外的地下 / 空中空间。AI 只给结构（层、种类、锚点类、层数、大小、连接方式），多边形、高度、连接点全由这里算。
+AI 只给结构（stratum、layout、under / over 目标、depth_layers / height_layers、size_m、branching、sublevels、corridor_m、rooms + links、connect），外轮廓、内部布局、高度、连接点全由这里算。
 ```js
-import { STRATA_KINDS, SPACE_LABEL, STRATUM_LABEL, CONNECTOR_VIA, VIA_LABEL, ANCHORS, ANCHOR_LABEL, SIZES, NET_HEIGHT, DEFAULT_VIA, CLEARANCE,
-  normalizeLevels, generateSpaces, makeSpace, connectorFor, connectorsFor, connectorHeights, refreshSpaces, spaceChecks, spaceFacts,
-  fitFloor, clearLimit, spaceClearance, groundRange, anchorPoint, bridgeEnd } from "./strata.js";
-normalizeLevels(levels) → Level[]                         // ≤ 3 项；stratum / kind 不合法的丢；其余回退默认
-generateSpaces(levels, sid, T, g?) → { spaces, connectors } // applyCard 调；g = generateArchetype 结果（省略时按 meta 重算）
-makeSpace({ stratum, kind?, polygon, floor_y?, height?, label?, id?, connect? }, sid, T) → { space, connector } | null   // 人圈的；不改 sid
-connectorFor(space, sid, T, end = 0) → marker              // 天桥 end 1 是另一端（id 加 _2）
-refreshSpaces(sid, T) → sid                                // resolve 调
-spaceChecks(sid, T) → Check[]                               // 没有空间时 []
+import { SPACE, LAYOUT_LABEL, VIA_LABEL, levelsOf, levelStep, levelFloor, entryLevel, goalLevel, fitFloor, clearLimit, setSpaceFloor, spaceClearance,
+  groundRange, sidTarget, buildInterior, compileSpaces, entryFloor, connectorHeights, connectorFor, refreshSpaces, makeSpace, interiorGraph,
+  spaceChecks, spaceFacts } from "./interior.js";
+compileSpaces(planSpaces, sid, T, resolveTarget?, { seed }) → { spaces, connectors, warnings }   // plan.js 调；不改 sid
+buildInterior(space, sid, T, { seed, center, approach, preferBoundary, axis_deg }) → { polygon, floor_y, height, passages, rooms, links, entrance, goal, facts, … }
+makeSpace({ stratum, polygon, layout?, … }, sid, T) → { space, connector } | null   // 人在地下 / 空中层圈的
+refreshSpaces(sid, T) → sid      // resolve 调：补内部、重定高度、连接点回到入口上方
+spaceChecks(sid, T) → Check[]    // spaces_connected / interior_connected / spaces_clear_of_terrain；没有空间时 []
 ```
-- **SID**：`sid.spaces[] = { id, stratum: underground|sky, kind, polygon, floor_y, height, label, anchor, size, depth_layers | height_layers, connect, generated | user_set, user_height? }`；连接点是 `markers[]` 里 `{ id, kind: "connector", via, from, to, position: [x, 下端 y, z], top_y, bottom_y, label, generated, user_moved? }`，`from` / `to` 是 `"ground"` 或空间 id。
-- **种类**：地下 cave 溶洞（净高 6）/ tunnel 地道（3，4 m 宽长条，沿下坡方向）/ cellar 地窖（3）/ crypt 地宫（5）；空中 platform 平台（4）/ walkway 栈道（3，3 m 宽长条，沿等高线）/ island 浮岛（6）/ bridge 天桥（3，3 m 宽长条，跨谷或跨台地）。默认连接：stairs / ramp / ladder / stairs；stairs / ladder / elevator / stairs。
-- **锚点**：landmark 地标中心 / village 面积最大的 other 区域 / top 顶层台地内 / plaza 广场区域（无则原型广场点）/ ridge_end、cliff_edge 原型给的点 / entry 出生点。空中空间锚在地标时贴着地标侧面放（沿「地标 → 入口」的垂线偏开），不压在地标头顶。
-- **多边形**：圆角 12 边形，直径 small 10 / medium 18 / large 28 m（种子化 ±6% 抖动、0.8–1 椭圆比）；长条长 16 / 28 / 40 m。整体平移进 bounds（留 2 m）。天桥另一端：24 方向 × 10–60 m 搜索，两端高差 ≤ 2 层，中间谷 ≥ 2 m 或两端在不同台地，评分 = 谷深×2 + 跨台地 3 − |长度 − 目标|×0.3；找不到就沿下坡方向。
-- **高度**（0.5 m 取整）：地下 `floor_y = 质心处地面 − depth_layers × 层高 − 净高`，再压到「多边形内地面最低点 − 2 m − 净高」以下；空中 `floor_y = 质心处地面 + height_layers × 层高`，再抬到「多边形内地面最高点 + 3 m + 1 m 板厚」以上。默认 depth_layers 2、height_layers 3。
-- **连接点**：地下 = 多边形内离主路（无主路时离「入口 → 地标」线）最近的点；空中 = 多边形边上（向内 1 m）离主路最近的点；天桥 = 两条短边中点各一个。避开地标与人放的体块（外扩 1 m）。文案「下行 / 上行 + 楼梯 / 梯子 / 井 / 竖井 / 升降台 / 索桥 / 坡道」。
-- **检查**：
-  | id | 文案 | 判定 | fixes |
-  | --- | --- | --- | --- |
-  | spaces_connected | 每个空间 都连到地面 | 从 ground 沿连接点（无向）BFS 到达每个空间 | 补一个连接点 / 不重要 |
-  | spaces_clear_of_terrain | 空间 不穿地形 | 地下顶板低于多边形内地面最低点 ≥ 2 m；空中板底（floor_y − 1）高于最高点 ≥ 3 m | 下移到合格高度 / 上移到合格高度（两种都有时「移到合格高度」）/ 不重要 |
-- **重算**：generated 且没有 user_set / user_height 的空间每次 resolve 按规则重算 floor_y（地形调高后仍在地面下）；generated 且没 user_moved 的连接点按主路重选位置；其余连接点只重算两端高度；引用了不存在空间的连接点删掉。
-- **确定性**：随机只来自 `sid.meta.seed`（= card.seed）；id = `space_<kind>_<n>`，人圈的 `u_space_<n>`，连接点 `conn_<空间 id>`。
+- **位置**：中心 = under / over 目标的投影 + 人拖过的 `offset_m`；空中压在建筑上方时挪到旁边。入口朝 `connect.from`（建筑就落在它旁边 R + 2 m），没有时朝出生点。
+- **内部布局**：maze（格 = 走廊宽 × 2，DFS 生成树 + 按 branching 打通 0 / 15 / 35% 死路，终点室在最远格，层间梯子在两层都可达的格）、galleries（主巷 + 每 8–10 m 横巷 + 采场，层间暗井在主巷端部）、halls（前厅 → 甬道 → 主厅 → 后室 + 对称耳室）、network（3–9 个洞室，最小生成树 + 0–3 条回环）、rooms、chamber、corridor。
+- **rooms**：房间 + 连线图 BFS 排到网格上（冲突换格，「左 / 右」的名字偏向左 / 右）；相邻两列（行）的中心距 = 两边最大房间半宽之和 + 一段走廊（走廊宽 + 2.5 m，夹在 4–6 m），整体缩到 size_m 以内（最小 0.4 倍）；名字像走廊的房间（甬道 / 廊）画成窄长条。给了 connect.from 时入口落在连接点上，否则最大的房间（主室）落在 under 目标正下方。
+- **外轮廓**：没有人给的轮廓时 = 房间多边形与通道缓冲带（半宽 + 0.75 m）的并集（栅格化后描外边界、按栅格精度化简），不用凸包；maze 是外接矩形，chamber 是那一间。
+- **高度**（0.5 m 取整）：地下 = 外轮廓质心处地面 − depth_layers × 层高 − 净高 − (层数 − 1) × 层距（最上层顶板在地面下 depth_layers 层），再压到每条通道 / 每个房间上方地面 − 2 m 以下；空中 = 地面 + height_layers × 层高，再抬到下方地面 + 3 m + 1 m 板厚以上。界面上的「深 N 层 / 高 N 层」按同一口径现算（views/map.js spaceDepth）。
+- **连接点**：`markers[]` 里 `{ id: conn_<空间 id>, kind: "connector", via, from: "ground" | 空间 id, to, position: [x, 下端 y, z], top_y, bottom_y, label: 下行 / 上行 + 方式 }`，落在入口正上方。
+- **确定性**：随机只来自 seed / layout_seed（「换一个」改 layout_seed）。
 
 ## 11. 剖切（section.js，D19）
 
@@ -257,10 +233,25 @@ projectToPath(path, [x,z]) → { d, off, q }    // 最近点的弧长与横向�
 - **投影**：`d0 / d1` 取四角（空间取顶点）投影的最小 / 最大弧长；折线拐弯处投影会跳段，跨度超过「形状对角线 × 1.5 + 2 m」时改用中心投影 ± 半对角线。体块 `y0 = max(position.y, 地面)`。
 - 纯函数、确定性、不调 AI；拖剖切线 / 拖宽度只需重新调 `sampleSection`。
 
-## 12. 场景适配层（medium/scene.js）的本地操作
+## 12. 界面的本地操作（medium/app.js）
 
-全部本地、即时、绝不调 AI；改的都是人的覆盖（`scene.user`）或 sid 里人的对象，重算时保留，都在 `snapshotState()` 里（可撤销）。
-- `removeVolume(id)`：程序生成的房子 / 树记位置（`user.removed = [[x, z, kind], …]`，不记 id——重排后 id 会变），每次 rebuild 后把同类生成物在 3 m（树 1.5 m）内的去掉；换原型（`setCard` 的 archetype 变了）时作废。
-- `setSpaceConnect(id, via)`：人加的空间直接改它的连接点（via 与「上行 / 下行 + 方式」文案）；AI 生成的改卡片 `levels` 对应项的 `connect` 再重算。返回 scene，不合法返回 false。
-- `lockVolume(id, false)`：拖过的房子（`user_moved`）只把 `locked` 设 false，留在原地；其余交回程序排（`generated: true`）。
-- `previewState(mutator) → Scene`：克隆一份，对副本执行 `mutator(s)`（任意本地方法），mutator 里的多次 rebuild 合并成最后一次；本体不变。给 3D 小窗做拖动中的实时预览。实测 villageSid 规模（之字坡 4 层、16 栋）单次中位约 9 ms（无头 Edge），7 层溪谷约 60 ms；`s.ms` 是这次耗时。
+全部本地、即时、绝不调 AI；状态只有 `store`（app.js 导出），每次改动走 `edit(label, fn)` / `planOps(label, ops)`，自动进撤销栈。
+- 改 plan：构成清单的旋钮、＋加一个、删除、锁 → `planOps` → `compileWith(plan, user)` 重编译。
+- 人的覆盖（`store.user`，重编译时保留）：拖过的房子（锁住的 `u_house_<n>`）、删掉的生成物（按位置记）、剖面上调过的台地高度（`terraceH`）、画的路 / 通道、圈的区域 / 空间。
+- 图上拖动：地标 / 入口 → `place.nudge_m`；地形块 → 反算 `at.dir / at.dist`；空间 → `offset_m`。plan 里依然没有 AI 写的坐标。
+
+## 13. 构成图编译（plan.js，v4，docs/05 §2–3）
+
+```js
+import { PLAN_SCHEMA, PLAN_GROUPS, DIRV, normalizePlan, compilePlan, applyOps, resolveTarget, knobsFor, summarize, newElement, planDistance, distinctPlans } from "./plan.js";
+normalizePlan(plan) → { plan, warnings }        // 按 spec/plan.schema.json 清洗：丢未知 / 坐标字段、夹数值、校枚举、补 id 与按 type 的默认值、引用降级、断环
+compilePlan(plan, { seed, ignored }) → { sid, T, checks, facts, index, plan, warnings, ms }
+applyOps(plan, ops) → { plan, warnings }         // set（字段可嵌套，value null = 删字段）/ add / remove（"rel:<i>" 删关系）
+resolveTarget(sid, T, id) → { point, polygon, top_y, base_y, kind, label, sid_ids } | null
+knobsFor(group, element, schema = PLAN_SCHEMA, plan) → 旋钮数组；summarize(group, element, plan) → 清单一行
+newElement(group, type, plan) → 「＋ 加一个」的默认项
+```
+- PLAN_SCHEMA 在模块加载时从 `spec/plan.schema.json` fetch（单一事实来源；页面必须经 http 打开）。
+- 编译顺序：场地（bounds = ±size_m/2）→ 地形块按 at 依赖顺序叠（hill / ridge = 椭圆穹顶；slope_terraces / ring_terraces / plateau / cliff / island 顶 = `override` 平顶，按顺序压上去；valley / basin / pit = 负的平底多边形）→ 池塘 → buildTerrain → 水（溪沿低处 A*，有谷且没给源头时顺第一条谷）→ 区域（on 的台地按 levels / side 取子集 → regions，带 building）→ 地标 / 入口按位置依赖顺序求解（候选点 + 打分：出场地 1000、压水 50、挤别的地标 80、压已路由的路 30、地面不平 2 + 高差、关系不成立 2（入口看不见 look_at 1）、名次 × 0.05；之后加 nudge_m）→ 朝向（place.facing / 入口）→ 空间（interior.compileSpaces：外轮廓、内部布局、高度、连接点）→ 路（第一条是 main_trail；节点：地标 = 门前，桥 = 两头（中间直线过桥），途经的门 = 门前门后，区域 / 地形 = 里面靠前一点的位置，水 / 路 = 最近点；style：winding A* 0.7、stairs A* 1.2（绕两倍多远或上不去就直上）、zigzag 之字、straight / bridge / tunnel 直线）→ 外观 → resolve → 放置检查 `place_<id>` + 关系检查 `rel_<i>`（relations.relationChecks，修法是 plan ops）→ 索引 `index[plan_id] = { group, sid_ids }`。
+- 层号压在 `site.relief_layers` 以内（总高差调小时顶上几层并成一层）；层高 = `site.layer_m`。
+- 确定性：同 plan + seed → 同 SID；seed 只影响台地多边形抖动、布房、A* 抖动与空间内部。

@@ -22,18 +22,22 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 ## 正式版：「场景对话」（medium/）
 
 ```bat
-.venv\Scripts\python -X utf8 desktop\sid_editor.py
+.venv\Scripts\python -X utf8 desktop\app.py
 ```
 或双击打包好的 `dist\SceneDialog\SceneDialog.exe`（没有就先运行 `desktop\build.bat`）。AI 可选 **DeepSeek**（`deepseek-flash`，默认关思考，出三张卡约 6 秒、约 ¥0.006 一次）或 **Claude**；没有密钥时用内置的模拟 AI 跑通全流程。点右上角「AI：…」切换服务商、填密钥。
-四步：**说**（一句话，调 AI）→ **选**（三张算过几何的方案卡，中间并排，黄标是真正的差异）→ **改**（全部本地、即时、可撤销，不花钱）→ **出**（随时可点：引擎包 zip；读回 JSON 导入后红点三选一）。
+四步：**说**（一句话，调 AI）→ **选**（三张**构成**不同的方案，中间并排）→ **改**（全部本地、即时、可撤销，不花钱）→ **出**（随时可点：引擎包 zip；读回 JSON 导入后红点三选一）。
+
+**AI 原生的构成图（v4，docs/05）**：AI 不再从菜单里挑「原型 / 地标种类 / 放置位」，而是写一张开放的**构成图**——任意数量的地形块（山、山脊、坡上台地、环台、平台、崖、谷、盆地、高台）、区域、建筑类型（吊脚木楼、院落、土楼、塔、厅、亭、门、桥、戏台……名字随便起）、地标、路、水、地下 / 空中空间和关系；尺寸用米，位置只用相对关系（在谁顶上 / 边上 / 尽头 / 下面、朝哪个方向），**仍然不写坐标**，由引擎（`medium/engine/plan.js`）编译成几何。
+
 「改」里能做的：
-- **俯视图直接拖**：地标、入口、房子、主路折点、剖切线、地下 / 空中空间、连接点；工具 移动 / 画路 / 圈区域 / 剖切 / 擦除，Ctrl+Z 撤销。
-- **剖面自选、直接调高**：沿主路或自己拉一条直线，宽度 2–60 m、±15° 转角度；在剖面上拖平台改那一层的高度、拖地标顶改地标高、拖空间改深度；3D 实时跟着变。
-- **多层空间**：天上 / 地面 / 地下 三层切换；地下溶洞 / 地道 / 地窖 / 地宫，空中平台 / 栈道 / 浮岛 / 天桥，用楼梯 / 梯子 / 井 / 竖井 / 升降台 / 索桥 / 坡道连起来。
-- **右栏参数**：原型、层数、坡度、台地宽、地标与位置（含村口）、入口、时段、溪，点了立刻重算；锁住的参数「换一批」不动。
-- 只有「发送」「三张都不要，重出」「换一批」会调 AI，按钮上标「调 AI」，每次调用在聊天里显示耗时、token、费用；你那句话里说死的条件（时段、溪、地标、层数、坡度、入口、原型、地下 / 空中）本地锁定，三张都照办。
-视图：俯视语义图、侧剖面、「第一眼」（入口 1.7 m 眼高看地标）、3D；俯视与剖面带 3D 小窗。
-细节与文件说明见 [medium/README.md](medium/README.md)；本轮改版规格见 [docs/04](docs/04-改版-直接操作与多层空间.md)，交互原则与 D1–D17 见 [docs/03](docs/03-交互设计-场景对话.md)。
+- **右栏构成清单**：AI 生成了什么就列什么，按组折叠（地形 / 区域 / 建筑 / 地标 / 路 / 水 / 空间 / 关系 / 外观）；每项有它自己的旋钮（从 `spec/plan.schema.json` 生成），可改名、加一项、删一项、锁住。
+- **空间有内部结构**：迷宫（网格 + 生成树 + 按岔路多少打通环路，入口与终点室）、矿道（主巷 + 横巷 + 采场）、厅堂、洞穴网、单室、地道，或直接给房间与连接（「前厅—甬道—主墓室，两侧耳室」）；可多层，地下层俯视图看得见整个平面，剖面和 3D 也画得出来；「换一个」本地重新生成。
+- **俯视图直接拖**：地标、出生点、房子、主路折点、地形块、空间、剖切线；工具 移动 / 画路 / 圈区域 / 剖切 / 擦除，Ctrl+Z 撤销，Esc 取消拖动。
+- **剖面自选、直接调高**：沿主路或自己拉一条直线，宽度与角度可调；在剖面上拖平台、地标顶、空间深度；3D 小窗实时跟着变。
+- 只有「发送」「三张都不要，重出」「换一批」会调 AI（按钮标「调 AI」，每次显示耗时、token、费用）；你那句话里说死的条件（时段、溪、地标名、层数、坡度、入口、地形词、迷宫 / 矿洞 / 地宫 / 栈道……）本地锁定，三张都照办，改动时也锁。
+
+视图：俯视语义图、侧剖面、「第一眼」（出生点 1.7 m 眼高）、3D；俯视与剖面带 3D 小窗。
+细节与文件说明见 [medium/README.md](medium/README.md)；v4 规格见 [docs/05](docs/05-AI原生场景构成.md)，上一轮改版见 [docs/04](docs/04-改版-直接操作与多层空间.md)，交互原则见 [docs/03](docs/03-交互设计-场景对话.md)。
 
 ## 过程产物
 
@@ -55,10 +59,9 @@ AI（Claude Code / Cursor + UE/Unity MCP）会写代码，但不会「搭地图�
 
 ```bat
 python -X utf8 tools\run_browser_test.py medium\engine\tests\sid.test.html
-python -X utf8 desktop\test_api.py
-python -X utf8 desktop\intent_rules.py
+python -X utf8 desktop\test_app.py
 ```
-引擎 12 页测试（无头 Edge 运行，不需要 Node）共 147 个用例；界面流程 `medium/tests/flow.test.html` 67 例（需先起本地服务，见文件头）；后端 101 条（模拟 AI + 假的 DeepSeek / Claude 客户端）；意图锁定 23 条；读回评分 38 条。DeepSeek 实测见 `desktop/README.md`。
+引擎 10 页测试（无头 Edge 运行，不需要 Node）共 154 个用例；界面流程 `medium/tests/flow.test.html` 82 例（需先起本地服务，见文件头；含「6 个示例 + 谷底 plan 编译后的 SID 过 jsonschema」）；后端 `desktop/test_app.py` 144 条（模拟 AI + 假的 DeepSeek / Claude 客户端 + 意图锁定）；读回评分 38 条。DeepSeek 实测见 `desktop/README.md`。
 
 ## 当前状态
 
@@ -80,12 +83,12 @@ python -X utf8 desktop\intent_rules.py
 ai-scene-bridge/
 ├── README.md
 ├── medium/                       正式版「场景对话」（ES modules，无构建）
-│   ├── index.html / app.js / scene.js / stage.js / gestures.js / params.js / sidepanels.js / history.js / views/ …
+│   ├── index.html / style.css / app.js（store + 流程）/ ui.js（构成清单）/ views/（map / profile / eye / view3d）
 │   └── engine/                   确定性几何引擎 + SPEC.md + tests/
-├── desktop/                      本地服务（api_server.py；ai_service / ai_deepseek / ai_mock / intent_rules）与 WebView2 桌面壳（sid_editor.py），build.bat 打包
+├── desktop/                      app.py（本地服务 + WebView2 窗口）、ai.py（提示词、DeepSeek / Claude / 模拟、费用、入口）、plans.py（plan schema 与工具）、rules.py（本地锁定）、test_app.py，build.bat 打包
 ├── prototype/                    交互原型（脚本 AI）
 ├── app/                          第一版 SID 编辑器（three.js）
-├── docs/                         00 愿景 · 01 调研 · 02 设计草案 · 03 交互设计
+├── docs/                         00 愿景 · 01 调研 · 02 设计草案 · 03 交互设计 · 04 改版 · 05 AI 原生构成（v4）
 ├── spec/                         sid.schema.json · PROTOCOL.md · examples/
 ├── tools/                        render_topdown.py · score_readback.py · run_browser_test.py
 └── experiments/week0-ab/         第 0 周实验包

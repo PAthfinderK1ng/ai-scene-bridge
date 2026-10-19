@@ -1,0 +1,433 @@
+<!doctype html><meta charset="utf-8"><pre id="out">running</pre>
+<script type="module">
+import { test, run, assert, close, between } from "./harness.js";
+import { villageSid } from "./fixtures.js";
+import { buildTerrain, pointInPolygon, distToPolygon, polygonCentroid, distToSegment } from "../terrain.js";
+import {
+  compileSpaces, buildInterior, refreshSpaces, spaceChecks, spaceFacts, interiorGraph, makeSpace, setSpaceFloor, levelFloor, groundRange,
+  INTERIOR_LAYOUTS, SPACE, CLEARANCE, LAYOUT_LABEL,
+} from "../interior.js";
+import { sampleSection } from "../section.js";
+
+// ------------------------------------------------------------ 场景与 resolveTarget 桩（plan.js 的替身）
+function world(seed = 7) {
+  const sid = villageSid(seed);
+  sid.meta.seed = 11;
+  const T = buildTerrain(sid);
+  const lm = sid.volumes[0];
+  lm.position[1] = T.heightAt(lm.position[0], lm.position[2]);
+  return { sid, T };
+}
+function stub(sid, T) {
+  const ts = T.terraces, top = ts[ts.length - 1], mid = ts[Math.floor(ts.length / 2)];
+  const lm = sid.volumes[0], sp = sid.markers.find((m) => m.kind === "player_spawn");
+  const fp = (v) => [[-4, -4], [4, -4], [4, 4], [-4, 4]].map(([x, z]) => [v.position[0] + x, v.position[2] + z]);
+  return (id) => {
+    if (id === "site") return { point: [0, 0], kind: "site" };
+    if (id === "spawn") return { point: [sp.position[0], sp.position[2]], kind: "spawn" };
+    if (id === "temple") return { point: [lm.position[0], lm.position[2]], polygon: fp(lm), top_y: lm.position[1] + lm.size[1], kind: "volume" };
+    if (id === "hill") return { point: top.centroid, polygon: top.polygon, kind: "terrain" };
+    if (id === "village") return { point: mid.centroid, polygon: mid.polygon, kind: "zone" };
+    if (id === "mid_south") return { point: [0, 20], kind: "terrain" };
+    return null;
+  };
+}
+const compile = (spaces, { seed = 3, w } = {}) => {
+  const W = w || world();
+  const out = compileSpaces(spaces, W.sid, W.T, stub(W.sid, W.T), { seed });
+  W.sid.spaces = out.spaces;
+  W.sid.markers.push(...out.connectors);
+  return Object.assign(out, W);
+};
+const one = (ps, opt) => { const o = compile([ps], opt); return Object.assign(o, { s: o.spaces[0], c: o.connectors[0] }); };
+const len = (pts) => { let L = 0; for (let i = 0; i + 1 < pts.length; i++) L += Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]); return L; };
+const inB = (sid, p) => p[0] >= sid.bounds.min[0] - 1e-6 && p[0] <= sid.bounds.max[0] + 1e-6 && p[1] >= sid.bounds.min[2] - 1e-6 && p[1] <= sid.bounds.max[2] + 1e-6;
+const checkOf = (cs, id) => cs.find((c) => c.id === id);
+const allReachable = (s) => { const G = interiorGraph(s); return G.entrance >= 0 && G.dist.every(Number.isFinite); };
+const MAZE = { id: "mine", stratum: "underground", label: "矿洞迷宫", under: "village", depth_layers: 3, layout: "maze", size_m: 44, branching: "high", sublevels: 2, corridor_m: 2.5, connect: { via: "shaft", from: "village" } };
+const TOMB = { id: "tomb", stratum: "underground", label: "地宫", under: "temple", depth_layers: 2, layout: "rooms",
+  rooms: [{ id: "front", label: "前厅", size: "m" }, { id: "main_hall", label: "主墓室", size: "l" }, { id: "side_l", label: "左耳室", size: "s" }, { id: "side_r", label: "右耳室", size: "s" }],
+  links: [["entry", "front"], ["front", "main_hall"], ["main_hall", "side_l"], ["main_hall", "side_r"]], connect: { via: "stairs", from: "temple" } };
+const ALL = (stratum) => INTERIOR_LAYOUTS[stratum].map((layout) => layout === "rooms" ? Object.assign({}, TOMB, { id: "sp_" + layout, stratum }) : { id: "sp_" + layout, stratum, layout, under: stratum === "sky" ? "temple" : "village", size_m: 36, sublevels: layout === "chamber" ? 1 : 2, connect: { from: "spawn" } });
+/** 独立复核净空：通道每 0.5 m 的中线与两侧边、房间多边形内地面 */
+function worstGap(s, T) {
+  let worst = Infinity;
+  const under = s.stratum !== "sky";
+  for (const p of s.passages) {
+    const hw = p.width / 2;
+    for (let i = 0; i + 1 < p.points.length; i++) {
+      const a = p.points[i], b = p.points[i + 1], n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / 0.5)), L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, nx = -(b[1] - a[1]) / L * hw, nz = (b[0] - a[0]) / L * hw;
+      for (let k = 0; k <= n; k++) for (const sg of [0, 1, -1]) {
+        const x = a[0] + (b[0] - a[0]) * k / n + nx * sg, z = a[1] + (b[1] - a[1]) * k / n + nz * sg, h = T.heightAt(x, z);
+        worst = Math.min(worst, under ? h - (p.floor_y + p.height) : p.floor_y - CLEARANCE.slab - h);
+      }
+    }
+  }
+  for (const r of s.rooms) { const g = groundRange(r.polygon, T); worst = Math.min(worst, under ? g.min - (r.floor_y + r.height) : r.floor_y - CLEARANCE.slab - g.max); }
+  return worst;
+}
+
+// ------------------------------------------------------------ 生成
+test("词表：地下 7 种布局、空中 4 种；SPACE 合集带标签与默认值", () => {
+  assert(INTERIOR_LAYOUTS.underground.length === 7 && INTERIOR_LAYOUTS.sky.length === 4, "布局数");
+  assert(INTERIOR_LAYOUTS.sky.every((l) => INTERIOR_LAYOUTS.underground.includes(l)), "空中是子集");
+  assert(SPACE.LAYOUTS === INTERIOR_LAYOUTS && SPACE.ROOM_SIZES.l === 16, "合集");
+  for (const l of INTERIOR_LAYOUTS.underground) assert(LAYOUT_LABEL[l], "标签 " + l);
+});
+
+test("地下每种布局都生成：外轮廓在 bounds 内、有通道 / 房间、入口与终点、内部全连通、连接点、三项检查通过", () => {
+  const o = compile(ALL("underground"));
+  assert(o.spaces.length === 7 && o.connectors.length === 7, "7 个空间 7 个连接点");
+  for (const s of o.spaces) {
+    assert(s.polygon.length >= 3 && s.polygon.every((p) => inB(o.sid, p)), s.layout + " 外轮廓在 bounds 内");
+    assert(s.rooms.length >= 1, s.layout + " 有房间");
+    if (s.layout !== "chamber") assert(s.passages.length >= 1, s.layout + " 有通道");
+    assert(Array.isArray(s.entrance) && Array.isArray(s.goal), s.layout + " 入口 / 终点");
+    assert(allReachable(s), s.layout + " 全连通");
+    assert(s.plan_id === "sp_" + s.layout && s.generated && s.facts && s.facts.rooms === s.rooms.length, s.layout + " 字段");
+    for (const p of s.passages) assert(p.width > 0 && p.points.length >= 2 && Number.isFinite(p.floor_y) && p.height > 0, s.layout + " 通道字段");
+  }
+  const cs = spaceChecks(o.sid, o.T);
+  for (const id of ["spaces_connected", "interior_connected", "spaces_clear_of_terrain"]) assert(checkOf(cs, id) && checkOf(cs, id).ok, id + " " + JSON.stringify(checkOf(cs, id) && checkOf(cs, id).detail));
+});
+
+test("空中：单室 / 栈道 / 平台群 / 房间图都生成，板底离地 ≥ 3 m；空中要迷宫 → 平台群并提示", () => {
+  const o = compile(ALL("sky"));
+  for (const s of o.spaces) { assert(allReachable(s), s.layout + " 连通"); assert(worstGap(s, o.T) >= 3 - 1e-6, s.layout + " 净空 " + worstGap(s, o.T)); }
+  const net = o.spaces.find((s) => s.layout === "network");
+  assert(net.passages.every((p) => p.style === "walkway" || p.style === "rope_bridge"), "平台之间是栈道 / 索桥");
+  const m = one({ id: "sk", stratum: "sky", layout: "maze", under: "hill" });
+  assert(m.s.layout === "network" && m.warnings.some((w) => w.includes("迷宫")), "降级 " + m.warnings.join(","));
+  // 压在建筑上方的空中空间挪到旁边，不压住它
+  const lm = m.sid.volumes[0], o2 = one({ id: "pf", stratum: "sky", layout: "chamber", over: "temple", size_m: 12 });
+  assert(!pointInPolygon([lm.position[0], lm.position[2]], o2.s.polygon), "空中平台不压在寺上");
+});
+
+test("确定性：同 plan + seed 两次逐字节相同；seed 不同则迷宫 / 矿道 / 洞穴网 / 单室不同", () => {
+  const sp = ALL("underground");
+  const a = JSON.stringify(compile(sp, { seed: 5 }).spaces), b = JSON.stringify(compile(sp, { seed: 5 }).spaces);
+  assert(a === b, "同种子相同");
+  const A = compile(sp, { seed: 5 }).spaces, B = compile(sp, { seed: 6 }).spaces;
+  for (const l of ["maze", "galleries", "network", "chamber"]) {
+    const x = A.find((s) => s.layout === l), y = B.find((s) => s.layout === l);
+    assert(JSON.stringify([x.passages, x.rooms]) !== JSON.stringify([y.passages, y.rooms]), l + " 换种子要变");
+  }
+  const c1 = one(Object.assign({}, MAZE, { layout_seed: 1 })).s, c2 = one(Object.assign({}, MAZE, { layout_seed: 2 })).s;
+  assert(JSON.stringify(c1.passages) !== JSON.stringify(c2.passages), "layout_seed（换一个）改变迷宫");
+});
+
+// ------------------------------------------------------------ 迷宫
+test("迷宫：死路数随 branching 单调不增（5 个种子），low 是完美迷宫（无回环），high 有回环", () => {
+  let lowSum = 0, highSum = 0;
+  for (const seed of [1, 2, 3, 4, 5]) {
+    const f = {};
+    for (const br of ["low", "medium", "high"]) f[br] = one(Object.assign({}, MAZE, { branching: br, sublevels: 1 }), { seed }).s.facts;
+    assert(f.low.dead_ends >= f.medium.dead_ends && f.medium.dead_ends >= f.high.dead_ends, `seed ${seed} 死路 ${f.low.dead_ends}/${f.medium.dead_ends}/${f.high.dead_ends}`);
+    assert(f.low.loops === 0 && f.high.loops > 0, `seed ${seed} 回环 ${f.low.loops}/${f.high.loops}`);
+    lowSum += f.low.dead_ends; highSum += f.high.dead_ends;
+  }
+  assert(lowSum > highSum, `总死路 ${lowSum} > ${highSum}`);
+  // 两层也单调
+  const two = ["low", "high"].map((br) => one(Object.assign({}, MAZE, { branching: br }), { seed: 9 }).s.facts.dead_ends);
+  assert(two[0] > two[1], "两层 " + two);
+});
+
+test("迷宫：终点室在离入口最远的格（一层与两层），longest_route_m 与之一致", () => {
+  for (const n of [1, 2]) for (const seed of [1, 4]) {
+    const s = one(Object.assign({}, MAZE, { sublevels: n }), { seed }).s, G = interiorGraph(s);
+    const dg = G.dist[G.goal], mx = Math.max(...G.nodes.map((nd, i) => (nd.kind === "room" ? -1 : G.dist[i])));
+    assert(dg >= mx - 1e-6, `n=${n} seed=${seed} 终点 ${dg} < 最远 ${mx}`);
+    assert(s.rooms.some((r) => r.role === "goal" && pointInPolygon(s.goal, r.polygon) && r.sublevel === 0), "终点室在第 0 层");
+    assert(s.rooms.some((r) => r.role === "entry" && r.sublevel === n - 1 && pointInPolygon(s.entrance, r.polygon)), "入口室在最上层");
+    between(s.facts.longest_route_m, dg - 0.6, dg + 0.6, "路线长");
+  }
+});
+
+test("迷宫两层：每层都有通道，一个层间连接落在两层的通道上，第 1 层底面 = 第 0 层 + 净高 + 2 m", () => {
+  const { s } = one(MAZE);
+  assert(s.sublevels === 2 && s.facts.cells === 2 * Math.floor(44 / 5) ** 2, "格数 " + s.facts.cells);
+  for (const k of [0, 1]) assert(s.passages.filter((p) => p.sublevel === k).length >= 5, "第 " + k + " 层通道");
+  assert(s.links.length === 1 && s.links[0].from === 0 && s.links[0].to === 1 && s.links[0].via === "ladder", "层间连接 " + JSON.stringify(s.links));
+  const at = s.links[0].at;
+  for (const k of [0, 1]) assert(s.passages.some((p) => p.sublevel === k && p.points.some((q, i) => i + 1 < p.points.length && distToSegment(at, q, p.points[i + 1]) < 0.05)), "连接点在第 " + k + " 层通道上");
+  close(levelFloor(s, 1) - levelFloor(s, 0), s.height + 2, 1e-6, "层距");
+  assert(s.passages.every((p) => Math.abs(p.floor_y - levelFloor(s, p.sublevel)) < 1e-6), "通道底面按层");
+  const three = one(Object.assign({}, MAZE, { sublevels: 3 })).s;
+  assert(three.links.length === 2 && allReachable(three), "三层 2 个连接、全连通");
+});
+
+test("迷宫：通道是合并共线段的折线（没有共线的中间点），段数远少于格边数", () => {
+  const { s } = one(Object.assign({}, MAZE, { sublevels: 1 }));
+  for (const p of s.passages) for (let i = 1; i + 1 < p.points.length; i++) {
+    const a = p.points[i - 1], b = p.points[i], c = p.points[i + 1], cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    assert(Math.abs(cr) > 1e-6, "共线点 " + JSON.stringify([a, b, c]));
+  }
+  const edges = s.facts.cells - 1 + s.facts.loops;
+  assert(s.passages.length < edges * 0.7, `折线 ${s.passages.length} vs 格边 ${edges}`);
+  close(s.facts.passage_m, edges * 5, 0.5, "通道总长 = 格边数 × 格边长");
+});
+
+test("迷宫：入口格靠近连接目标（connect.from 是建筑时落在它旁边、不在它里面）；没给目标时入口在边上", () => {
+  const o = one(Object.assign({}, MAZE, { under: "temple", connect: { via: "stairs", from: "temple" }, sublevels: 1 }));
+  const lm = o.sid.volumes[0], fp = [[-4, -4], [4, -4], [4, 4], [-4, 4]].map(([x, z]) => [lm.position[0] + x, lm.position[2] + z]);
+  assert(!pointInPolygon(o.s.entrance, fp), "入口不在寺里");
+  assert(distToPolygon(o.s.entrance, fp) <= 5 + 2.5, "入口贴着寺 " + distToPolygon(o.s.entrance, fp));
+  close(o.c.position[0], o.s.entrance[0], 1e-6, "连接点 x"); close(o.c.position[2], o.s.entrance[1], 1e-6, "连接点 z");
+  const p = one(Object.assign({}, MAZE, { connect: { via: "stairs" }, sublevels: 1 })).s;
+  assert(distToPolygon(p.entrance, p.polygon) <= 5 / 2 + 1e-6, "无目标时入口在边格 " + distToPolygon(p.entrance, p.polygon));
+});
+
+test("性能：44 m 两层迷宫编译 < 500 ms（目标 < 50 ms）", () => {
+  const W = world(), r = stub(W.sid, W.T);
+  compileSpaces([MAZE], W.sid, W.T, r, { seed: 1 });
+  const t0 = performance.now();
+  for (let i = 0; i < 5; i++) compileSpaces([Object.assign({}, MAZE, { layout_seed: i })], W.sid, W.T, r, { seed: 1 });
+  const ms = (performance.now() - t0) / 5;
+  console.log("maze44x2 ms", ms);
+  document.title = "maze44x2 " + ms.toFixed(1) + " ms";
+  assert(ms < 500, "耗时 " + ms);
+});
+
+// ------------------------------------------------------------ 矿道 / 厅堂 / 洞穴网 / 房间图
+test("矿道：多层，每层都有主巷（贯通长轴）和横巷，层间暗井在主巷端部，有采场", () => {
+  let stopes = 0;
+  for (const seed of [1, 2, 3]) {
+    const { s } = one({ id: "mn", stratum: "underground", layout: "galleries", under: "village", size_m: 40, sublevels: 3, branching: "medium" }, { seed });
+    assert(allReachable(s), "连通");
+    const mains = [];
+    for (const k of [0, 1, 2]) {
+      const ps = s.passages.filter((p) => p.sublevel === k), main = ps.slice().sort((a, b) => len(b.points) - len(a.points))[0];
+      assert(len(main.points) >= 40 * 0.7, `第 ${k} 层主巷 ${len(main.points)}`);
+      assert(ps.length >= 2, `第 ${k} 层横巷`);
+      mains[k] = main;
+    }
+    assert(s.links.length === 2 && s.links.every((l) => l.via === "winze"), "暗井");
+    for (const l of s.links) for (const k of [l.from, l.to]) {
+      const m = mains[k], ends = [m.points[0], m.points[m.points.length - 1]];
+      assert(ends.some((e) => Math.hypot(e[0] - l.at[0], e[1] - l.at[1]) < 0.05), `暗井在第 ${k} 层主巷端部`);
+    }
+    stopes += s.rooms.filter((r) => r.role === "stope").length;
+  }
+  assert(stopes >= 3, "采场 " + stopes);
+});
+
+test("矿道：横巷数随 branching 增加（3 个种子合计）", () => {
+  const cnt = (br) => [1, 2, 3].reduce((a, seed) => a + one({ id: "mn", stratum: "underground", layout: "galleries", under: "village", size_m: 44, branching: br }, { seed }).s.passages.length, 0);
+  const lo = cnt("low"), hi = cnt("high");
+  assert(hi > lo, `横巷 low ${lo} high ${hi}`);
+});
+
+test("厅堂：入口 → 前厅 → 主厅（中轴），耳室左右对称成对；对数随 branching 增加", () => {
+  const pairs = {};
+  for (const br of ["low", "medium", "high"]) {
+    const { s } = one({ id: "cr", stratum: "underground", layout: "halls", under: "temple", size_m: 34, branching: br, connect: { from: "temple" } });
+    assert(allReachable(s), br + " 连通");
+    const R = (lab) => s.rooms.find((r) => r.label === lab);
+    assert(R("入口").role === "entry" && R("前厅").role === "hall" && R("主厅").role === "hall", "角色");
+    const a = polygonCentroid(R("前厅").polygon), b = polygonCentroid(R("主厅").polygon), e = polygonCentroid(R("入口").polygon);
+    assert(distToSegment(e, [a[0] + (a[0] - b[0]) * 5, a[1] + (a[1] - b[1]) * 5], b) < 0.05, "入口在中轴上");
+    const sides = s.rooms.filter((r) => r.role === "side");
+    assert(sides.length % 2 === 0, "成对");
+    for (let i = 0; i < sides.length; i += 2) {
+      const p = polygonCentroid(sides[i].polygon), q = polygonCentroid(sides[i + 1].polygon), m = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]), dist = Math.abs((b[0] - a[0]) * (m[1] - a[1]) - (b[1] - a[1]) * (m[0] - a[0])) / L;
+      assert(dist < 0.05 && sides[i].label === "左耳室" && sides[i + 1].label === "右耳室", "对称 " + dist);
+    }
+    pairs[br] = sides.length / 2;
+  }
+  assert(pairs.low === 1 && pairs.medium === 2 && pairs.high >= 2, "对数 " + JSON.stringify(pairs));
+});
+
+test("洞穴网：洞室数按 branching（3–4 / 5–6 / 7–9），通道弯曲，low 无回环（最小生成树），房间互不重叠", () => {
+  for (const [br, lo, hi] of [["low", 3, 4], ["medium", 5, 6], ["high", 7, 9]]) {
+    const { s } = one({ id: "cv", stratum: "underground", layout: "network", under: "village", size_m: 56, branching: br }, { seed: 2 });
+    between(s.rooms.length, lo, hi, br + " 洞室数");
+    assert(allReachable(s), br + " 连通");
+    if (br === "low") assert(s.facts.loops === 0, "low 无回环");
+    assert(s.passages.some((p) => p.points.length > 2), "弯曲");
+    for (let i = 0; i < s.rooms.length; i++) for (let j = i + 1; j < s.rooms.length; j++) assert(!s.rooms[i].polygon.some((p) => pointInPolygon(p, s.rooms[j].polygon)), "洞室重叠");
+    assert(s.rooms.some((r) => r.role === "entry") && s.rooms.some((r) => r.role === "goal"), "入口洞 / 最深洞室");
+  }
+});
+
+test("房间图（地宫）：每条连线都变成连通的走廊，房间不重叠，左右耳室在主墓室两侧，保留节点 entry", () => {
+  const { s, warnings } = one(TOMB);
+  assert(!warnings.length, "无提示 " + warnings);
+  const R = new Map(s.rooms.map((r) => [r.id, r]));
+  assert(R.get("entry").role === "entry" && R.get("main_hall").label === "主墓室" && R.get("side_l").role === "named", "房间");
+  for (const [a, b] of TOMB.links) {
+    const p = s.passages.find((x) => x.between && ((x.between[0] === a && x.between[1] === b) || (x.between[0] === b && x.between[1] === a)));
+    assert(p, `连线 ${a}-${b} 有走廊`);
+    const [ea, eb] = p.between[0] === a ? [p.points[0], p.points[p.points.length - 1]] : [p.points[p.points.length - 1], p.points[0]];
+    assert(pointInPolygon(ea, R.get(a).polygon) && pointInPolygon(eb, R.get(b).polygon), `走廊 ${a}-${b} 两端在房间里`);
+  }
+  const rs = s.rooms;
+  for (let i = 0; i < rs.length; i++) for (let j = i + 1; j < rs.length; j++) assert(!rs[i].polygon.some((p) => pointInPolygon(p, rs[j].polygon) || distToPolygon(p, rs[j].polygon) < 0.5), `房间重叠 ${rs[i].id} ${rs[j].id}`);
+  const c = (id) => polygonCentroid(R.get(id).polygon), f = c("front"), m = c("main_hall"), l = c("side_l"), r = c("side_r");
+  const side = (p) => Math.sign((m[0] - f[0]) * (p[1] - f[1]) - (m[1] - f[1]) * (p[0] - f[0]));
+  assert(side(l) * side(r) < 0, "耳室在两侧");
+  assert(allReachable(s) && ["main_hall", "side_l", "side_r"].some((id) => pointInPolygon(s.goal, R.get(id).polygon)), "终点是最远的房间");
+});
+
+test("房间图：排得紧凑（外接框 ≤ size_m + 走廊余量）、外轮廓贴着房间和走廊（不是凸包）、入口在连接目标旁边、地宫在寺下", () => {
+  const polyArea = (P) => { let A = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; A += p[0] * q[1] - q[0] * p[1]; } return Math.abs(A) / 2; };
+  for (const tomb of [TOMB, Object.assign({}, TOMB, { rooms: [...TOMB.rooms.slice(0, 1), { id: "passage", label: "甬道", size: "s" }, ...TOMB.rooms.slice(1)],
+    links: [["entry", "front"], ["front", "passage"], ["passage", "main_hall"], ["main_hall", "side_l"], ["main_hall", "side_r"]] })]) {
+    const o = one(Object.assign({}, tomb, { size_m: 30 })), { s } = o;
+    const xs = s.polygon.map((p) => p[0]), zs = s.polygon.map((p) => p[1]), W = Math.max(...xs) - Math.min(...xs), D = Math.max(...zs) - Math.min(...zs);
+    assert(Math.max(W, D) <= 30 + 6, `外接框 ${W.toFixed(1)} × ${D.toFixed(1)}`);
+    const roomA = s.rooms.reduce((a, r) => a + polyArea(r.polygon), 0), corA = s.passages.reduce((a, p) => a + len(p.points) * p.width, 0);
+    assert(polyArea(s.polygon) <= 2.2 * (roomA + corA) + 40, `外轮廓 ${polyArea(s.polygon).toFixed(0)} m² vs 房间 + 走廊 ${(roomA + corA).toFixed(0)} m²`);
+    for (const r of s.rooms) for (const p of r.polygon) assert(pointInPolygon(p, s.polygon) || distToPolygon(p, s.polygon) < 0.6, `房间 ${r.id} 在外轮廓里`);
+    const lm = o.sid.volumes[0], fp = [[-4, -4], [4, -4], [4, 4], [-4, 4]].map(([x, z]) => [lm.position[0] + x, lm.position[2] + z]);
+    assert(distToPolygon(s.entrance, fp) <= 6, "入口贴着寺 " + distToPolygon(s.entrance, fp).toFixed(1));
+    assert(distToPolygon([lm.position[0], lm.position[2]], s.polygon) <= 6, "寺在地宫上方附近");
+  }
+});
+
+test("房间图：没连上的房间接到前一个、不存在的连线丢掉并提示；仍全连通", () => {
+  const { s, warnings } = one({ id: "vault", stratum: "underground", layout: "rooms", under: "village",
+    rooms: [{ id: "a", label: "甲", size: "s" }, { id: "b", label: "乙", size: "m" }, { id: "c", label: "丙", size: "l" }], links: [["entry", "a"], ["a", "zzz"]] });
+  assert(warnings.some((w) => w.includes("zzz")) && warnings.some((w) => w.includes("乙")), "提示 " + warnings.join("；"));
+  assert(s.rooms.length === 4 && allReachable(s), "连通");
+});
+
+// ------------------------------------------------------------ 高度 / 净空 / 连接点
+test("净空：每种地下布局每层每条通道、每个房间顶板都在地面下 ≥ 2 m（独立复核）；第 0 层最深", () => {
+  for (const seed of [1, 2]) {
+    const o = compile(ALL("underground").map((x) => Object.assign({}, x, { depth_layers: 1 })), { seed });
+    for (const s of o.spaces) {
+      assert(worstGap(s, o.T) >= 2 - 1e-6, `${s.layout} 岩层 ${worstGap(s, o.T)}`);
+      assert(s.passages.concat(s.rooms).every((e) => e.floor_y >= s.floor_y - 1e-6), "第 0 层最深");
+    }
+  }
+});
+
+test("整体下沉：坡上的大迷宫按最高处地面压下去，比按中心算的更深，且仍然全连通", () => {
+  const { s, T } = one(Object.assign({}, MAZE, { under: "mid_south", depth_layers: 1, size_m: 60 }));
+  const c = polygonCentroid(s.polygon), naive = T.heightAt(c[0], c[1]) - T.layer - s.height - (s.sublevels - 1) * (s.height + 2);
+  const g = groundRange(s.polygon, T);
+  assert(g.max - g.min > 3, "确实在坡上 " + (g.max - g.min));
+  assert(s.floor_y < naive - 0.4, `下沉 ${s.floor_y} < ${naive}`);
+  assert(worstGap(s, T) >= 2 - 1e-6, "岩层");
+});
+
+test("连接点：kind connector、via / from / to / plan_id；上端在地面、下端在入口层底面；位置在入口正上方", () => {
+  const o = one(MAZE), { s, c, T } = o;
+  assert(c.kind === "connector" && c.via === "shaft" && c.from === "ground" && c.to === s.id && c.plan_id === "mine" && c.id === "conn_mine", JSON.stringify(c));
+  close(c.top_y, T.heightAt(c.position[0], c.position[2]), 0.01, "上端");
+  close(c.bottom_y, levelFloor(s, 1), 1e-6, "下端 = 入口层");
+  assert(c.position[1] === c.bottom_y && c.position[0] === s.entrance[0] && c.position[2] === s.entrance[1], "位置");
+  const sky = one({ id: "pf", stratum: "sky", layout: "network", under: "village" });
+  close(sky.c.bottom_y, sky.T.heightAt(sky.c.position[0], sky.c.position[2]), 0.01, "空中下端在地面");
+  close(sky.c.top_y, sky.s.floor_y, 1e-6, "空中上端 = 第 0 层板面");
+  // 空间连到另一个空间
+  const two = compile([MAZE, { id: "deep", stratum: "underground", layout: "chamber", under: "village", connect: { via: "ladder", from: "mine" } }]);
+  const cc = two.connectors.find((m) => m.to === "deep");
+  assert(cc.from === "mine" && checkOf(spaceChecks(two.sid, two.T), "spaces_connected").ok, "空间连空间 " + JSON.stringify(cc));
+});
+
+test("spaces_clear_of_terrain：把迷宫抬到地面附近 → 报错并指出哪一层；修法下移后通过，连接点高度跟着变", () => {
+  const o = one(MAZE), { s, sid, T } = o;
+  setSpaceFloor(s, s.floor_y + 30);
+  const ck = checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain");
+  assert(!ck.ok && ck.severity === "error" && /第 \d 层/.test(ck.detail), ck.detail);
+  ck.fixes[0].patch(sid);
+  assert(checkOf(spaceChecks(sid, T), "spaces_clear_of_terrain").ok, "修好");
+  close(sid.markers.find((m) => m.id === "conn_mine").bottom_y, levelFloor(s, 1), 1e-6, "连接点跟着");
+  ck.fixes[1].patch(sid);
+  assert(sid.meta.ignored_checks.includes("spaces_clear_of_terrain"), "不重要");
+});
+
+test("interior_connected：删掉一段通道（完美迷宫）→ 不通过；修法「重新生成内部」→ 通过", () => {
+  const o = one(Object.assign({}, MAZE, { branching: "low", sublevels: 1 })), { s, sid, T } = o;
+  const G = interiorGraph(s), all = s.passages.slice();
+  const cut = all.findIndex((_, k) => !allReachable(Object.assign({}, s, { passages: all.filter((__, j) => j !== k) })));
+  assert(cut >= 0, "完美迷宫里总有一段通道是必经的");
+  s.passages.splice(cut, 1);
+  const ck = checkOf(spaceChecks(sid, T), "interior_connected");
+  assert(!ck.ok && ck.detail.includes("走不到"), ck.detail);
+  ck.fixes[0].patch(sid);
+  assert(checkOf(spaceChecks(sid, T), "interior_connected").ok && sid.spaces[0].passages.length > 0, "修好");
+  assert(G.nodes.length > 0, "图");
+});
+
+test("spaces_connected：删掉连接点 → 不通过；「补一个连接点」→ 通过", () => {
+  const o = one(TOMB), { sid, T } = o;
+  sid.markers = sid.markers.filter((m) => m.kind !== "connector");
+  const ck = checkOf(spaceChecks(sid, T), "spaces_connected");
+  assert(!ck.ok, "不通过");
+  ck.fixes[0].patch(sid);
+  assert(checkOf(spaceChecks(sid, T), "spaces_connected").ok, "补上");
+});
+
+test("refreshSpaces：地形整体抬高 6 m → generated 空间跟着重定高度仍合格，连接点上端跟到新地面；有 layout 没内部的空间补内部", () => {
+  const o = one(MAZE), { sid } = o, before = o.s.floor_y;
+  sid.terrain.base_height = 6;
+  const T2 = buildTerrain(sid);
+  refreshSpaces(sid, T2);
+  const s = sid.spaces[0], c = sid.markers.find((m) => m.id === "conn_mine");
+  close(s.floor_y, before + 6, 0.51, "跟着抬");
+  assert(worstGap(s, T2) >= 2 - 1e-6, "仍合格");
+  close(c.top_y, T2.heightAt(c.position[0], c.position[2]), 0.01, "连接点上端");
+  sid.spaces.push({ id: "bare", stratum: "underground", layout: "galleries", polygon: [[-20, -10], [20, -10], [20, 10], [-20, 10]], floor_y: 0, height: 3, size_m: [20, 40], generated: true, layout_seed: 4 });
+  refreshSpaces(sid, T2);
+  const bare = sid.spaces.find((x) => x.id === "bare");
+  assert(bare.passages.length > 2 && allReachable(bare) && worstGap(bare, T2) >= 2 - 1e-6, "补内部");
+});
+
+test("人圈的外轮廓（L 形）里铺迷宫：格子都在轮廓里、全连通、外轮廓保留", () => {
+  const W = world(), L = [[-30, -30], [10, -30], [10, -10], [-10, -10], [-10, 20], [-30, 20]];
+  const r = makeSpace({ stratum: "underground", layout: "maze", polygon: L, label: "人圈的迷宫" }, W.sid, W.T);
+  assert(r && r.space.user_set && r.space.user_polygon, "user_set");
+  assert(JSON.stringify(r.space.polygon) === JSON.stringify(L), "外轮廓保留");
+  for (const p of r.space.passages) for (const q of p.points) assert(pointInPolygon(q, L), "格在轮廓里 " + q);
+  assert(allReachable(r.space) && r.connector.to === r.space.id, "连通 + 连接点");
+});
+
+test("位置：offset_m 平移整个空间；找不到的目标放在场地中央并提示；size 越界夹回、外轮廓夹在 bounds 内", () => {
+  const a = one({ id: "c1", stratum: "underground", layout: "chamber", under: "village", size_m: 14 }).s;
+  const b = one({ id: "c1", stratum: "underground", layout: "chamber", under: "village", size_m: 14, offset_m: [10, -6] }).s;
+  const ca = polygonCentroid(a.polygon), cb = polygonCentroid(b.polygon);
+  close(cb[0] - ca[0], 10, 0.05, "dx"); close(cb[1] - ca[1], -6, 0.05, "dz");
+  const m = one({ id: "c2", stratum: "underground", layout: "maze", under: "nowhere", size_m: 999 });
+  assert(m.warnings.some((w) => w.includes("nowhere")), "提示");
+  assert(m.s.size_m[0] <= 200 && m.s.polygon.every((p) => inB(m.sid, p)), "夹回");
+  assert(allReachable(m.s), "仍连通");
+});
+
+// ------------------------------------------------------------ 剖切 / 汇总
+test("剖切：穿过层间连接的直线切到两层的通道（按 sublevel、floor_y、height），连接给竖线位置；房间带 role", () => {
+  const o = one(MAZE), { s, sid, T } = o, at = s.links[0].at;
+  const sec = { mode: "line", line: [[at[0] - 40, at[1]], [at[0] + 40, at[1]]], width_m: 4 };
+  const S = sampleSection(sid, T, sec), sp = S.spaces.find((x) => x.id === "mine");
+  assert(sp && sp.layout === "maze" && sp.sublevels === 2, "空间入带");
+  for (const k of [0, 1]) assert(sp.passages.some((p) => p.sublevel === k && p.d1 > p.d0 && Math.abs(p.floor_y - levelFloor(s, k)) < 1e-6 && p.height === s.height), "切到第 " + k + " 层通道");
+  assert(sp.passages.every((p) => p.d0 >= -3 && p.d1 <= S.length_m + 3), "d 在线内");
+  const lk = sp.links.find((l) => l.id === s.links[0].id);
+  assert(lk && Math.abs(lk.d - 40) < 0.05 && lk.y0 === levelFloor(s, 0) && lk.y1 > lk.y0, "层间竖线 " + JSON.stringify(lk));
+  const ent = sampleSection(sid, T, { mode: "line", line: [[s.entrance[0] - 30, s.entrance[1]], [s.entrance[0] + 30, s.entrance[1]]], width_m: 4 }).spaces[0];
+  assert(ent.rooms.some((r) => r.role === "entry" && r.sublevel === 1), "入口室入带");
+  const far = sampleSection(sid, T, { mode: "line", line: [[58, -58], [58, 58]], width_m: 2 });
+  assert(!far.spaces.length || far.spaces.every((x) => !x.passages.length), "角落细带切不到");
+});
+
+test("spaceFacts：总数、通道总长、每个空间的事实", () => {
+  const o = compile([MAZE, TOMB]);
+  const f = spaceFacts(o.sid);
+  assert(f.total === 2 && f.underground === 2 && f.connectors === 2 && f.items.length === 2, "数量");
+  close(f.passage_m, o.spaces[0].facts.passage_m + o.spaces[1].facts.passage_m, 0.11, "总长");
+  const mz = f.items.find((x) => x.plan_id === "mine");
+  assert(mz.layout === "maze" && mz.dead_ends >= 0 && mz.longest_route_m > 0 && mz.cells > 0 && mz.sublevels === 2, JSON.stringify(mz));
+});
+
+test("buildInterior 直接用：对已编译空间重建（同 seed）结果相同；换 layout 后重建为对应布局", () => {
+  const o = one(MAZE), { s, sid, T } = o;
+  const r = buildInterior(s, sid, T, { seed: s.layout_seed });
+  assert(JSON.stringify(r.passages) === JSON.stringify(s.passages) && JSON.stringify(r.rooms) === JSON.stringify(s.rooms), "同 seed 重建相同");
+  const g = buildInterior(Object.assign({}, s, { layout: "galleries" }), sid, T, { seed: s.layout_seed });
+  assert(g.links.every((l) => l.via === "winze") && g.passages.length > 2, "换成矿道");
+});
+
+run();
+</script>

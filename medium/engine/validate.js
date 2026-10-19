@@ -6,8 +6,8 @@ import { polygonCentroid, pointInPolygon } from "./terrain.js";
 export const ID_RE = /^[a-z][a-z0-9_]*$/;
 export const COLLS = ["volumes", "regions", "paths", "markers", "spaces", "features"];
 const DEG = Math.PI / 180;
-const FEATURE_KINDS = ["hill", "pit", "ridge", "cliff", "plateau"];
-const SPACE_KINDS = { underground: ["cave", "tunnel", "cellar", "crypt"], sky: ["platform", "walkway", "island", "bridge"] };
+const FEATURE_KINDS = ["hill", "pit", "ridge", "cliff", "plateau", "valley", "basin"];
+const SPACE_KINDS = { underground: ["cave", "tunnel", "cellar", "crypt", "mine", "maze", "chamber", "halls", "rooms"], sky: ["platform", "walkway", "island", "bridge", "chamber", "network", "rooms"] };
 const VIAS = ["stairs", "ladder", "well", "shaft", "elevator", "rope_bridge", "ramp"];
 
 /**
@@ -122,7 +122,7 @@ export function validate(sid, T) {
     if (f.kind && !FEATURE_KINDS.includes(f.kind)) push("warn", f.id, `${f.id} 的 kind「${f.kind}」不在 ${FEATURE_KINDS.join("/")}`);
     if (Array.isArray(f.polygon)) {
       if (f.polygon.length < 3) push("error", f.id, `${f.id} 的 polygon 少于 3 个点`);
-      if (f.polygon.length > 16) push("warn", f.id, `${f.id} 的 polygon 有 ${f.polygon.length} 个点（建议 ≤ 16）`);
+      if (f.polygon.length > 32) push("warn", f.id, `${f.id} 的 polygon 有 ${f.polygon.length} 个点（建议 ≤ 32）`);
       for (const [x, z] of f.polygon) if (!inside(x, z)) { push("warn", f.id, `${f.id} 的 polygon 超出 bounds`); break; }
     } else {
       if (!isVec3(f.center)) push("error", f.id, `${f.id} 没有 polygon，必须给 center [x, y, z]`);
@@ -139,7 +139,7 @@ export function validate(sid, T) {
     if (v.size.some((s) => !(s > 0))) push("error", v.id, `${v.id} 的尺寸必须大于 0`);
     if (v.kind === "building" && v.size[1] < 2.5) push("warn", v.id, `${v.id} 是建筑但高度只有 ${v.size[1]} m（玩家 1.8 m）`);
     if (v.color_role && !palette.some((p) => p.role === v.color_role)) push("warn", v.id, `${v.id} 的 color_role「${v.color_role}」不在调色板里`);
-    if (T && v.kind === "building") {
+    if (T && v.kind === "building" && v.form !== "stilt_house" && v.form !== "bridge" && !v.rests_on) { // 吊脚楼底面取上坡角、桥跨谷：不按贴地 / 跨台地查
       const ground = T.heightAt(v.position[0], v.position[2]);
       if (Math.abs(v.position[1] - ground) > 1.5) push("warn", v.id, `${v.id} 未贴地：position.y=${v.position[1]}，地面 ${Math.round(ground * 10) / 10} m`);
       const levels = new Set(boxCorners(v.position, v.size, v.rotation_y || 0).map(([x, z]) => T.levelAt(x, z)));
@@ -186,6 +186,7 @@ export function validate(sid, T) {
     const A = vols[i], B = vols[j];
     const ay = [A.v.position[1], A.v.position[1] + A.v.size[1]], by = [B.v.position[1], B.v.position[1] + B.v.size[1]];
     if (ay[1] <= by[0] + 1e-6 || by[1] <= ay[0] + 1e-6) continue;
+    if (A.v.kind === "prop" && B.v.kind === "prop" && A.v.generated && B.v.generated) continue; // 林子里树冠挨着树冠是常态
     if (obbOverlap(A.poly, B.poly)) push("warn", A.v.id, `${A.v.id} 与 ${B.v.id} 重叠`);
   }
   // 标记在体块里

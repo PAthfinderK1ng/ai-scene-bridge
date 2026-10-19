@@ -2,11 +2,21 @@
 <script type="module">
 import { test, run, assert, close, between } from "./harness.js";
 import { buildTerrain } from "../terrain.js";
-import { newDoc, applyCard, resolve, setTerraceHeight } from "../sid.js";
+import { newDoc, resolve, setTerraceHeight } from "../sid.js";
+import { compileSpaces } from "../interior.js";
+import { villageSid, valleySid } from "./fixtures.js";
 import { defaultSection, sectionPath, sampleSection, rotateSection, widthClamp, projectToPath } from "../section.js";
 
-const card = (extra = {}) => Object.assign({ archetype: "slope_zigzag", params: { entry_side: "S", terraces: 4, layer_height_m: 3, plateau_width: "medium" }, landmark: { kind: "temple", placement: "top" }, spawn: { placement: "valley_bottom" } }, extra);
-const build = (extra) => resolve(applyCard(newDoc(), card(extra)), { seed: 1 });
+/** 之字坡 4 层（或溪谷 3 层）→ resolve（旧模式自动算主路）；给了 spaces 就用 interior.js 编译后再 resolve */
+const build = ({ valley = false, spaces = null } = {}) => {
+  const sid = valley ? valleySid(3) : villageSid(1);
+  delete sid._archetype;
+  const r = resolve(sid, { seed: 1 });
+  if (!spaces) return r;
+  const out = compileSpaces(spaces, r.sid, r.T, null, { seed: 1 });
+  r.sid.spaces = out.spaces; r.sid.markers.push(...out.connectors);
+  return resolve(r.sid, { seed: 1 });
+};
 const len = (l) => Math.hypot(l[1][0] - l[0][0], l[1][1] - l[0][1]);
 const NS = { mode: "line", line: [[0, 56], [0, -56]], width_m: 12 };
 
@@ -88,18 +98,18 @@ test("rotateSection：旋转 90° 后长度不变、南北线变东西线（俯�
 });
 
 test("空间与连接点入带：沿主路剖切能看到地标下的溶洞与它的楼梯；远处的平台宽带才看得到", () => {
-  const { sid, T } = build({ levels: [{ stratum: "underground", kind: "cave", anchor: "landmark", size: "medium" }, { stratum: "sky", kind: "platform", anchor: "village", size: "small" }] });
+  const { sid, T } = build({ spaces: [{ id: "cave", stratum: "underground", layout: "chamber", under: "landmark", size_m: 18, height_m: 6, connect: { via: "stairs", from: "landmark" } }, { id: "deck", stratum: "sky", layout: "chamber", under: "r_terrace_1", size_m: 10 }] });
   const S = sampleSection(sid, T, defaultSection(sid, T));
   const cave = S.spaces.find((s) => s.stratum === "underground");
   assert(cave && cave.d1 > cave.d0 && cave.floor_y < 0 + 20 && cave.height === 6, "溶洞入带 " + JSON.stringify(cave));
-  assert(S.connectors.some((c) => c.id === "conn_space_cave_1" && c.top_y > c.bottom_y && c.d >= 0 && c.d <= S.length_m + 0.01), "楼梯入带");
+  assert(S.connectors.some((c) => c.id === "conn_cave" && c.top_y > c.bottom_y && c.d >= 0 && c.d <= S.length_m + 0.01), "楼梯入带");
   const line = { mode: "line", line: [[-58, -50], [-50, -58]], width_m: 2 };
   const far = sampleSection(sid, T, line);
   assert(far.spaces.length === 0 && far.connectors.length === 0, "角落的细带看不到空间");
 });
 
 test("paths：直线横穿主路 / 溪时给出交点 d；trail 模式不把主路自己算进去；widthClamp", () => {
-  const { sid, T } = build({ archetype: "valley_two_banks", params: { entry_side: "S", terraces: 3, layer_height_m: 3 } });
+  const { sid, T } = build({ valley: true });
   const EW = { mode: "line", line: [[-58, 0], [58, 0]], width_m: 12 };
   const S = sampleSection(sid, T, EW);
   const st = S.paths.find((p) => p.id === "stream");

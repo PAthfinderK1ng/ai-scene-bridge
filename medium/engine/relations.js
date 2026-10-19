@@ -59,12 +59,14 @@ function samplePolyline(pts, step = 1) {
  */
 export function findActors(sid) {
   const vols = (sid.volumes || []).filter((v) => v && v.position && v.size);
-  const landmark = vols.find((v) => v.importance === "landmark") || vols.find((v) => v.id === "landmark") || null;
+  // 多个地标（plan）时，主地标 = meta.focus（出生点第一眼看的那个），否则第一个
+  const focus = sid.meta && sid.meta.focus;
+  const landmark = (focus && vols.find((v) => v.id === focus && v.importance === "landmark")) || vols.find((v) => v.importance === "landmark") || vols.find((v) => v.id === "landmark") || null;
   const spawn = (sid.markers || []).find((m) => m.kind === "player_spawn") || null;
   const paths = (sid.paths || []).filter((p) => p && Array.isArray(p.points) && p.points.length >= 2);
   const walkPaths = paths.filter((p) => WALK_KINDS.has(p.kind));
   const trail = paths.find((p) => p.id === "main_trail") || walkPaths[0] || null;
-  const houses = vols.filter((v) => v.kind === "building" && v !== landmark);
+  const houses = vols.filter((v) => v.kind === "building" && v !== landmark && v.importance !== "landmark");
   return { landmark, spawn, trail, houses, walkPaths };
 }
 
@@ -203,6 +205,7 @@ export function analyze(sid, T) {
   T = T || buildTerrain(sid, { res: 2 });
   const { landmark, spawn, trail, houses, walkPaths } = findActors(sid);
   const vols = (sid.volumes || []).filter((v) => v && v.position && v.size);
+  const planMode = !!(sid.meta && sid.meta.plan_mode);
   const lmName = landmark ? landmark.label || landmark.id : "地标";
   const lmXZ = landmark ? xz(landmark.position) : null, spXZ = spawn ? xz(spawn.position) : null;
   const relations = [];
@@ -236,38 +239,48 @@ export function analyze(sid, T) {
 
   // 一次 BFS，多个目标复用；地标底面视为可走（走到门前就算到）
   const origin = spXZ || (trail ? trail.points[0] : null);
-  const R = origin ? reachSet(T, sid.paths || [], origin, { walkPolys: landmarkWalk(landmark) }) : null;
+  // plan 里有多个地标（寨门在崖边、风雨桥跨溪）：每个地标底面都算可走
+  const walkPolys = planMode ? vols.filter((v) => v.importance === "landmark").flatMap(landmarkWalk) : landmarkWalk(landmark);
+  const R = origin ? reachSet(T, sid.paths || [], origin, { walkPolys }) : null;
   const ignored = new Set((sid.meta && sid.meta.ignored_checks) || []);
   const ignoreFix = (id) => ({ label: "不重要", patch(s) { s.meta = s.meta || {}; const arr = (s.meta.ignored_checks = s.meta.ignored_checks || []); if (!arr.includes(id)) arr.push(id); } });
   const mk = (id, text, ok, detail, severity, fixes) => Object.assign({ id, text, ok, detail, severity, fixes }, ignored.has(id) ? { ignored: true, detail: "已标记不重要 · " + detail } : {});
   const checks = [];
 
   // 1. spawn_sees_landmark
-  if (!landmark || !spawn) checks.push(mk("spawn_sees_landmark", `入口 能看见 ${lmName}`, false, !landmark ? "缺少地标（importance: landmark）" : "缺少出生点（player_spawn）", "warn", []));
+  if (!landmark || !spawn) checks.push(mk("spawn_sees_landmark", `出生点 能看见 ${lmName}`, false, !landmark ? "缺少地标（importance: landmark）" : "缺少出生点（player_spawn）", "warn", []));
   else {
     const detail = los.visible ? "视线通畅" : los.blockedBy === "terrain" ? `被地形挡住（约 ${los.at} 处）` : `被 ${los.blockedBy.slice(7)} 挡住（约 ${los.at} 处）`;
-    checks.push(mk("spawn_sees_landmark", `入口 能看见 ${lmName}`, los.visible, detail, "warn", [
+    checks.push(mk("spawn_sees_landmark", `出生点 能看见 ${lmName}`, los.visible, detail, "warn", [
       { label: "地标再高一层", patch(s) { const f = findObject(s, landmark.id); if (f) f.obj.size[1] = r2(f.obj.size[1] + T.layer); } },
-      { label: "入口挪到路口", patch(s) { moveSpawnToVisiblePoint(s, T, landmark.id, spawn.id, trail ? trail.id : null); } },
+      { label: "出生点挪到路口", patch(s) { moveSpawnToVisiblePoint(s, T, landmark.id, spawn.id, trail ? trail.id : null); } },
       ignoreFix("spawn_sees_landmark"),
     ]));
   }
-  // 2. trail_reaches_landmark
-  if (!landmark || !trail) checks.push(mk("trail_reaches_landmark", `主路 能到达 ${lmName}`, false, !landmark ? "缺少地标" : "缺少主路（main_trail）", "error", []));
+  // 2. trail_reaches_landmark（plan：主路到它自己的终点 meta.trail_target；终点不是地标时只看终点可达）
+  const goalId = planMode && sid.meta.trail_target;
+  const goal = goalId ? vols.find((v) => v.id === goalId) || null : landmark;
+  if (planMode && trail && !goal) {
+    const last = trail.points[trail.points.length - 1], ok = R ? R.at(last[0], last[1]) : false;
+    checks.push(mk("trail_reaches_landmark", `主路 能走到头`, ok, ok ? "主路终点可达" : "主路终点从出生点走不到", "error", [ignoreFix("trail_reaches_landmark")]));
+  } else if (!goal || !trail) checks.push(mk("trail_reaches_landmark", `主路 能到达 ${lmName}`, false, !goal ? "缺少地标" : "缺少主路（main_trail）", "error", []));
   else {
+    const landmark = goal, lmXZ = xz(goal.position), lmName = goal.label || goal.id;
     // 可达目标 = 地标中心格或主路终点格（门前点）：地标贴台地边缘时中心格可能落在坡裙另一侧，不该算走不到
-    const last = trail.points[trail.points.length - 1], dEnd = dist2(last, lmXZ);
+    // 距离按地标底面算（桥 / 长廊这种长条，路接在桥头而不是桥中间）
+    const foot = boxCorners(goal.position, goal.size, goal.rotation_y || 0).map((p) => [p[0], p[1]]);
+    const last = trail.points[trail.points.length - 1], dEnd = pointInPolygon(last, foot) ? 0 : distToPolygon(last, foot);
     const reach = R ? R.at(lmXZ[0], lmXZ[1]) || R.at(last[0], last[1]) : false;
     const ok = dEnd < 6 && reach;
-    const detail = ok ? `主路终点距地标 ${r2(dEnd)} m，可达` : dEnd >= 6 ? `主路终点距地标 ${r2(dEnd)} m（需 < 6 m）` : "主路终点在地标旁，但从出生点走不到（坡太陡且无路）";
+    const detail = ok ? `主路终点离地标底面 ${r2(dEnd)} m，可达` : dEnd >= 6 ? `主路终点离地标底面 ${r2(dEnd)} m（需 < 6 m）` : "主路终点在地标旁，但从出生点走不到（坡太陡且无路）";
     checks.push(mk("trail_reaches_landmark", `主路 能到达 ${lmName}`, ok, detail, "error", [
       { label: "把路接到地标", patch(s) { const p = findObject(s, trail.id), l = findObject(s, landmark.id); if (p && l) p.obj.points[p.obj.points.length - 1] = [r2(l.obj.position[0]), r2(l.obj.position[2])]; } },
       ignoreFix("trail_reaches_landmark"),
     ]));
   }
-  // 3. landmark_on_top
+  // 3. landmark_on_top（plan 里地标放在哪由 place 说了算，换成 plan.js 的「放置」检查）
   const top = T.topTerrace();
-  if (!landmark || !top) checks.push(mk("landmark_on_top", `${lmName} 在 顶层台地`, false, !landmark ? "缺少地标" : "没有台地", "warn", []));
+  if (planMode) { /* 跳过 */ } else if (!landmark || !top) checks.push(mk("landmark_on_top", `${lmName} 在 顶层台地`, false, !landmark ? "缺少地标" : "没有台地", "warn", []));
   else {
     const t = T.terraceAt(lmXZ[0], lmXZ[1]);
     const onTop = !!t && Math.abs(t.height - top.height) < 1e-6;
@@ -293,6 +306,7 @@ export function analyze(sid, T) {
   for (let i = 0; i < bld.length; i++) for (let j = i + 1; j < bld.length; j++) {
     const A = bld[i], B = bld[j];
     if (A.y1 <= B.y0 + 1e-6 || B.y1 <= A.y0 + 1e-6) continue;
+    if (A.v.rests_on === B.v.id || B.v.rests_on === A.v.id) continue; // 立在它身上（桥心楼阁在风雨桥上）不算重叠
     if (obbOverlap(A.poly, B.poly)) overlaps.push([A.v.id, B.v.id]);
   }
   // 修法：生成的房子换种子重排；两栋都是人放的（拖过 / 锁住）时把人后放的那栋挪到最近的空位
@@ -327,7 +341,7 @@ export function analyze(sid, T) {
     pressed.length ? [houseFix(pMove, pGen, "houses_clear_of_paths", T)] : []));
   // 6. houses_on_terraces（每栋非地标建筑——含人拖过的——四角落在同一层台地上；台地外同高的平地也算）
   const offT = [];
-  if (T.terraces.length) for (const h of houses) { const why = offTerrace(T, footprint(h)); if (why) offT.push({ id: h.id, why }); }
+  if (T.terraces.length) for (const h of houses) { if (h.form === "stilt_house") continue; const why = offTerrace(T, footprint(h)); if (why) offT.push({ id: h.id, why }); } // 吊脚楼本来就跨坡
   checks.push(mk("houses_on_terraces", "房子 都在台地上", offT.length === 0, offT.length ? offT.map((f) => `${f.id} ${f.why}`).join("、") : T.terraces.length ? `${houses.length} 栋都在台地上` : "没有台地", "warn",
     offT.length ? [{ label: "挪回最近的台地", patch(s) { for (const f of offT) moveHouseToSpot(s, T, f.id); } }, ignoreFix("houses_on_terraces")] : []));
   // 7. terraces_reachable（每个台地 10 m 内有路点，且从出生点可达；支路也算，这样「补一段支路」才能修好它）
@@ -341,7 +355,7 @@ export function analyze(sid, T) {
 }
 
 // ------------------------------------------------------------ fixes 用的 patch 辅助
-/** 「入口挪到路口」：沿主路从起点走，挪到第一个看得见地标顶的路点；没有就挪到主路起点 */
+/** 「出生点挪到路口」：沿主路从起点走，挪到第一个看得见地标顶的路点；没有就挪到主路起点 */
 function moveSpawnToVisiblePoint(s, T, landmarkId, spawnId, trailId) {
   const l = findObject(s, landmarkId), m = findObject(s, spawnId), p = trailId ? findObject(s, trailId) : null;
   if (!l || !m || !p) return;
@@ -445,4 +459,148 @@ function houseFix(moveIds, genIds, checkId, T) {
     label: moveIds.length ? "挪开一点" : "重排房子",
     patch(s) { for (const id of moveIds) moveHouseToSpot(s, T, id); if (genIds.length) requestRelayout(s, checkId, genIds); },
   };
+}
+
+// ------------------------------------------------------------ plan 的关系（docs/05 §3 第 10 步）
+/** plan 关系的中文说法 */
+export const REL_TEXT = Object.freeze({
+  visible_from: (a, b) => `${a} 从 ${b} 看得见`, faces: (a, b) => `${a} 朝着 ${b}`, adjacent: (a, b) => `${a} 挨着 ${b}`,
+  behind: (a, b) => `${a} 在 ${b} 后面`, above: (a, b) => `${a} 在 ${b} 上方`, below: (a, b) => `${a} 在 ${b} 下方`,
+  between: (a, b, c) => `${a} 在 ${b} 和 ${c} 之间`, far_from: (a, b) => `${a} 远离 ${b}`,
+});
+
+/**
+ * 编译后的 SID 里 plan 元素的几何（按 plan_id 找）：点、底 / 顶高度、朝向、底面、名字。找不到返回 null。
+ * spawn → 出生点；地标 → 体块；区域 → 它的 regions；地形 → features；空间 → spaces；水 / 路 → paths。
+ * @param {object} sid
+ * @param {object} T
+ * @param {string} id plan 元素 id（或 "spawn"）
+ * @returns {{point: number[], base: number, top: number, rotation: number|null, rect: number[][]|null, polygon: number[][]|null, label: string, sid_ids: string[]}|null}
+ */
+export function planGeo(sid, T, id) {
+  const by = (arr) => (arr || []).filter((o) => o && o.plan_id === id);
+  if (id === "spawn") {
+    const m = (sid.markers || []).find((k) => k.kind === "player_spawn");
+    return m ? { point: xz(m.position), base: m.position[1], top: m.position[1] + 1.7, rotation: m.rotation_y ?? null, rect: null, polygon: null, label: m.label || "出生点", sid_ids: [m.id] } : null;
+  }
+  const v = (sid.volumes || []).find((o) => o && o.importance === "landmark" && (o.plan_id === id || o.id === id));
+  if (v) return { point: xz(v.position), base: volumeBase(T, v), top: volumeTop(T, v), rotation: v.rotation_y || 0, rect: footprint(v), polygon: footprint(v), label: v.label || id, sid_ids: [v.id], rests_on: v.rests_on || null };
+  const sp = by(sid.spaces);
+  if (sp.length) { const s = sp[0], n = s.sublevels || 1; return { point: polygonCentroid(s.polygon), base: s.floor_y, top: s.floor_y + s.height * n + 2 * (n - 1), rotation: null, rect: null, polygon: s.polygon, label: s.label || id, sid_ids: sp.map((o) => o.id) }; }
+  const regs = by(sid.regions), feats = by(sid.terrain && sid.terrain.features);
+  // 穹顶（山 / 山脊）没有多边形：按 rx / rz / angle 补一个椭圆外轮廓
+  const ellipse = (f) => { const c = Math.cos(f.angle || 0), s = Math.sin(f.angle || 0), out = []; for (let k = 0; k < 16; k++) { const t = (2 * Math.PI * k) / 16, u = f.rx * Math.cos(t), v = f.rz * Math.sin(t); out.push([f.center[0] + u * c - v * s, f.center[2] + u * s + v * c]); } return out; };
+  const polys = [...regs.map((r) => r.polygon), ...feats.filter((f) => Array.isArray(f.polygon)).map((f) => f.polygon), ...feats.filter((f) => !f.polygon && f.rx > 0 && f.rz > 0).map(ellipse)];
+  if (polys.length || feats.length) {
+    // 面积加权质心；落不进任何多边形时取最大块里离边最远的格点
+    let A = 0, cx = 0, cz = 0;
+    for (const p of polys) { const a = Math.abs(polyArea(p)), c = polygonCentroid(p); A += a; cx += c[0] * a; cz += c[1] * a; }
+    let point = A > 0 ? [cx / A, cz / A] : [feats[0].center[0], feats[0].center[2]];
+    if (polys.length && !polys.some((p) => pointInPolygon(point, p))) point = deepPoint(polys.reduce((m, p) => (Math.abs(polyArea(p)) > Math.abs(polyArea(m)) ? p : m)));
+    const hs = feats.map((f) => f.height).filter(Number.isFinite), g = T.heightAt(point[0], point[1]);
+    return { point, base: regs.length ? g : Math.min(g, ...hs), top: Math.max(g, ...hs), rotation: null, rect: null, polygon: polys[0] || null, label: (regs[0] || feats[0]).label || id, sid_ids: [...regs, ...feats].map((o) => o.id) };
+  }
+  const pa = by(sid.paths);
+  if (pa.length) { const pts = pa[0].points, m = pts[Math.floor(pts.length / 2)], h = T.heightAt(m[0], m[1]); return { point: m, base: h, top: h, rotation: null, rect: null, polygon: null, line: pts, label: pa[0].label || id, sid_ids: pa.map((o) => o.id) }; }
+  return null;
+}
+function polyArea(p) { let a = 0; for (let i = 0, j = p.length - 1; i < p.length; j = i++) a += p[j][0] * p[i][1] - p[i][0] * p[j][1]; return a / 2; }
+function deepPoint(poly) {
+  let xmin = Infinity, zmin = Infinity, xmax = -Infinity, zmax = -Infinity;
+  for (const [x, z] of poly) { xmin = Math.min(xmin, x); xmax = Math.max(xmax, x); zmin = Math.min(zmin, z); zmax = Math.max(zmax, z); }
+  let best = poly[0], bd = -1;
+  for (let z = zmin + 1; z < zmax; z += 2) for (let x = xmin + 1; x < xmax; x += 2) if (pointInPolygon([x, z], poly)) { const d = distToPolygon([x, z], poly); if (d > bd) { bd = d; best = [x, z]; } }
+  return best;
+}
+
+/**
+ * plan.relations → 检查（成立 / 不成立 + 修法）。修法是 plan 的 ops（applyOps 直接用）：只对能自动修的给
+ * （a 是地标或入口时改它的 place / 尺寸 / 朝向；a 是空间时改 stratum + under / over）；最后总有一个「不重要」（ignore: 检查 id）。
+ * 每条：{ id: "rel_<序号>", text, ok, detail, severity: "warn", relation: 序号, plan: true, fixes: [{ label, ops } | { label, ignore }] }。
+ * @param {object} sid 编译后的 SID
+ * @param {object} T
+ * @param {object} plan 规范化后的 plan
+ * @returns {object[]}
+ */
+export function relationChecks(sid, T, plan) {
+  const out = [], S = (plan.site && plan.site.size_m) || 140, layer = T.layer;
+  const ignored = new Set((sid.meta && sid.meta.ignored_checks) || []);
+  const lm = new Map((plan.landmarks || []).map((l) => [l.id, l]));
+  const spaces = new Map((plan.spaces || []).map((s) => [s.id, s]));
+  const spawn = planGeo(sid, T, "spawn");
+  const vols = (sid.volumes || []).filter((v) => v && v.position && v.size);
+  const placeOp = (id, place) => { const old = id === "spawn" ? (plan.spawn || {}).place : (lm.get(id) || {}).place; const v = Object.assign({}, old || {}, place); delete v.nudge_m; return { op: "set", id, field: "place", value: v }; };
+  const movable = (id) => lm.has(id) || id === "spawn";
+  (plan.relations || []).forEach((r, i) => {
+    const A = planGeo(sid, T, r.a), B = planGeo(sid, T, r.b), C = r.c ? planGeo(sid, T, r.c) : null;
+    const la = A ? A.label : r.a, lb = B ? B.label : r.b, lc = C ? C.label : r.c || "";
+    const text = (REL_TEXT[r.type] || ((a, b) => `${a} ${r.type} ${b}`))(la, lb, lc);
+    let ok = false, detail = "";
+    const fixes = [];
+    if (!A || !B || (r.type === "between" && !C)) detail = "有一端还没生成出来";
+    else {
+      const d = dist2(A.point, B.point);
+      switch (r.type) {
+        case "visible_from": {
+          const g = T.heightAt(A.point[0], A.point[1]);
+          const los = lineOfSight(T, vols, B.point, A.point, { eye: 1.7, targetHeight: Math.max(1.7, A.top - g), ignore: A.sid_ids.concat(B.sid_ids) });
+          ok = los.visible; detail = ok ? "视线通畅" : los.blockedBy === "terrain" ? `被地形挡住（约 ${los.at} 处）` : `被 ${los.blockedBy.slice(7)} 挡住`;
+          if (!ok && lm.has(r.a)) { const s = lm.get(r.a).size_m; if (Array.isArray(s)) fixes.push({ label: "再高一层", ops: [{ op: "set", id: r.a, field: "size_m", value: [s[0], r2(s[1] + layer), s[2]] }] }); }
+          break;
+        }
+        case "faces": {
+          if (A.rotation == null) { ok = true; detail = "没有朝向，不用管"; break; }
+          const t = (A.rotation * Math.PI) / 180, f = [-Math.sin(t), -Math.cos(t)], u = [B.point[0] - A.point[0], B.point[1] - A.point[1]], L = Math.hypot(u[0], u[1]) || 1;
+          const ang = Math.round((Math.acos(Math.max(-1, Math.min(1, (f[0] * u[0] + f[1] * u[1]) / L))) * 180) / Math.PI);
+          ok = ang <= 45; detail = `朝向偏 ${ang}°`;
+          if (!ok && lm.has(r.a)) fixes.push({ label: `转向 ${lb}`, ops: [{ op: "set", id: r.a, field: "place.facing", value: r.b }] });
+          break;
+        }
+        case "adjacent": {
+          const gap = A.rect && B.rect ? rectToRectDist(A.rect, B.rect) : B.polygon && !pointInPolygon(A.point, B.polygon) ? distToPolygon(A.point, B.polygon) : A.polygon && !pointInPolygon(B.point, A.polygon) ? distToPolygon(B.point, A.polygon) : B.polygon || A.polygon ? 0 : d;
+          ok = gap <= 10; detail = `相距 ${r2(gap)} m（需 ≤ 10 m）`;
+          if (!ok && movable(r.a)) fixes.push({ label: `挪到 ${lb} 旁边`, ops: [placeOp(r.a, { rel: "beside", target: r.b })] });
+          break;
+        }
+        case "behind": {
+          if (!spawn) { detail = "没有出生点"; break; }
+          const u = [B.point[0] - spawn.point[0], B.point[1] - spawn.point[1]], v = [A.point[0] - B.point[0], A.point[1] - B.point[1]], lu = Math.hypot(u[0], u[1]) || 1, lv = Math.hypot(v[0], v[1]) || 1;
+          ok = (u[0] * v[0] + u[1] * v[1]) / (lu * lv) >= 0.5 && dist2(A.point, spawn.point) > dist2(B.point, spawn.point);
+          detail = ok ? `从出生点看在 ${lb} 后面` : "从出生点看不在它后面";
+          if (!ok && movable(r.a)) fixes.push({ label: `挪到 ${lb} 后面`, ops: [placeOp(r.a, { rel: "behind", target: r.b })] });
+          break;
+        }
+        case "above": case "below": {
+          const up = r.type === "above";
+          const rest = up && A.rests_on && B.sid_ids.includes(A.rests_on);
+          ok = rest || (up ? A.base >= B.top - 0.5 : A.top <= B.base + 0.5);
+          detail = rest ? `${la} 立在 ${lb} 上（${r2(A.base)} m）` : `${la} ${r2(up ? A.base : A.top)} m，${lb} ${r2(up ? B.top : B.base)} m`;
+          if (!ok && up && lm.has(r.a)) fixes.push({ label: `放到 ${lb} 顶上`, ops: [placeOp(r.a, { rel: "top_of", target: r.b })] });
+          if (!ok && spaces.has(r.a)) fixes.push({ label: up ? `挪到 ${lb} 上空` : `挪到 ${lb} 下面`, ops: up ? [{ op: "set", id: r.a, field: "stratum", value: "sky" }, { op: "set", id: r.a, field: "over", value: r.b }] : [{ op: "set", id: r.a, field: "stratum", value: "underground" }, { op: "set", id: r.a, field: "under", value: r.b }] });
+          break;
+        }
+        case "between": {
+          const u = [C.point[0] - B.point[0], C.point[1] - B.point[1]], L2 = u[0] * u[0] + u[1] * u[1] || 1;
+          const t = ((A.point[0] - B.point[0]) * u[0] + (A.point[1] - B.point[1]) * u[1]) / L2, lat = Math.abs((A.point[0] - B.point[0]) * u[1] - (A.point[1] - B.point[1]) * u[0]) / Math.sqrt(L2);
+          ok = t >= 0.1 && t <= 0.9 && lat <= Math.max(10, 0.3 * Math.sqrt(L2)); detail = `沿连线 ${Math.round(t * 100)}%，偏开 ${r2(lat)} m`;
+          if (!ok && movable(r.a)) fixes.push({ label: `挪到 ${lb} 和 ${lc} 之间`, ops: [placeOp(r.a, { rel: "between", target: [r.b, r.c] })] });
+          break;
+        }
+        case "far_from": {
+          ok = d >= 0.35 * S; detail = `相距 ${r2(d)} m（需 ≥ ${r2(0.35 * S)} m）`;
+          if (!ok && movable(r.a)) {
+            const ang = (Math.atan2(-B.point[0], B.point[1]) * 180) / Math.PI; // 从 B 指向场地中心再往外：0 = 北
+            const side = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][((Math.round(ang / 45) % 8) + 8) % 8];
+            fixes.push({ label: "挪到场地另一边", ops: [placeOp(r.a, { rel: "edge_of", target: "site", side })] });
+          }
+          break;
+        }
+        default: detail = `不认识的关系 ${r.type}`;
+      }
+    }
+    const id = `rel_${i}`;
+    fixes.push({ label: "不重要", ignore: id });
+    out.push(Object.assign({ id, text, ok, detail, severity: "warn", relation: i, plan: true, fixes }, ignored.has(id) ? { ignored: true, detail: "已标记不重要 · " + detail } : {}));
+  });
+  return out;
 }

@@ -1,0 +1,43 @@
+{
+  "name": "山脊院落镇",
+  "one_liner": "沿之字路上南坡，院落一进进排在台地上，东台有座土楼，山脊亭子边有栈道悬在半空。",
+  "site": { "size_m": 160, "relief_layers": 5, "layer_m": 3.5 },
+  "terrain": [
+    { "id": "ridge", "type": "ridge", "label": "山脊", "at": { "of": "site", "dir": "N", "dist": 0.45 }, "size_m": [150, 50], "orient": "E", "top_layer": 5 },
+    { "id": "south_steps", "type": "slope_terraces", "label": "南坡台地", "at": { "of": "site", "dir": "C", "dist": 0 }, "size_m": [84, 110], "orient": "N", "steps": 4, "from_layer": 1 },
+    { "id": "east_terrace", "type": "plateau", "label": "东台", "at": { "of": "site", "dir": "SE", "dist": 0.62 }, "size_m": [30, 28], "layer": 1 }
+  ],
+  "buildings": [
+    { "id": "court", "label": "四合院", "form": "courtyard", "size_m": [14, 5, 12], "floors": 1, "roof": "gable" },
+    { "id": "tulou", "label": "土楼", "form": "round_house", "size_m": [20, 9, 20], "floors": 3, "roof": "round" }
+  ],
+  "zones": [
+    { "id": "z_courts", "label": "院落", "use": "housing", "on": "south_steps", "levels": "all", "building": "court", "density": 0.8 },
+    { "id": "z_tulou", "label": "土楼", "use": "housing", "on": "east_terrace", "building": "tulou", "density": 0.6 },
+    { "id": "z_forest", "label": "山林", "use": "forest", "on": "ridge", "side": "N", "density": 0.9 }
+  ],
+  "landmarks": [
+    { "id": "pavilion", "label": "望江亭", "form": "pavilion", "size_m": [6, 6, 6], "floors": 1, "roof": "pyramid", "place": { "rel": "top_of", "target": "south_steps" } }
+  ],
+  "spawn": { "place": { "rel": "edge_of", "target": "site", "side": "S" }, "look_at": "pavilion" },
+  "paths": [
+    { "id": "main", "label": "之字路", "from": "spawn", "to": "pavilion", "style": "zigzag", "width_m": 2.5 },
+    { "id": "to_tulou", "label": "土楼小路", "from": "main", "to": "z_tulou", "style": "winding", "width_m": 2 }
+  ],
+  "spaces": [
+    { "id": "walkway", "stratum": "sky", "label": "崖上栈道", "over": "ridge", "height_layers": 2, "layout": "corridor", "size_m": 40, "connect": { "via": "ladder", "from": "pavilion" } }
+  ],
+  "relations": [
+    { "type": "visible_from", "a": "pavilion", "b": "spawn" },
+    { "type": "far_from", "a": "z_tulou", "b": "ridge" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#47423D", "note": "小青瓦" },
+    { "role": "wall", "hex": "#D8CBB0", "note": "白墙" },
+    { "role": "stone", "hex": "#9A958A", "note": "石板" },
+    { "role": "foliage", "hex": "#486B3F", "note": "松林" },
+    { "role": "mist", "hex": "#E2E8EE", "note": "晨雾" }
+  ],
+  "lighting": { "time_of_day": "morning" },
+  "mood": ["规整", "开阔"]
+}

@@ -50,7 +50,7 @@ test("analyze：完整小村全部检查通过，checks 顺序固定，relations
   assert(res.checks.map((c) => c.id).join(",") === CHECK_ORDER.join(","), "顺序：" + res.checks.map((c) => c.id).join(","));
   for (const c of res.checks) assert(c.ok === true, `${c.id} 应通过：${c.detail}`);
   for (const c of res.checks) { assert(typeof c.text === "string" && ["error", "warn"].includes(c.severity), "字段齐全"); for (const f of c.fixes) assert(typeof f.label === "string" && typeof f.patch === "function", "fix 结构"); }
-  assert(checkMap(res).spawn_sees_landmark.text === "入口 能看见 山顶寺", "文案：" + checkMap(res).spawn_sees_landmark.text);
+  assert(checkMap(res).spawn_sees_landmark.text === "出生点 能看见 山顶寺", "文案：" + checkMap(res).spawn_sees_landmark.text);
   assert(checkMap(res).landmark_on_top.text === "山顶寺 在 顶层台地", "文案");
   const by = (t) => res.relations.filter((r) => r.type === t);
   const onTop = Object.fromEntries(by("on_top_of").map((r) => [r.a, r.b]));
@@ -133,7 +133,7 @@ test("trail_reaches_landmark：主路半途而止 → false；fix「把路接到
   const sid = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -10]] });
   const T = buildTerrain(sid);
   let c = checkMap(analyze(sid, T)).trail_reaches_landmark;
-  assert(c.ok === false && c.detail.includes("25"), "终点距地标 25 m：" + c.detail);
+  assert(c.ok === false && /离地标底面 2\d(\.\d+)? m/.test(c.detail), "终点离地标中心 25 m、离底面 20 多 m：" + c.detail);
   c.fixes.find((f) => f.label === "把路接到地标").patch(sid);
   const last = sid.paths[0].points[sid.paths[0].points.length - 1];
   assert(last[0] === 0 && last[1] === -35, "主路最后一点改为地标位置：" + last);
@@ -157,13 +157,13 @@ test("terraces_reachable：主路只到二层 → 三、四层不可达；fix「
   assert(cb.ok === false && cb.severity === "warn" && cb.detail.split("、").length === 4, "无路时四层都失败：" + cb.detail);
 });
 
-test("fix「入口挪到路口」：被体块挡住时把出生点沿主路前移到看得见的位置", () => {
+test("fix「出生点挪到路口」：被体块挡住时把出生点沿主路前移到看得见的位置", () => {
   const sid = scene();
   sid.volumes.push({ id: "blocker", kind: "blocker", shape: "box", position: [0, 0, 10], size: [12, 20, 12], rotation_y: 0 });
   const T = buildTerrain(sid);
   let c = checkMap(analyze(sid, T)).spawn_sees_landmark;
   assert(c.ok === false, "先被挡");
-  c.fixes.find((f) => f.label === "入口挪到路口").patch(sid);
+  c.fixes.find((f) => f.label === "出生点挪到路口").patch(sid);
   const sp = sid.markers.find((m) => m.kind === "player_spawn");
   assert(sp.position[2] < 4, "出生点应越过体块：z=" + sp.position[2]);
   assert(T.terraceAt(sp.position[0], sp.position[2]) !== null, "落在台地上");
@@ -257,7 +257,7 @@ test("trail_reaches_landmark：地标贴台地边缘、主路终点在门前（�
   assert(T.terraceAt(0, -27).id === "terrace_3" && (T.terraceAt(0, -22) || {}).id !== "terrace_3", "门前点与地标中心不在同一台地（测试前提）");
   const c = checkMap(analyze(sid, T)).trail_reaches_landmark;
   assert(c.ok === true, "应判为可达：" + c.detail);
-  assert(/距地标 [45](\.\d+)? m/.test(c.detail), "终点距地标 5 m：" + c.detail);
+  assert(/离地标底面 [0-2](\.\d+)? m/.test(c.detail), "终点在门前（离中心 5 m、离底面 1 m 左右）：" + c.detail);
   // 终点离地标 ≥ 6 m 仍然不算
   const far = scene({ trail: [[0, 54], [0, 40], [0, 20], [0, 0], [0, -16]] }); far.volumes[0].position = [0, 0, -27];
   assert(checkMap(analyze(far, buildTerrain(far))).trail_reaches_landmark.ok === false, "11 m 外不算到达");

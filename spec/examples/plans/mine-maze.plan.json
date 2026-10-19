@@ -1,0 +1,38 @@
+{
+  "name": "矿工村",
+  "one_liner": "坡上是矿工村，井架下面是两层的矿洞迷宫，岔路很多，最深处有终点室。",
+  "site": { "size_m": 140, "relief_layers": 5, "layer_m": 3 },
+  "terrain": [
+    { "id": "hill", "type": "hill", "label": "矿山", "at": { "of": "site", "dir": "N", "dist": 0.4 }, "size_m": [130, 80], "top_layer": 5 },
+    { "id": "steps", "type": "slope_terraces", "label": "坡上台地", "at": { "of": "site", "dir": "C", "dist": 0 }, "size_m": [80, 96], "orient": "N", "steps": 4, "from_layer": 1 }
+  ],
+  "buildings": [
+    { "id": "miner_house", "label": "矿工房", "form": "house", "size_m": [6, 4, 5], "floors": 1, "roof": "gable" }
+  ],
+  "zones": [
+    { "id": "z_village", "label": "矿工村", "use": "housing", "on": "steps", "levels": "all", "building": "miner_house", "density": 1 }
+  ],
+  "landmarks": [
+    { "id": "headframe", "label": "井架", "form": "tower", "size_m": [6, 13, 6], "floors": 1, "roof": "flat", "place": { "rel": "edge_of", "target": "steps", "side": "E" } }
+  ],
+  "spawn": { "place": { "rel": "edge_of", "target": "site", "side": "S" }, "look_at": "headframe" },
+  "paths": [
+    { "id": "main", "label": "矿道口路", "from": "spawn", "to": "headframe", "style": "winding", "width_m": 2.5 }
+  ],
+  "spaces": [
+    { "id": "mine", "stratum": "underground", "label": "矿洞迷宫", "under": "steps", "depth_layers": 3, "layout": "maze", "size_m": 44, "branching": "high", "sublevels": 2, "corridor_m": 2.5, "connect": { "via": "shaft", "from": "headframe" } }
+  ],
+  "relations": [
+    { "type": "visible_from", "a": "headframe", "b": "spawn" },
+    { "type": "below", "a": "mine", "b": "z_village" }
+  ],
+  "palette": [
+    { "role": "roof", "hex": "#55504A", "note": "铁皮顶" },
+    { "role": "wall", "hex": "#B59F82", "note": "土墙" },
+    { "role": "stone", "hex": "#6E6A63", "note": "矿渣" },
+    { "role": "foliage", "hex": "#56663F", "note": "灌木" },
+    { "role": "mist", "hex": "#D8D4CC", "note": "灰尘" }
+  ],
+  "lighting": { "time_of_day": "overcast" },
+  "mood": ["粗粝", "幽深"]
+}

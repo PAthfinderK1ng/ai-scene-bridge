@@ -1,6 +1,6 @@
 // section.js — 自选剖切（D19）：沿主路或一条直线、带宽度，把带内的体块 / 空间 / 连接点 / 路投到剖面上。
 // 规格见 docs/04 §5、SPEC.md §11。纯函数、确定性；不调 AI。
-import { clamp, r2, pointInPolygon, distToPolygon, DEFAULT_BOUNDS } from "./terrain.js";
+import { clamp, r2, pointInPolygon, distToPolygon, polygonCentroid, DEFAULT_BOUNDS } from "./terrain.js";
 import { boxCorners } from "./layout.js";
 
 export const SECTION_WIDTH = Object.freeze({ min: 2, max: 60, default: 12 });
@@ -74,13 +74,55 @@ function dRange(path, pts, center, extent) {
 }
 
 /**
+ * 空间内部投到剖面（docs/04 §8.3）：带内的通道按连续段切成 [d0, d1]（两端各加半个宽），房间取多边形投影，层间连接给竖线位置。
+ * @returns {{passages: object[], rooms: object[], links: object[]}}
+ *   passages: [{ id, sublevel, d0, d1, floor_y, height, width }]；rooms: [{ id, sublevel, role, label, d0, d1, floor_y, height }]；
+ *   links: [{ id, d, from, to, via, y0, y1 }]（y0 = 下层底面，y1 = 上层底面 + 净高）
+ */
+export function interiorBand(s, path, halfW) {
+  const H = Number(s.height) || 3, step = H + (s.stratum === "sky" ? 1 : 2), fl = (k) => r2((Number(s.floor_y) || 0) + k * step);
+  const passages = [], rooms = [], links = [];
+  for (const p of s.passages || []) {
+    if (!p || !Array.isArray(p.points) || p.points.length < 2 || !p.points.every(isPt)) continue;
+    const w = Number(p.width) || 2, lim = halfW + w / 2;
+    let run = null, k = 0;
+    const flush = () => { if (run) passages.push({ id: p.id + (k++ ? "_" + k : ""), sublevel: p.sublevel | 0, d0: r2(run[0] - w / 2), d1: r2(run[1] + w / 2), floor_y: Number.isFinite(p.floor_y) ? p.floor_y : fl(p.sublevel | 0), height: Number(p.height) > 0 ? p.height : H, width: w }); run = null; };
+    for (let i = 0; i + 1 < p.points.length; i++) {
+      const a = p.points[i], b = p.points[i + 1], n = Math.max(1, Math.ceil(dist2(a, b) / 0.5));
+      for (let j = i ? 1 : 0; j <= n; j++) {
+        const q = [a[0] + ((b[0] - a[0]) * j) / n, a[1] + ((b[1] - a[1]) * j) / n], pr = projectToPath(path, q);
+        if (pr.off <= lim) { if (!run) run = [pr.d, pr.d]; else { if (Math.abs(pr.d - run[1]) > 3 + w && Math.abs(pr.d - run[0]) > 3 + w) { flush(); run = [pr.d, pr.d]; } else { run[0] = Math.min(run[0], pr.d); run[1] = Math.max(run[1], pr.d); } } }
+        else flush();
+      }
+    }
+    flush();
+  }
+  for (const r of s.rooms || []) {
+    if (!r || !Array.isArray(r.polygon) || r.polygon.length < 3) continue;
+    const c = polygonCentroid(r.polygon), offs = [c, ...r.polygon].map((q) => projectToPath(path, q).off);
+    if (Math.min(...offs) > halfW && !path.some((q) => pointInPolygon(q, r.polygon))) continue;
+    const xs = r.polygon.map((q) => q[0]), zs = r.polygon.map((q) => q[1]);
+    const [d0, d1] = dRange(path, r.polygon, c, Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs)));
+    rooms.push({ id: r.id, sublevel: r.sublevel | 0, role: r.role || "chamber", label: r.label || "", d0, d1, floor_y: Number.isFinite(r.floor_y) ? r.floor_y : fl(r.sublevel | 0), height: Number(r.height) > 0 ? r.height : H });
+  }
+  for (const l of s.links || []) {
+    if (!l || !isPt(l.at)) continue;
+    const pr = projectToPath(path, l.at);
+    if (pr.off > halfW) continue;
+    const lo = Math.min(l.from | 0, l.to | 0), hi = Math.max(l.from | 0, l.to | 0);
+    links.push({ id: l.id, d: r2(pr.d), from: lo, to: hi, via: l.via || "ladder", y0: fl(lo), y1: r2(fl(hi) + H) });
+  }
+  return { passages, rooms, links };
+}
+
+/**
  * 沿剖切线采样（docs/04 §5）。
  * @param {object} sid
  * @param {object} T buildTerrain 结果
  * @param {{mode, line, width_m}} [section] 省略时用 sid.meta.section，再省略用 defaultSection
  * @returns {{path, length_m, width_m, ground, terraces, volumes, spaces, connectors, paths}}
  *   ground: [{ d, h, x, z, terrace_id, level }] 每 1 m；terraces: 剖切线穿过的台地平台段 [{ id, level, height, d0, d1, user_height }]；
- *   volumes: 带内体块 [{ id, kind, importance, d0, d1, y0, y1, label }]；spaces: [{ id, stratum, kind, d0, d1, floor_y, height, label }]；
+ *   volumes: 带内体块 [{ id, kind, importance, d0, d1, y0, y1, label }]；spaces: [{ id, stratum, kind, layout, sublevels, d0, d1, floor_y, height, label, passages, rooms, links }]（内部见 interiorBand）；
  *   connectors: [{ id, via, d, top_y, bottom_y }]；paths: 与剖切线相交的路 / 溪 [{ id, kind, d }]
  */
 export function sampleSection(sid, T, section) {
@@ -124,7 +166,7 @@ export function sampleSection(sid, T, section) {
     const ext = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs));
     const c = [(Math.max(...xs) + Math.min(...xs)) / 2, (Math.max(...zs) + Math.min(...zs)) / 2];
     const [d0, d1] = dRange(path, s.polygon, c, ext);
-    spaces.push({ id: s.id, stratum: s.stratum, kind: s.kind, d0, d1, floor_y: s.floor_y, height: s.height, label: s.label || "" });
+    spaces.push(Object.assign({ id: s.id, stratum: s.stratum, kind: s.kind, layout: s.layout || null, sublevels: Number(s.sublevels) || 1, d0, d1, floor_y: s.floor_y, height: s.height, label: s.label || "" }, interiorBand(s, path, halfW)));
   }
 
   const connectors = [];

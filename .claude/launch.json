@@ -4,7 +4,7 @@
     {
       "name": "scene-dialog",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-X", "utf8", "desktop/sid_editor.py", "--no-window", "--port", "8766"],
+      "runtimeArgs": ["-X", "utf8", "desktop/app.py", "--no-window", "--port", "8766"],
       "port": 8766
     },
     {
