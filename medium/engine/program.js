@@ -100,13 +100,16 @@ export function runProgram(plan, opts = {}) {
   const warn = opts.warn || (() => {});
   const site = plan.site, [W, D] = site.size_m, hw = W / 2, hd = D / 2, layer = site.layer_m || 3;
   const inset = clamp(0.1 * Math.min(W, D), 8, 20);
+  // 人定的层表（site.layers，docs/07 §7）→ sid.terrain.layers（source = user；resolve 后换成完整层表）；site.layer_zero_m → meta.layer_zero（0 层在哪）
+  const userLayers = Array.isArray(site.layers) ? site.layers.filter((l) => l && Number.isFinite(Number(l.height_m))).map((l, i) => Object.assign({ id: `L${i}`, height_m: r2(Number(l.height_m)), source: "user" }, l.label ? { label: String(l.label) } : {})) : [];
   const sid = {
     sid_version: "0.1",
-    meta: { name: plan.name, units: "meters", up_axis: "+Y", handedness: "right", north: "-Z", player_height: 1.7, grid: 0.5, layer_height_m: layer, theme: "mountain_village", seed, plan_mode: true, plan_version: 2, ground: site.ground, ...(plan.marks && plan.marks.length ? { marks: clone(plan.marks) } : {}) }, // marks：人画的标记（参考用，不出体块）
+    meta: { name: plan.name, units: "meters", up_axis: "+Y", handedness: "right", north: "-Z", player_height: 1.7, grid: 0.5, layer_height_m: layer, theme: "mountain_village", seed, plan_mode: true, plan_version: 2, ground: site.ground, ...(plan.marks && plan.marks.length ? { marks: clone(plan.marks) } : {}),
+      ...(Number.isFinite(Number(site.layer_zero_m)) ? { layer_zero: r2(Number(site.layer_zero_m)), layer_zero_from: "user" } : {}) }, // marks：人画的标记（参考用，不出体块）
     intent: { summary: plan.concept || "", mood: (plan.mood || []).slice() },
     style: { palette: [], references: [], lighting: {}, material_intents: {} },
     bounds: { min: [-hw, -40, -hd], max: [hw, 120, hd] },
-    terrain: { base: site.ground === "sky" ? "none" : "flat", base_height: 0, sculpt: true, features: [] },
+    terrain: { base: site.ground === "sky" ? "none" : "flat", base_height: 0, sculpt: true, features: [], ...(userLayers.length ? { layers: userLayers } : {}) },
     volumes: [], regions: [], paths: [], markers: [], spaces: [], relations: [], constraints: [], views: [], asset_hints: {},
   };
   // SID id：节点自己的主对象就用节点 id（own）；派生的（院墙、基座、水面…）加后缀，且不占用别的 plan id

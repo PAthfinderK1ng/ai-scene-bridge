@@ -91,6 +91,33 @@ export function streamOf(sid) { return (sid.paths || []).find((p) => p.kind === 
 export function terraceLevelAt(T, p) { const t = T && T.terraceAt(p[0], p[1]); return t ? t.level : null; }
 export { pointInPolygon };
 
+// ------------------------------------------------------------ 层（docs/07 §7）：出生点所在层为 0、往上 +1、往下 −1（T.layers / T.layerAt，口径同 tools/score_readback.py）
+/** 有层表的地形才有层号（没有 → null） */
+export const hasLayers = (T) => !!(T && Array.isArray(T.layers) && T.layers.length && typeof T.layerAt === "function");
+/** (x, z) 处地面的层号 */
+export function layerOfPoint(T, p) { return hasLayers(T) && p ? T.layerAt(p[0], p[1]) : null; }
+/** 体块 / 标记归到哪一层：按它位置处的地形高度（与评分脚本 level_at 同口径；悬空的也按脚下的地） */
+export function layerOfVolume(T, v) { return v && Array.isArray(v.position) ? layerOfPoint(T, [v.position[0], v.position[2]]) : null; }
+/** 层号 → 「+2」「0」「−1」 */
+export const layerNoText = (n) => (n > 0 ? `+${n}` : n < 0 ? `−${-n}` : "0");
+/** 层按钮 / 标题文案：「+2 层 · 云台 · 22.5 m」 */
+export function layerTitle(T, n) { const l = hasLayers(T) ? T.layerByNo(n) : null; return l ? `${layerNoText(n)} 层${l.label ? ` · ${l.label}` : ""} · ${fmt1(l.height_m)} m${n === 0 ? `（${T.zeroFrom === "spawn" ? "出生点所在层" : T.zeroFrom === "user" ? "你定的 0 层" : "基准面"}）` : ""}` : `${layerNoText(n)} 层`; }
+/** 穿透模式里离当前层 d 层的淡显程度（层差越大越淡，最淡 0.12） */
+export const LAYER_FADE = (d) => Math.max(0.12, 0.45 * Math.pow(0.62, d - 1));
+/**
+ * 俯视图的按层显示设置：ctx.layerView = { cur: 层号 | null（全部）, mode: "solo"（只看这一层）| "xray"（当前层实画、其它层按层差淡显）, depth: 穿透几层（数字；Infinity / "all" = 全部）}
+ * 只在地面层、非缩略图、层表 ≥ 2 层、cur 是层表里的层时生效 → { cur, mode, depth, visible(k), fade(k) }；否则 null（照旧全画）
+ */
+export function layerViewOf(ctx, T, enabled = true) {
+  const v = ctx && ctx.layerView;
+  if (!enabled || !v || v.cur == null || !hasLayers(T) || T.layers.length < 2) return null;
+  const cur = Math.round(Number(v.cur));
+  if (!Number.isFinite(cur) || !T.layerByNo(cur)) return null;
+  const mode = v.mode === "solo" ? "solo" : "xray";
+  const depth = mode === "solo" ? 0 : v.depth == null ? 1 : v.depth === "all" || !Number.isFinite(Number(v.depth)) ? Infinity : Math.max(0, Number(v.depth));
+  return { cur, mode, depth, visible: (k) => k === cur || (mode === "xray" && Math.abs(k - cur) <= depth), fade: (k) => (k === cur ? 1 : LAYER_FADE(Math.abs(k - cur))) };
+}
+
 // 空间内部层换算（sublevelOf / interiorLevelName / spaceDepth …）在 engine/interior.js，这里转出
 import { sublevelOf, interiorIndexOf, interiorLevelName, spaceDepth, spaceLevelTag } from "../engine/interior.js";
 export { sublevelOf, interiorIndexOf, interiorLevelName, spaceDepth, spaceLevelTag };
@@ -114,7 +141,8 @@ function planLabel(plan, id) {
 /**
  * 画俯视图。
  * @param {object} ctx { sid, T, facts?, checks?, plan?, index?, stratum?: "ground"|"underground"|"sky", interiorLevel?: 0|1|2（0 = 入口层）,
- *   section?: {mode, line, width_m}, selected?: {plan_id?, sid_id?, part?}, diffs?: [{id, from, to, err_m}], eye?: {landmark_visible}, tool?: 当前工具（非移动工具不画折点把手）}
+ *   section?: {mode, line, width_m}, selected?: {plan_id?, sid_id?, part?}, diffs?: [{id, from, to, err_m}], eye?: {landmark_visible}, tool?: 当前工具（非移动工具不画折点把手）,
+ *   layerView?: { cur: 层号 | null, mode: "solo"|"xray", depth }（按层显示，见 layerViewOf；只在地面层生效）}
  * @param {object} [opts] { small: 缩略图（不画文字 / 等高线 / 剖切 / 选中 / 把手）, footer: 图底一行统计（导出 PNG 用）, sectionHandles: false 不画剖切把手 }
  * @returns {SVGSVGElement}
  */
@@ -123,17 +151,23 @@ export function renderMap(ctx, opts = {}) {
   const [xmin, zmin] = [b.min[0], b.min[2]], W = b.max[0] - b.min[0], H = b.max[2] - b.min[2];
   const u = Math.max(W, H) / 120, PAD = 4 * u, footer = !small && !!opts.footer, vbH = H + 2 * PAD + (footer ? 3 * u : 0);
   const stratum = ["underground", "sky"].includes(ctx.stratum) ? ctx.stratum : "ground", onGround = stratum === "ground";
-  const svg = svgel("svg", { viewBox: `${fmt1(xmin - PAD)} ${fmt1(zmin - PAD)} ${fmt1(W + 2 * PAD)} ${fmt1(vbH)}`, class: "map", "font-family": "inherit", "data-stratum": stratum, style: "touch-action:none" });
+  const lv = layerViewOf(ctx, T, onGround && !small);
+  const svg = svgel("svg", { viewBox: `${fmt1(xmin - PAD)} ${fmt1(zmin - PAD)} ${fmt1(W + 2 * PAD)} ${fmt1(vbH)}`, class: "map", "font-family": "inherit", "data-stratum": stratum, "data-layer-cur": lv ? lv.cur : null, "data-layer-mode": lv ? lv.mode : null, style: "touch-action:none" });
   svg.append(svgel("rect", { x: fmt1(xmin - PAD), y: fmt1(zmin - PAD), width: fmt1(W + 2 * PAD), height: fmt1(vbH), fill: "#fbfaf6" }));
   svg.append(svgel("rect", { x: xmin, y: zmin, width: W, height: H, fill: onGround ? "#efe9dc" : "#e9e6df" }));
-  const ground = svgel("g", { class: "stratum-ground", opacity: onGround ? null : 0.35, "pointer-events": onGround ? null : "none", "data-inactive": onGround ? null : 1 });
+  // 地面层分两组：面状的（地形 / 区域 / 路 / 水 / 等高线，按层显示时按层的范围裁剪）与点状的（体块 / 出生点 / 传送门，各带 data-layer 按归属层显隐）
+  const dim = { opacity: onGround ? null : 0.35, "pointer-events": onGround ? null : "none", "data-inactive": onGround ? null : 1 };
+  const ground = svgel("g", Object.assign({ class: "stratum-ground" }, dim)), groundWrap = svgel("g", { class: "ground-wrap" }, ground);
+  const objs = svgel("g", Object.assign({ class: "stratum-objs" }, dim));
   const labels = svgel("g", { class: "labels" });
   const groundLabels = onGround ? labels : svgel("g", { opacity: 0.45, "pointer-events": "none", "data-inactive": 1 });
   if (!onGround) labels.append(groundLabels);
   /** 文字：白描边；meta.rank 越小越先占位，meta.optional 躲不开就不画 */
   const label = (attrs, text, meta = {}) => svgel("text", Object.assign({ stroke: "#fff", "stroke-width": fmt1(0.6 * u), "paint-order": "stroke", "stroke-linejoin": "round", "data-rank": meta.rank, "data-optional": meta.optional ? 1 : null }, attrs), text);
-  const R = { svg, sid, T, ctx, u, small, stratum, onGround, ground, labels, groundLabels, label, plan: ctx.plan || (sid.meta && sid.meta.plan) || null, obs: { ground: [], strata: [], interior: [] } };
-  svg.append(ground);
+  const R = { svg, sid, T, ctx, u, small, stratum, onGround, ground, objs, lv, labels, groundLabels, label, plan: ctx.plan || (sid.meta && sid.meta.plan) || null, obs: { ground: [], strata: [], interior: [] },
+    /** (x, z) 处的层号（没有层表 → null）；画点状东西 / 标签时写进 data-layer */
+    layerOf: (x, z) => (hasLayers(T) ? T.layerAt(x, z) : null) };
+  svg.append(groundWrap, objs);
 
   drawTerrain(R);
   drawZones(R);
@@ -151,6 +185,7 @@ export function renderMap(ctx, opts = {}) {
   if (!small && ctx.selected) drawSelection(R, ctx.selected);
   if (!small && onGround && ctx.selected) drawOpHandles(R);
   if (!onGround) for (const t of groundLabels.querySelectorAll("text")) if (!["landmark", "spawn"].includes(t.getAttribute("data-type"))) t.remove();
+  if (lv) applyLayerView(R, groundWrap);
   if (!small) { drawChrome(R, footer, PAD, W, H); placeLabels(R); }
   svg.append(labels);
   if (small) { const fb = contentBox(sid, b, u); if (fb) svg.setAttribute("viewBox", fb.map(fmt1).join(" ")); } // 缩略图：取景框贴着内容（形体 + 路 + 出生点），不画整块场地
@@ -160,6 +195,40 @@ export function renderMap(ctx, opts = {}) {
 /** 通用属性：可点、可拖的东西都带这些 */
 const tag = (type, planId, sidId, forKey, extra = {}) => Object.assign({ "data-type": type, "data-plan-id": planId || null, "data-sid-id": sidId || null, "data-for": forKey }, extra);
 
+/**
+ * 按层显示（docs/07 §7）：面状的地面内容按「当前层的范围」裁剪（每 1 m 采样地面层号，同一行连续同层的格合成 rect 进 clipPath）；
+ * 穿透模式再用 <use> 把地面内容按其它层的范围各复制一份、按层差淡显、不接指针；点状的东西 / 标签按 data-layer：不在穿透范围内的删掉，邻层淡显并标 data-inactive。
+ */
+function applyLayerView(R, groundWrap) {
+  const { lv, T, svg, ground, objs, labels, sid } = R, cur = lv.cur, b = sid.bounds;
+  const uid = "lv" + Math.random().toString(36).slice(2, 8), defs = svgel("defs"), masks = new Map();
+  const maskFor = (k) => { if (!masks.has(k)) { const cp = svgel("clipPath", { id: `${uid}-L${k}`, "data-layer": k }); defs.append(cp); masks.set(k, cp); } return masks.get(k); };
+  maskFor(cur);
+  const step = Math.max(0.5, Math.min(2, (T.res || 2) / 2)), x0 = b.min[0], z0 = b.min[2], x1 = b.max[0], z1 = b.max[2];
+  for (let z = z0; z < z1; z += step) {
+    let runK = null, runX = x0;
+    const flush = (xe) => { if (runK != null && lv.visible(runK) && xe > runX) maskFor(runK).append(svgel("rect", { x: fmt1(runX), y: fmt1(z), width: fmt1(Math.min(x1, xe) - runX + 0.05), height: fmt1(Math.min(step, z1 - z) + 0.05) })); };
+    for (let x = x0; x < x1; x += step) { const k = T.layerAt(x + step / 2, z + step / 2); if (k !== runK) { flush(x); runK = k; runX = x; } }
+    flush(x1);
+  }
+  svg.insertBefore(defs, svg.firstChild);
+  ground.setAttribute("id", `${uid}-ground`);
+  groundWrap.setAttribute("clip-path", `url(#${uid}-L${cur})`);
+  if (lv.mode === "xray") for (const k of [...masks.keys()].sort((p, q) => Math.abs(q - cur) - Math.abs(p - cur))) { // 远的先放（在下面），近的盖在上面
+    if (k === cur) continue;
+    groundWrap.after(svgel("use", { href: `#${uid}-ground`, "clip-path": `url(#${uid}-L${k})`, opacity: r2(lv.fade(k)), "pointer-events": "none", "data-inactive": 1, "data-layer": k, class: "layer-ghost" }));
+  }
+  const prune = (n) => {
+    const k = Number(n.getAttribute("data-layer"));
+    if (!Number.isFinite(k)) return;
+    if (!lv.visible(k)) { n.remove(); return; }
+    if (k !== cur) { n.setAttribute("opacity", r2(lv.fade(k))); n.setAttribute("pointer-events", "none"); n.setAttribute("data-inactive", 1); }
+  };
+  for (const n of [...objs.querySelectorAll("[data-layer]")]) prune(n);
+  for (const n of [...labels.querySelectorAll("[data-layer]"), ...svg.querySelectorAll(".trail-handles [data-layer]")]) prune(n);
+  R.obs.ground = R.obs.ground.filter((o) => o.layer == null || lv.visible(o.layer));
+}
+
 // ------------------------------------------------------------ 地形：穹顶 / 谷（底）→ 台地（按层着色）→ 崖 → 等高线 → 名字与层号
 function drawTerrain(R) {
   const { sid, T, u, small, ground: g, label, groundLabels } = R;
@@ -167,6 +236,8 @@ function drawTerrain(R) {
   const terraces = (T && T.terraces) || [], terraceIds = new Set(terraces.map((t) => t.id));
   const maxLevel = terraces.reduce((m, t) => Math.max(m, t.level), 0);
   const layer = (T && T.layer) || 3;
+  // 台地的「层」按层表（出生点所在层 0）；没有层表的旧文档退回 terrace.level（3 m 切片）
+  const HL = hasLayers(T), lno = (t) => (HL ? T.layerNo(t.height) : t.level), lidx = (t) => (HL ? T.layerIndexOf(t.height) : t.level), maxIdx = HL ? T.layers.length - 1 : maxLevel;
   const shape = (f, poly, style) => {
     const c = planCenter(sid, T, f.plan_id);
     return svgel("polygon", Object.assign(tag("feature", f.plan_id, f.id, `feature:${f.plan_id}`, { "data-center": c ? `${c[0]} ${c[1]}` : null }), { points: pts(poly), "stroke-linejoin": "round" }, style),
@@ -182,9 +253,9 @@ function drawTerrain(R) {
   }
   for (const t of terraces) {
     const f = t.feature || {};
-    if (!f.plan_id) { g.append(svgel("polygon", { points: pts(t.polygon), fill: levelColor(t.level, maxLevel), stroke: "#8c9a6b", "stroke-width": 0.45, "stroke-dasharray": "1.4 1", "pointer-events": "none" })); continue; }
-    const n = shape(f, t.polygon, { fill: levelColor(t.level, maxLevel), stroke: "#8c9a6b", "stroke-width": 0.45, "stroke-dasharray": "1.4 1" });
-    n.lastChild.textContent = `${planLabel(R.plan, f.plan_id) || f.label} · ${t.level} 层 · +${fmt1(t.height)} m`;
+    if (!f.plan_id) { g.append(svgel("polygon", { points: pts(t.polygon), fill: levelColor(lidx(t), maxIdx), stroke: "#8c9a6b", "stroke-width": 0.45, "stroke-dasharray": "1.4 1", "pointer-events": "none" })); continue; }
+    const n = shape(f, t.polygon, { fill: levelColor(lidx(t), maxIdx), stroke: "#8c9a6b", "stroke-width": 0.45, "stroke-dasharray": "1.4 1" });
+    n.lastChild.textContent = `${planLabel(R.plan, f.plan_id) || f.label} · ${layerNoText(lno(t))} 层 · ${t.height < 0 ? "−" : "+"}${fmt1(Math.abs(t.height))} m`;
     g.append(n);
   }
   for (const f of others) if (f.kind === "cliff") { const poly = featurePolygon(f); if (poly) g.append(shape(f, poly, { fill: "#7d6a4f", "fill-opacity": 0.4, stroke: "#5a4a32", "stroke-width": 0.8 })); }
@@ -196,13 +267,14 @@ function drawTerrain(R) {
     if (seen.has(f.plan_id)) continue; seen.add(f.plan_id);
     if (f.plan_id === "site" || !f.plan_id) continue; // 场地基础形态（plan_id = site）不标名字：它是底，不是 AI 写的地形块
     const c = planCenter(sid, T, f.plan_id); if (!c) continue;
-    groundLabels.append(label(Object.assign(tag("feature", f.plan_id, f.id, `feature:${f.plan_id}`), { x: fmt1(c[0]), y: fmt1(c[1] - 3 * u), "font-size": fmt1(2.4 * u), "text-anchor": "middle", fill: "#5f6e43", style: "cursor:pointer" }), planLabel(R.plan, f.plan_id) || String(f.label || "").replace(/\s*第.*$/, ""), { rank: 6, optional: true }));
+    groundLabels.append(label(Object.assign(tag("feature", f.plan_id, f.id, `feature:${f.plan_id}`), { x: fmt1(c[0]), y: fmt1(c[1] - 3 * u), "font-size": fmt1(2.4 * u), "text-anchor": "middle", fill: "#5f6e43", style: "cursor:pointer", "data-layer": R.layerOf(c[0], c[1]) }), planLabel(R.plan, f.plan_id) || String(f.label || "").replace(/\s*第.*$/, ""), { rank: 6, optional: true }));
   }
   const lv = new Set();
   for (const t of terraces) {
-    if (lv.has(t.level)) continue; lv.add(t.level);
-    const x = Math.min(...t.polygon.map((p) => p[0])) + 2.5 * u;
-    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": t.level }, `${t.level} 层 ${(Number.isFinite(t.height) ? t.height : t.level * layer) < 0 ? "−" : "+"}${fmt1(Math.abs(Number.isFinite(t.height) ? t.height : t.level * layer))} m`, { rank: 8, optional: true }));
+    const n = lno(t);
+    if (lv.has(n)) continue; lv.add(n);
+    const x = Math.min(...t.polygon.map((p) => p[0])) + 2.5 * u, hgt = Number.isFinite(t.height) ? t.height : t.level * layer;
+    groundLabels.append(label({ x: fmt1(x), y: fmt1(t.centroid[1] + u), "font-size": fmt1(2.2 * u), fill: "#6b7a4b", "pointer-events": "none", "data-lv": n, "data-layer": HL ? n : null }, `${layerNoText(n)} 层 ${hgt < 0 ? "−" : "+"}${fmt1(Math.abs(hgt))} m`, { rank: 8, optional: true }));
   }
 }
 
@@ -223,7 +295,7 @@ function drawZones(R) {
   if (small) return;
   for (const [pid, { r, c }] of best) {
     const kd = REGION_KINDS[r.kind] || REGION_KINDS.other;
-    groundLabels.append(label(Object.assign(tag("zone", pid, r.id, `zone:${pid}`), { x: fmt1(c[0]), y: fmt1(c[1] + 1.2 * u), "font-size": fmt1(2.5 * u), "text-anchor": "middle", fill: kd.color && r.kind !== "water" ? kd.color : "#7a5a00", style: "cursor:pointer" }), r.label || planLabel(R.plan, pid) || kd.label, { rank: 4 }));
+    groundLabels.append(label(Object.assign(tag("zone", pid, r.id, `zone:${pid}`), { x: fmt1(c[0]), y: fmt1(c[1] + 1.2 * u), "font-size": fmt1(2.5 * u), "text-anchor": "middle", fill: kd.color && r.kind !== "water" ? kd.color : "#7a5a00", style: "cursor:pointer", "data-layer": R.layerOf(c[0], c[1]) }), r.label || planLabel(R.plan, pid) || kd.label, { rank: 4 }));
   }
 }
 
@@ -266,7 +338,7 @@ function drawWaterAndPaths(R) {
     if (!small && pid) {
       const mid = p.points[Math.floor(p.points.length / 2)], b = sid.bounds;
       const how = main && trailFacts ? (p.user_drawn ? " · 你画的" : trailFacts.folds === 0 ? " · 直上" : ` · 之字 ${trailFacts.folds} 折`) + (trailFacts.climb_m != null ? ` · 爬升 ${Math.round(trailFacts.climb_m)} m` : "") : "";
-      groundLabels.append(label(Object.assign(tag("path", pid, p.id, `path:${p.id}`), { x: fmt1(clamp(mid[0] + 3 * u, b.min[0] + 2 * u, b.max[0] - 30 * u)), y: fmt1(clamp(mid[1] - 2 * u, b.min[2] + 6 * u, b.max[2] - 4 * u)), "font-size": fmt1(2.5 * u), fill: "#5a4a2a", class: main ? "trail-label" : null, style: "cursor:pointer" }), `${p.label || planLabel(R.plan, pid) || "路"}${how}`, { rank: 5, optional: !main }));
+      groundLabels.append(label(Object.assign(tag("path", pid, p.id, `path:${p.id}`), { x: fmt1(clamp(mid[0] + 3 * u, b.min[0] + 2 * u, b.max[0] - 30 * u)), y: fmt1(clamp(mid[1] - 2 * u, b.min[2] + 6 * u, b.max[2] - 4 * u)), "font-size": fmt1(2.5 * u), fill: "#5a4a2a", class: main ? "trail-label" : null, style: "cursor:pointer", "data-layer": R.layerOf(mid[0], mid[1]) }), `${p.label || planLabel(R.plan, pid) || "路"}${how}`, { rank: 5, optional: !main }));
     }
   }
   for (const br of (ctx.facts && ctx.facts.bridges) || []) {
@@ -350,12 +422,12 @@ function drawStyledPath(R, p, st, w) {
 }
 /** 传送门标记（markers kind portal） */
 function drawPortals(R) {
-  const { sid, u, ground: g } = R;
+  const { sid, u, objs: g } = R;
   for (const m of sid.markers || []) {
     if (!m || m.kind !== "portal" || !Array.isArray(m.position)) continue;
-    const at = [m.position[0], m.position[2]];
-    g.append(portalRing(Object.assign(tag("portal", m.plan_id || null, m.id, `portal:${m.id}`, { "data-pos": `${fmt1(at[0])} ${fmt1(at[1])}` }), { class: "portal-ring portal-marker" }), at, u));
-    R.obs.ground.push([at[0] - 2.2, at[1] - 2.2, at[0] + 2.2, at[1] + 2.2, ICON_W]);
+    const at = [m.position[0], m.position[2]], lk = R.layerOf(at[0], at[1]);
+    g.append(portalRing(Object.assign(tag("portal", m.plan_id || null, m.id, `portal:${m.id}`, { "data-pos": `${fmt1(at[0])} ${fmt1(at[1])}`, "data-layer": lk }), { class: "portal-ring portal-marker" }), at, u));
+    R.obs.ground.push(Object.assign([at[0] - 2.2, at[1] - 2.2, at[0] + 2.2, at[1] + 2.2, ICON_W], { layer: lk }));
   }
 }
 
@@ -434,18 +506,18 @@ function shapeGlyph(v, fill, edge, small) {
 /** 带 v4 符号的地标 form（这些仍叠画旧符号） */
 const GLYPH_FORMS = new Set(["hall", "tower", "gate", "pavilion", "stage", "bridge", "wall", "well", "tree", "statue", "round_house"]);
 function drawVolumes(R) {
-  const { sid, T, u, small, ground: g, label, groundLabels } = R, pal = paletteOf(sid), focus = landmarkOf(sid);
+  const { sid, T, u, small, objs: g, label, groundLabels } = R, pal = paletteOf(sid), focus = landmarkOf(sid);
   const vols = (sid.volumes || []).filter((v) => v && Array.isArray(v.position) && Array.isArray(v.size));
   // 俯视的画家算法：低的先画、高的盖上去（悬空的在上面）；同高保持原顺序
   const tops = new Map(vols.map((v) => [v, volumeTop(v, T)]));
   const order = vols.map((v, i) => [v, i]).sort((a, b) => tops.get(a[0]) - tops.get(b[0]) || a[1] - b[1]).map((x) => x[0]);
   const groupLabel = new Map(), elevLabel = new Map();
   for (const v of order) {
-    const [x, , z] = v.position, type = volumeType(v), sh = shapeOf(v), [w, , d] = volDims(v), e = elevOf(v), lm = type === "landmark";
+    const [x, , z] = v.position, type = volumeType(v), sh = shapeOf(v), [w, , d] = volDims(v), e = elevOf(v), lm = type === "landmark", lk = R.layerOf(x, z);
     // v4 的树：只画一个绿点，不可点
-    if (v.kind === "prop" && !v.plan_id && !lm) { g.append(svgel("circle", { cx: fmt1(x), cy: fmt1(z), r: fmt1(Math.max(1.2, (w / 2) * 0.6)), fill: pal.foliage, opacity: 0.85, "pointer-events": "none" })); continue; }
+    if (v.kind === "prop" && !v.plan_id && !lm) { g.append(svgel("circle", { cx: fmt1(x), cy: fmt1(z), r: fmt1(Math.max(1.2, (w / 2) * 0.6)), fill: pal.foliage, opacity: 0.85, "pointer-events": "none", "data-layer": lk })); continue; }
     const key = `${type}:${v.id}`, pid = v.plan_id || v.zone_id || (lm ? v.id : null), r = roofOf(v);
-    const n = svgel("g", Object.assign(tag(type, pid, v.id, key, { "data-zone-id": v.zone_id || null, "data-pos": `${fmt1(x)} ${fmt1(z)}`, "data-shape": sh, "data-kind": v.kind || null, "data-roof": r ? r.type : null, "data-elev": e > 0.5 ? fmt1(e) : null, "data-instance-of": v.instance_of || null }),
+    const n = svgel("g", Object.assign(tag(type, pid, v.id, key, { "data-zone-id": v.zone_id || null, "data-pos": `${fmt1(x)} ${fmt1(z)}`, "data-shape": sh, "data-kind": v.kind || null, "data-roof": r ? r.type : null, "data-elev": e > 0.5 ? fmt1(e) : null, "data-instance-of": v.instance_of || null, "data-layer": lk }),
       { class: lm ? "landmark volume" : "volume", transform: `translate(${fmt1(x)} ${fmt1(z)}) rotate(${fmt1(-(v.rotation_y || 0))})`, style: "cursor:pointer" }));
     const edge = { stroke: v.locked ? "#b8452b" : lm ? "#4a1a10" : "#222", "stroke-width": v.locked ? 0.5 : lm ? 0.35 : 0.25, "stroke-dasharray": e > 0.5 ? "1 0.6" : null, "fill-opacity": e > 0.5 ? 0.6 : null };
     const oldGlyph = lm && v.form && GLYPH_FORMS.has(v.form) && (sh === "box" || sh === "cylinder");
@@ -456,29 +528,29 @@ function drawVolumes(R) {
       if (v.form === "stilt_house" || v.stilt_m > 0) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) n.append(svgel("circle", { cx: fmt1((sx * w) / 2), cy: fmt1((sz * d) / 2), r: 0.45, fill: "#6b4f2a", "pointer-events": "none" }));
     }
     g.append(n);
-    const bb = aabb(v);
-    if (ringOf(v)) for (const q of footRects(v, 8)) { const xs = q.map((p) => p[0]), zs = q.map((p) => p[1]); R.obs.ground.push([Math.min(...xs), Math.min(...zs), Math.max(...xs), Math.max(...zs)]); }
-    else R.obs.ground.push(bb);
+    const bb = aabb(v), ob = (arr) => R.obs.ground.push(Object.assign(arr, { layer: lk }));
+    if (ringOf(v)) for (const q of footRects(v, 8)) { const xs = q.map((p) => p[0]), zs = q.map((p) => p[1]); ob([Math.min(...xs), Math.min(...zs), Math.max(...xs), Math.max(...zs)]); }
+    else ob(bb);
     if (small) continue;
-    if (lm) groundLabels.append(label(Object.assign(tag("landmark", pid, v.id, key), { x: fmt1(x), y: fmt1(bb[1] - 1.5 * u), "font-size": fmt1((v === focus ? 2.9 : 2.6) * u), "font-weight": v === focus ? 700 : null, "text-anchor": "middle", fill: "#4a1a10", style: "cursor:pointer" }), v.label || FORM_LABEL[v.form] || "地标", { rank: 1 }));
+    if (lm) groundLabels.append(label(Object.assign(tag("landmark", pid, v.id, key), { x: fmt1(x), y: fmt1(bb[1] - 1.5 * u), "font-size": fmt1((v === focus ? 2.9 : 2.6) * u), "font-weight": v === focus ? 700 : null, "text-anchor": "middle", fill: "#4a1a10", style: "cursor:pointer", "data-layer": lk }), v.label || FORM_LABEL[v.form] || "地标", { rank: 1 }));
     // 名字与「↑N m」每组一个：同一模板的实例（instance_of / plan_id 去掉 [k]）算一组，不然环形 8 座宿舍就有 8 个名字
     const gk = String(v.instance_of || pid || "").replace(/\[\d+\]/g, "") || null; // 嵌套重复（signs[2]/stack）也归成一组
-    if (!lm && type === "shape" && v.label && gk && !v.plinth_of && !groupLabel.has(gk)) groupLabel.set(gk, { v, key, bb, pid }); // 基座不出名字（名字给它垫着的那块）
+    if (!lm && type === "shape" && v.label && gk && !v.plinth_of && !groupLabel.has(gk)) groupLabel.set(gk, { v, key, bb, pid, lk }); // 基座不出名字（名字给它垫着的那块）
     const ek = gk || v.id;
-    if (e > 0.5 && (!elevLabel.has(ek) || elevLabel.get(ek).e < e)) elevLabel.set(ek, { v, e, key, bb, pid });
+    if (e > 0.5 && (!elevLabel.has(ek) || elevLabel.get(ek).e < e)) elevLabel.set(ek, { v, e, key, bb, pid, lk });
   }
   if (small) return;
   // 同心的几圈环（环墙、墙顶环道、外墙立面、环形花槽）只标最外一圈；孔里的东西（院地、水池）标在它自己中间，不标到环带上
   const rings = vols.map((v) => [v, ringOf(v)]).filter(([, q]) => q && !q.torus && q.ix > 0.2).map(([v, q]) => ({ v, c: [v.position[0], v.position[2]], r: (q.rx + q.rz) / 2, ri: (q.ix + q.iz) / 2 }));
   const ringOf_ = (v) => rings.find((q) => q.v === v);
   const outer = (q) => !rings.some((o) => o !== q && Math.hypot(o.c[0] - q.c[0], o.c[1] - q.c[1]) < 3 && (o.r > q.r + 0.3 || (Math.abs(o.r - q.r) <= 0.3 && rings.indexOf(o) < rings.indexOf(q))));
-  for (const { v, key, bb, pid } of groupLabel.values()) {
+  for (const { v, key, bb, pid, lk } of groupLabel.values()) {
     const rq = ringOf_(v);
     if (rq && !outer(rq)) continue;
     const inHole = !rq && rings.some((q) => Math.hypot(v.position[0] - q.c[0], v.position[2] - q.c[1]) < q.ri - 1);
-    groundLabels.append(label(Object.assign(tag("shape", pid, v.id, key), { x: fmt1(v.position[0]), y: fmt1(inHole ? v.position[2] + 0.8 * u : bb[1] - 1.2 * u), "font-size": fmt1(2.3 * u), "text-anchor": "middle", fill: "#3d3a33", style: "cursor:pointer", "data-plan-root": (v.plan_path || [])[0] || null }), v.label, { rank: 6, optional: true }));
+    groundLabels.append(label(Object.assign(tag("shape", pid, v.id, key), { x: fmt1(v.position[0]), y: fmt1(inHole ? v.position[2] + 0.8 * u : bb[1] - 1.2 * u), "font-size": fmt1(2.3 * u), "text-anchor": "middle", fill: "#3d3a33", style: "cursor:pointer", "data-plan-root": (v.plan_path || [])[0] || null, "data-layer": lk }), v.label, { rank: 6, optional: true }));
   }
-  for (const { v, e, key, bb, pid } of elevLabel.values()) groundLabels.append(label({ x: fmt1(bb[2] + 0.6 * u), y: fmt1(bb[1] + 2 * u), "font-size": fmt1(2 * u), fill: "#2a6aa6", "pointer-events": "none", "data-for": key, "data-elev-label": pid || v.id }, `↑${Math.round(e)} m`, { rank: 7 }));
+  for (const { v, e, key, bb, pid, lk } of elevLabel.values()) groundLabels.append(label({ x: fmt1(bb[2] + 0.6 * u), y: fmt1(bb[1] + 2 * u), "font-size": fmt1(2 * u), fill: "#2a6aa6", "pointer-events": "none", "data-for": key, "data-elev-label": pid || v.id, "data-layer": lk }, `↑${Math.round(e)} m`, { rank: 7 }));
 }
 /** 区域名字放哪：形心在区域里（不在内孔里、水面真的盖着它）就用形心，否则取离边最远的格点（湖的名字在水上，不在湖心岛 / 岩柱上） */
 function labelPoint(poly, hole, wet) {
@@ -504,18 +576,18 @@ const aabb = (v) => {
 
 // ------------------------------------------------------------ 出生点与第一眼视锥（看不见主地标时变红）
 function drawSpawn(R) {
-  const { sid, u, small, ground: g, label, groundLabels, ctx } = R, sp = spawnOf(sid);
+  const { sid, u, small, objs: g, label, groundLabels, ctx } = R, sp = spawnOf(sid);
   if (!sp) return;
-  const [ex, , ez] = sp.position, lm = landmarkOf(sid), key = `spawn:${sp.id}`, b = sid.bounds;
+  const [ex, , ez] = sp.position, lm = landmarkOf(sid), key = `spawn:${sp.id}`, b = sid.bounds, lk = R.layerOf(ex, ez);
   const th = ((sp.rotation_y || 0) * Math.PI) / 180, ang = Math.atan2(-Math.cos(th), -Math.sin(th));
   const L = lm ? Math.hypot(lm.position[0] - ex, lm.position[2] - ez) * 0.8 : 30;
   const col = ctx.eye && ctx.eye.landmark_visible === false ? "#c0392b" : "#1f6feb";
-  for (const da of [-1, 1].map((k) => (k * (EYE_FOV_DEG / 2) * Math.PI) / 180)) g.append(svgel("line", { x1: fmt1(ex), y1: fmt1(ez), x2: fmt1(ex + Math.cos(ang + da) * L), y2: fmt1(ez + Math.sin(ang + da) * L), stroke: col, "stroke-width": 0.35, "stroke-dasharray": "1 1", opacity: 0.45, "pointer-events": "none", "data-for": key }));
-  const n = svgel("g", Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key, { "data-pos": `${fmt1(ex)} ${fmt1(ez)}` }), { class: "spawn", transform: `translate(${fmt1(ex)} ${fmt1(ez)}) rotate(${fmt1(-(sp.rotation_y || 0))})`, style: "cursor:pointer" }));
+  for (const da of [-1, 1].map((k) => (k * (EYE_FOV_DEG / 2) * Math.PI) / 180)) g.append(svgel("line", { x1: fmt1(ex), y1: fmt1(ez), x2: fmt1(ex + Math.cos(ang + da) * L), y2: fmt1(ez + Math.sin(ang + da) * L), stroke: col, "stroke-width": 0.35, "stroke-dasharray": "1 1", opacity: 0.45, "pointer-events": "none", "data-for": key, "data-layer": lk }));
+  const n = svgel("g", Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key, { "data-pos": `${fmt1(ex)} ${fmt1(ez)}`, "data-layer": lk }), { class: "spawn", transform: `translate(${fmt1(ex)} ${fmt1(ez)}) rotate(${fmt1(-(sp.rotation_y || 0))})`, style: "cursor:pointer" }));
   n.append(svgel("path", { d: "M0 -4.5 L3.2 3 L-3.2 3 Z", fill: "#1f6feb", stroke: "#fff", "stroke-width": 0.5 }));
   g.append(n);
-  R.obs.ground.push([ex - 3.5, ez - 4.5, ex + 3.5, ez + 3.5, ICON_W]);
-  if (!small) { const right = ex < b.min[0] + (b.max[0] - b.min[0]) * 0.6; groundLabels.append(label(Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key), { x: fmt1(right ? ex + 5 * u : ex - 5 * u), y: fmt1(ez + 1 * u), "text-anchor": right ? "start" : "end", "font-size": fmt1(2.7 * u), fill: "#1f6feb" }), `出生点 · 看向${lm ? lm.label || "地标" : "北"}`, { rank: 2 })); }
+  R.obs.ground.push(Object.assign([ex - 3.5, ez - 4.5, ex + 3.5, ez + 3.5, ICON_W], { layer: lk }));
+  if (!small) { const right = ex < b.min[0] + (b.max[0] - b.min[0]) * 0.6; groundLabels.append(label(Object.assign(tag("spawn", sp.plan_id || "spawn", sp.id, key), { x: fmt1(right ? ex + 5 * u : ex - 5 * u), y: fmt1(ez + 1 * u), "text-anchor": right ? "start" : "end", "font-size": fmt1(2.7 * u), fill: "#1f6feb", "data-layer": lk }), `出生点 · 看向${lm ? lm.label || "地标" : "北"}`, { rank: 2 })); }
 }
 
 // ------------------------------------------------------------ 地下 / 空中空间
@@ -637,7 +709,7 @@ function drawTrailHandles(R) {
   const { sid, u, ctx } = R, trail = mainTrailOf(sid);
   if (!trail || !trail.points || trail.points.length <= 2 || !(ctx.tool == null || ["move", "pin", "select"].includes(ctx.tool))) return;
   const hg = svgel("g", { class: "trail-handles" });
-  trail.points.forEach((q, i) => { if (i > 0 && i < trail.points.length - 1) hg.append(svgel("circle", Object.assign(tag("trail_vertex", trail.plan_id, trail.id, `trail_vertex:${i}`, { "data-index": i, "data-pos": `${fmt1(q[0])} ${fmt1(q[1])}` }), { cx: fmt1(q[0]), cy: fmt1(q[1]), r: fmt1(0.9 * u), fill: "#fff", stroke: "#8b7d5b", "stroke-width": fmt1(0.35 * u), style: "cursor:move" }))); });
+  trail.points.forEach((q, i) => { if (i > 0 && i < trail.points.length - 1) hg.append(svgel("circle", Object.assign(tag("trail_vertex", trail.plan_id, trail.id, `trail_vertex:${i}`, { "data-index": i, "data-pos": `${fmt1(q[0])} ${fmt1(q[1])}`, "data-layer": R.layerOf(q[0], q[1]) }), { cx: fmt1(q[0]), cy: fmt1(q[1]), r: fmt1(0.9 * u), fill: "#fff", stroke: "#8b7d5b", "stroke-width": fmt1(0.35 * u), style: "cursor:move" }))); });
   R.svg.append(hg);
 }
 
@@ -827,7 +899,8 @@ function drawChrome(R, footer, PAD, W, H) {
     const houses = (sid.volumes || []).filter((v) => v.kind === "building" && v.importance !== "landmark").length;
     const steps = f && f.steps_estimate ? ` · 主路 ${Math.round(f.length_m)} m / 约 ${Math.round(f.steps_estimate)} 级` : "";
     const sps = (sid.spaces || []).filter((x) => x && x.polygon), nu = sps.filter((x) => x.stratum === "underground").length, ns = sps.length - nu;
-    labels.append(label({ x: fmt1(xmin + 2 * u), y: fmt1(zmin + H + PAD + 1.8 * u), "font-size": fmt1(2.4 * u), fill: "#555" }, `约 ${W} m 见方 · ${terraces.length} 块台地（1 层 ≈ ${layer} m）· ${houses} 栋 · ${landmarksOf(sid).length} 个地标${steps}${nu ? ` · 地下 ${nu} 处` : ""}${ns ? ` · 空中 ${ns} 处` : ""}`));
+    const lay = hasLayers(T) ? `${T.layers.length} 层（${T.zeroFrom === "spawn" ? "出生点所在层" : T.zeroFrom === "user" ? "指定的" : "基准面"}为 0 层 = ${fmt1(T.layers[T.zero])} m，往上 +1、往下 −1）` : `1 层 ≈ ${layer} m`;
+    labels.append(label({ x: fmt1(xmin + 2 * u), y: fmt1(zmin + H + PAD + 1.8 * u), "font-size": fmt1(2.4 * u), fill: "#555" }, `约 ${W} m 见方 · ${terraces.length} 块台地 · ${lay} · ${houses} 栋 · ${landmarksOf(sid).length} 个地标${steps}${nu ? ` · 地下 ${nu} 处` : ""}${ns ? ` · 空中 ${ns} 处` : ""}`));
   }
 }
 

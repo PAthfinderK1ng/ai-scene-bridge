@@ -218,6 +218,26 @@ body.gesturing.height-live #inset3d:not(.docked) { opacity: 1; }
 #level-switch[hidden] { display: none; }
 #level-switch button { font: inherit; font-size: 11px; width: 44px; padding: 3px 0; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
 #level-switch button.on { background: #6b5a8c; color: #fff; border-color: #6b5a8c; }
+/* 地形的层（docs/07 §7）：地面层下面一列层按钮（出生点所在层 0、往上 +1、往下 −1）、单层 / 穿透、穿透几层、编辑层表 */
+#layer-switch { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); max-height: 62vh; overflow: auto; scrollbar-width: none; }
+#layer-switch[hidden] { display: none; }
+#layer-switch .lhead { font-size: 10px; color: var(--muted); text-align: center; line-height: 1; }
+#layer-switch button { font: inherit; font-size: 11px; width: 44px; padding: 3px 0; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
+#layer-switch button.lno { font-variant-numeric: tabular-nums; }
+#layer-switch button.on { background: #6b7a4b; color: #fff; border-color: #6b7a4b; }
+#layer-switch button.zero { font-weight: 700; }
+#layer-switch .lmode, #layer-switch .ldepth { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+#layer-switch .lmode button.on { background: #2a2622; border-color: #2a2622; }
+#layer-switch .ldepth button { font-size: 10px; padding: 2px 0; }
+#layer-switch button:disabled { opacity: .45; cursor: default; }
+/* 右栏「场地」里的层表 */
+.layers .lrow { display: flex; align-items: center; gap: 4px; padding: 1px 0; flex-wrap: wrap; }
+.layers .lno { font: inherit; font-size: 11px; min-width: 30px; padding: 1px 4px; border: 1px solid var(--line); border-radius: 5px; background: #fff; cursor: pointer; font-variant-numeric: tabular-nums; }
+.layers .lrow.on .lno { background: #6b7a4b; color: #fff; border-color: #6b7a4b; }
+.layers .lh { font-size: 11px; color: var(--muted); min-width: 44px; font-variant-numeric: tabular-nums; }
+.layers input.txt { width: 5.5em; }
+.layers .lrow.add input.val { width: 52px; }
+.layers .lzero { font-size: 11px; color: var(--muted); }
 .cmp .comp { margin-top: 2px; }
 .modal-card pre.brief { max-height: 320px; }
 /* 选中 */

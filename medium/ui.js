@@ -232,7 +232,57 @@ function knobsBlock(it) {
     if (it.kind === "node" && (solid || n.type === "group" || n.type === "repeat")) box.append(el("div", { class: "selact" }, btn("剖到这里", () => sectionTo({ type: "node", plan_id: A.hlId(it.ref) })), n.role === "landmark" ? btn("看第一眼", () => A.setView("eye")) : null));
   }
   if (it.kind === "look") box.append(lookExtras());
+  if (it.kind === "site") box.append(layerExtras());
   if (it.kind === "mark") box.append(el("div", { class: "hint" }, "人给的几何（场地坐标，AI 不改它）：AI 用「" + it.ref + "」当锚点；图上拖它 = 挪，选中后 × = 删。"));
+  return box;
+}
+
+// ---------- 层表（docs/07 §7）：场地一栏里的「层」：引擎按实际台地找的，或人定的（site.layers）；出生点所在层为 0（或人定 site.layer_zero_m）
+/** 现在的层表（人定的优先；没有就把引擎找的拿来当起点），只留 height_m / label */
+function layersNow() {
+  const p = store.plan;
+  if (Array.isArray(p.site.layers) && p.site.layers.length) return clone(p.site.layers);
+  return ((store.T && store.T.layerTable) || []).map((l) => Object.assign({ height_m: l.height_m }, l.label ? { label: l.label } : {}));
+}
+const setLayers = (label, ls, extra = []) => A.planOps(label, [{ op: "set", id: "site", field: "layers", value: ls && ls.length ? ls : null }].concat(extra));
+/** 加一层（高度 m，可带名字）：层表变成人定的；加完在俯视图里看这一层 */
+export function addLayer(h, label = "") {
+  const v = r1(Number(h));
+  if (!Number.isFinite(v)) { A.note("先写一个高度（米）"); return false; }
+  const ls = layersNow();
+  if (ls.some((l) => Math.abs(l.height_m - v) <= 0.05)) { A.note(`${v} m 已经有一层了`); return false; }
+  ls.push(Object.assign({ height_m: v }, label ? { label } : {}));
+  const ok = setLayers(`加了一层：${v} m${label ? `（${label}）` : ""}`, ls);
+  if (ok && MapView.hasLayers(store.T)) A.setLayer(store.T.layerNo(v));
+  return ok;
+}
+function renameLayer(h, label) {
+  const ls = layersNow().map((l) => (Math.abs(l.height_m - h) <= 0.05 ? Object.assign({ height_m: l.height_m }, label ? { label } : {}) : l));
+  return setLayers(label ? `${r1(h)} m 那层改名「${label}」` : `${r1(h)} m 那层去掉了名字`, ls);
+}
+function removeLayer(h) {
+  const ls = layersNow().filter((l) => Math.abs(l.height_m - h) > 0.05);
+  if (!ls.length) { A.note("至少留一层"); return false; }
+  return setLayers(`删了 ${r1(h)} m 那层`, ls);
+}
+function layerExtras() {
+  const T = store.T, p = store.plan, manual = Array.isArray(p.site.layers) && p.site.layers.length > 0, rows = ((T && T.layerTable) || []).slice().reverse();
+  const box = el("div", { class: "layers" });
+  box.append(el("div", { class: "ksec" }, `层 · ${manual ? "你定的" : "引擎按台地找的"} · ${rows.length} 层`));
+  for (const l of rows) {
+    const no = l.no;
+    box.append(el("div", { class: "lrow" + (store.layerCur === no ? " on" : ""), "data-no": no },
+      el("button", { type: "button", class: "lno", title: MapView.layerTitle(T, no) + "：点一下在俯视图里只看这一层", onclick: () => A.setLayer(store.layerCur === no ? null : no) }, MapView.layerNoText(no)),
+      el("span", { class: "lh" }, `${r1(l.height_m)} m`),
+      el("input", { class: "txt", type: "text", value: l.label || "", placeholder: "名字", maxlength: 16, title: "这一层的名字（可空）", onchange: (e) => renameLayer(l.height_m, e.target.value.trim()) }),
+      no === 0 ? el("span", { class: "lzero" }, T.zeroFrom === "user" ? "0 层（你定的）" : T.zeroFrom === "spawn" ? "0 层（出生点）" : "0 层（基准面）")
+        : btn("设为 0", () => A.planOps(`${MapView.layerNoText(no)} 层设为 0 层`, [{ op: "set", id: "site", field: "layer_zero_m", value: r1(l.height_m) }]), "sm", "把这一层当 0 层，其它层相对它编号"),
+      btn("×", () => removeLayer(l.height_m), "x", "删掉这一层（它上面的东西归到高度最近的层）")));
+  }
+  const inp = el("input", { class: "val", type: "text", inputmode: "decimal", placeholder: "高度", title: "新一层的高度（米）", onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); if (addLayer(inp.value)) inp.value = ""; } } });
+  box.append(el("div", { class: "lrow add" }, btn("＋ 加一层", () => { if (addLayer(inp.value)) inp.value = ""; }, "sm", "按这个高度加一层"), inp, el("span", { class: "unit" }, "m"), el("span", { class: "hint" }, "或在俯视图点一个点 →「以这里的高度加一层」")));
+  if (manual || p.site.layer_zero_m != null) box.append(el("div", { class: "selact" }, btn("恢复自动", () => setLayers("层表恢复成引擎按台地找的", null, [{ op: "set", id: "site", field: "layer_zero_m", value: null }]), "sm", "去掉你定的层表与 0 层，回到引擎按实际台地找的")));
+  box.append(el("div", { class: "hint" }, "层按场景里实际的台地 / 平面分：出生点所在层为 0，往上 +1、往下 −1；房 / 树 / 路段按脚下的地面归层。改过层表后引擎不再自动加层，「恢复自动」能回去。"));
   return box;
 }
 /** 数字旋钮的名字可以左右拖（每 8 px 一步），松手才改 */
@@ -449,9 +499,10 @@ function renderSel(box) {
     return true;
   }
   if (s.type === "ground" && s.p) {
-    const p = s.p, sp = MapView.spawnOf(sid), h = store.T.heightAt(p[0], p[1]);
-    head(store.stratum === "ground" ? "这一点" : `${STRATUM_LABEL[store.stratum]}层`, `地面 ${r1(h)} m${sp ? ` · 比出生点高 ${Math.round(h - store.T.heightAt(sp.position[0], sp.position[2]))} m · 离出生点 ${Math.round(Math.hypot(p[0] - sp.position[0], p[1] - sp.position[2]))} m` : ""}`);
-    if (store.stratum === "ground") acts(btn("在这放个图钉（加到对话）", () => pinHere(worldToSite(sid, p))), btn("在这调高度", () => A.setTool("height")));
+    const p = s.p, sp = MapView.spawnOf(sid), h = store.T.heightAt(p[0], p[1]), lno = MapView.layerOfPoint(store.T, p);
+    head(store.stratum === "ground" ? "这一点" : `${STRATUM_LABEL[store.stratum]}层`, `地面 ${r1(h)} m${lno != null ? ` · ${MapView.layerNoText(lno)} 层` : ""}${sp ? ` · 比出生点高 ${Math.round(h - store.T.heightAt(sp.position[0], sp.position[2]))} m · 离出生点 ${Math.round(Math.hypot(p[0] - sp.position[0], p[1] - sp.position[2]))} m` : ""}`);
+    if (store.stratum === "ground") acts(btn("在这放个图钉（加到对话）", () => pinHere(worldToSite(sid, p))), btn("在这调高度", () => A.setTool("height")),
+      lno != null ? btn("以这里的高度加一层", () => addLayer(h), "", `把这一点的地面高度（${r1(h)} m）加成一层：层表变成你定的，在右栏「场地」里改名 / 删`) : null);
     tip(store.stratum === "ground" ? "「圈区域」圈一块 / 「画路」画一笔 = 加到对话，再说要做成什么；右键或 Ctrl+点 = 放图钉；「高度」(H) 在任意一点上下拖。" : `用「圈区域」在这一层圈一块，就是一个新的${STRATUM_LABEL[store.stratum]}空间。`);
     return true;
   }
@@ -759,6 +810,8 @@ export function buildBrief() {
   L.push("## 概念", p.concept || "", "");
   if ((p.key_structures || []).length) L.push(`关键结构：${p.key_structures.join("、")}`, "");
   L.push("## 场地与地形", `- 场地：${summarize("site", p.site)}`);
+  const LT = (sid.terrain && sid.terrain.layers) || [];
+  if (LT.length) L.push(`- 层（${sid.meta.layer_zero_from === "user" ? "人定的" : sid.meta.layer_zero_from === "base" ? "基准面" : "出生点所在层"}为 0，往上 +1、往下 −1；按场景里实际的台地分，不是 layer_height_m 切片；\`terrain.layers\` / \`meta.layer_zero\`）：${LT.map((l) => `${MapView.layerNoText(l.no)} = ${r1(l.height_m)} m${l.label ? `（${l.label}）` : ""}`).join("、")}`);
   for (const t of p.terrain) L.push(`- **${t.label || t.id}**（\`${t.id}\`，${A.OPT("terrain_op", "op")[t.op] || t.op}）：${summarize("terrain", Object.assign({}, t, { label: undefined }), p)}${ids(t.id)}${(p.locks || []).includes(t.id) ? "（已锁）" : ""}`);
   L.push("", "## 场景树（名字就是给人看的名字；SID 里每个对象带 plan_id / plan_path / instance_of）");
   const TY = A.OPT("node", "type");
@@ -855,11 +908,19 @@ function readbackDiffs(result, sid) {
 function renderReadback(body, status) {
   const res = store.readback; if (!res) return;
   const s = res.summary, again = () => renderReadback(body, status);
-  status.textContent = `读回格式 ${res.format} · 匹配 ${s.matched}/${s.intent_objects} · 位置中位误差 ${s.pos_err_median_m} m · 位置合格 ${s.pos_ok_rate_pct}% · 尺寸合格 ${s.size_ok_rate_pct}% · 朝向合格 ${s.rot_ok_rate_pct}%`;
-  const table = el("table", {}, el("tr", {}, ["对象", "匹配到", "位置误差 m", "高度差 m", "尺寸比", "朝向差°", "怎么办"].map((h) => el("th", {}, h))));
-  for (const r of res.rows) { const d = store.diffs.find((x) => x.id === r.id); table.append(el("tr", { class: d ? "bad" : "" }, el("td", { title: r.id }, humanize(r.id)), el("td", {}, r.matched || "—"), ...[r.pos_err_m, r.dy_m, r.size_ratio, r.rot_err].map((v) => el("td", { class: "num" }, v ?? "—")), el("td", {}, d ? el("div", { class: "fixes" }, diffButtons(d, again)) : "✓"))); }
-  for (const d of store.diffs.filter((x) => x.missing)) table.append(el("tr", { class: "bad" }, el("td", {}, humanize(d.id)), el("td", {}, "— 引擎里没有"), ...[0, 1, 2, 3].map(() => el("td", { class: "num" }, "—")), el("td", {}, el("div", { class: "fixes" }, diffButtons(d, again)))));
+  const okMark = (v) => (v === true ? "✓" : v === false ? "✗" : "—"), pct = (v) => (v == null ? "—" : `${v}%`);
+  const vis = s.visible_from_spawn || {}, con = s.trail_connected || {};
+  status.textContent = `读回格式 ${res.format} · 匹配 ${s.matched}/${s.intent_objects} · 位置中位误差 ${s.pos_err_median_m} m · 位置合格 ${s.pos_ok_rate_pct}% · 尺寸合格 ${s.size_ok_rate_pct}% · 朝向合格 ${s.rot_ok_rate_pct}% · 层合格 ${pct(s.level_ok_rate_pct)} · 颜色合格 ${pct(s.color_ok_rate_pct)} · 出生点见地标 ${okMark(vis.readback)}${vis.readback === false && vis.blocked_by ? `（被 ${vis.blocked_by} 挡）` : ""} · 主路连通 ${okMark(con.readback)}`;
+  // 层：按场景里实际的台地分，出生点所在层为 0、往上 +1、往下 −1（评分脚本算的，不是 3 m 切片）；不一致时「a→b 层」。颜色：读回色块 + ΔE。标记 / 无地形 / 读回没 color 的行显示 —
+  const LEVEL_TIP = "按场景里实际的台地分：出生点所在层为 0，往上 +1、往下 −1";
+  const levelCell = (r) => (r.level_intent == null ? "—" : r.level_ok === false ? `${r.level_intent}→${r.level_readback} 层` : `${r.level_intent} 层`);
+  const colorCell = (r) => (r.delta_e == null ? "—" : el("span", {}, el("span", { class: "swatch", style: `background:${r.color_readback}`, title: `读回 ${r.color_readback} · 意图 ${r.color_intent}` }), ` ΔE ${r.delta_e}`));
+  const table = el("table", {}, el("tr", {}, ["对象", "匹配到", "位置误差 m", "高度差 m", "尺寸比", "朝向差°", "层", "颜色", "怎么办"].map((h) => el("th", { title: h === "层" ? LEVEL_TIP : null }, h))));
+  for (const r of res.rows) { const d = store.diffs.find((x) => x.id === r.id); table.append(el("tr", { class: d ? "bad" : "" }, el("td", { title: r.id }, humanize(r.id)), el("td", {}, r.matched || "—"), ...[r.pos_err_m, r.dy_m, r.size_ratio, r.rot_err].map((v) => el("td", { class: "num" }, v ?? "—")), el("td", { class: "num" }, levelCell(r)), el("td", { class: "num" }, colorCell(r)), el("td", {}, d ? el("div", { class: "fixes" }, diffButtons(d, again)) : "✓"))); }
+  for (const d of store.diffs.filter((x) => x.missing)) table.append(el("tr", { class: "bad" }, el("td", {}, humanize(d.id)), el("td", {}, "— 引擎里没有"), ...[0, 1, 2, 3, 4, 5].map(() => el("td", { class: "num" }, "—")), el("td", {}, el("div", { class: "fixes" }, diffButtons(d, again)))));
   body.replaceChildren(table);
+  if (vis.readback === false || con.readback === false) body.append(el("div", { class: "hint" }, `${vis.readback === false ? `引擎里从出生点看不见地标${vis.blocked_by ? `（被 ${vis.blocked_by} 挡）` : ""}${vis.intent ? "，意图里能看见" : ""}。` : ""}${con.readback === false ? `引擎里主路没有从出生点连到地标门前${con.intent ? "，意图里是连通的" : ""}。` : ""}`));
+  if (s.layers) body.append(el("div", { class: "hint" }, `层：${s.layers.zero_from === "spawn" ? "出生点所在层" : "基准面"}为 0（${s.layers.zero_m} m），往上 +1、往下 −1；本场景 ${s.layers.heights_m.length} 层（${s.layers.range[0]} … ${s.layers.range[1]}），层高 ${s.layers.heights_m.join(" / ")} m`));
   if (store.corrections.length) body.append(el("div", {}, el("b", {}, "下一轮修正要求（会写进 BRIEF.md）"), el("pre", {}, store.corrections.join("\n"))));
 }
 /** 一个红点的三选一：按意图修（记进修正要求）/ 接受引擎版（当成人在图上拖了一下：改偏移）/ 不重要 */
@@ -869,7 +930,7 @@ export function diffButtons(d, after = () => {}) {
   const v = store.sid.volumes.find((x) => x.id === d.id), m = store.sid.markers.find((x) => x.id === d.id);
   const target = v ? { type: MapView.volumeType(v), plan_id: v.plan_id, sid_id: v.id } : m && m.kind === "player_spawn" ? { type: "spawn", plan_id: "spawn", sid_id: m.id } : null;
   return [
-    btn("按意图修", () => { const txt = d.missing ? `${d.id}：引擎里没放，请按 SID 位置 (${d.from.map(r1).join(", ")}) 补上` : `${d.id}：意图位置 (${d.from.map(r1).join(", ")})，引擎放在 (${d.to ? d.to.map(r1).join(", ") : "?"})，偏 ${row.pos_err_m} m；请按意图重放`; if (!store.corrections.includes(txt)) store.corrections.push(txt); done(); A.note(`记下了：${humanize(d.id)}按意图重放（写进 BRIEF）`); }, "chip"),
+    btn("按意图修", () => { const txt = d.missing ? `${d.id}：引擎里没放，请按 SID 位置 (${d.from.map(r1).join(", ")}) 补上` : `${d.id}：意图位置 (${d.from.map(r1).join(", ")})，引擎放在 (${d.to ? d.to.map(r1).join(", ") : "?"})，偏 ${row.pos_err_m} m${row.rot_ok === false ? `，朝向差 ${row.rot_err}°` : ""}${row.size_ok === false ? `，尺寸比 ${row.size_ratio}` : ""}${row.level_ok === false ? `，落在 ${row.level_readback} 层而不是 ${row.level_intent} 层（出生点所在层为 0）` : ""}${row.color_ok === false ? `，颜色 ${row.color_readback} 应为 ${row.color_intent}（ΔE ${row.delta_e}）` : ""}；请按意图重放`; if (!store.corrections.includes(txt)) store.corrections.push(txt); done(); A.note(`记下了：${humanize(d.id)}按意图重放（写进 BRIEF）`); }, "chip"),
     d.to && target ? btn("接受引擎版", () => { A.mapHandlers.onDragEnd(target, d.to, {}); done(); }, "chip") : null,
     btn("不重要", done, "chip"),
   ].filter(Boolean);

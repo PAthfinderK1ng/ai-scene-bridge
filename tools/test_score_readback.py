@@ -127,6 +127,12 @@ def main() -> int:
           f"{T.height_at(0, -18)} {T.height_at(-8, -6)} {T.height_at(0, 20)}")
     check("高度函数：坡裙外侧线性落到 0（terrace_1 南缘外 1.2 m ≈ 1.5 m 高）", abs(T.height_at(0, 1.2) - 1.5) < 0.3, str(T.height_at(0, 1.2)))
     check("层号：出生点 0 层、房 1 层 / 2 层、地标 2 层", (T.level_at(0, 28), T.level_at(-8, -6), T.level_at(8, -18), T.level_at(0, -18)) == (0, 1, 2, 2))
+    check("层表：按实际台地分成 0 / 3 / 6 m 三层，出生点所在层为 0", T.layers == [0.0, 3.0, 6.0] and T.zero == 0 and T.zero_from == "spawn", f"{T.layers} zero={T.zero}")
+    sid_up = copy.deepcopy(sid)
+    sid_up["markers"][0]["position"] = [-14, 3, -6]   # 出生点挪到 1 层台地上
+    T_up = sr.Terrain(sid_up)
+    check("出生点在中间那层 → 它是 0，下面的台地 −1，上面的 +1", (T_up.level_at(0, 28), T_up.level_at(-8, -6), T_up.level_at(0, -18)) == (-1, 0, 1), f"{T_up.level_at(0, 28)} {T_up.level_at(-8, -6)} {T_up.level_at(0, -18)}")
+    check("坡裙上的点归到高度最近的层（terrace_1 南缘外 1.6 m ≈ 1.0 m → 0 层；外 0.4 m ≈ 2.5 m → 1 层）", T.level_at(0, 1.6) == 0 and T.level_at(0, 0.4) == 1, f"{T.height_at(0, 1.6)} {T.height_at(0, 0.4)}")
     check("terraceAt：顶层多边形里取最高台地", T.terrace_at(0, -18)["id"] == "terrace_2" and T.terrace_at(0, 28) is None)
 
     rb = ideal_unity_readback(sid)
@@ -228,6 +234,44 @@ def main() -> int:
     seg, w = sr.box_axis_segment({"position": [-4.5, 0, -12.5], "size": [12.727922061357855, 0.02, 4], "rotation_y": 135})
     pts = sorted([tuple(round(c, 3) for c in p) for p in seg])
     check("aux 路段盒子（斜段 main_road_n 第 1 段：(0,−8)→(−9,−17)）", pts == [(-9.0, -17.0), (0.0, -8.0)], f"{pts}")
+
+    # ------------------------------------------------ 5. 雕刻模式地形（terrain.sculpt = true）与引擎逐点一致
+    # 期望值来自浏览器里 medium/engine/terrain.js buildTerrain(mini, {res: 2}) 的 heightAt / slopeAt / levelAt（2026-10-19 采样），
+    # 覆盖 raise(round 边) / noise / quant(terraced 边) / line 遮罩 set(cliff 边) / dune / 旧式 override 台地 / pit 负平底
+    mini = {"meta": {"layer_height_m": 3, "player_height": 1.7}, "bounds": {"min": [-30, 0, -30], "max": [30, 30, 30]}, "terrain": {"base": "flat", "base_height": 0, "sculpt": True, "features": [
+        {"id": "m_raise", "kind": "raise", "op": "raise", "mask": "poly", "blend": "add", "amount": 12, "edge": "round", "skirt": 20, "polygon": [[-24, -24], [24, -24], [24, 24], [-24, 24]]},
+        {"id": "m_noise", "kind": "noise", "op": "noise", "mask": "all", "blend": "add", "wave": {"kind": "noise", "amp": 1.5, "scale": 15, "seed": 42}},
+        {"id": "m_quant", "kind": "quant", "op": "quant", "mask": "poly", "blend": "quant", "step": 3, "base": 0, "edge": "terraced", "steps": 2, "skirt": 4, "polygon": [[-20, -20], [20, -20], [20, 0], [-20, 0]]},
+        {"id": "m_cut", "kind": "cut", "op": "cut", "mask": "line", "blend": "set", "target": 2, "edge": "cliff", "skirt": 3, "half": 2, "line": [[-25, 10], [25, 14]]},
+        {"id": "m_dune", "kind": "dune", "op": "dune", "mask": "all", "blend": "add", "wave": {"kind": "dune", "amp": 2, "scale": 12, "seed": 7, "dir": [0.6, 0.8]}},
+        {"id": "m_top", "kind": "plateau", "level": 2, "override": True, "polygon": [[-8, 16], [8, 16], [8, 26], [-8, 26]]},
+        {"id": "m_pit", "kind": "pit", "height": -3, "polygon": [[10, 16], [20, 16], [20, 26], [10, 26]]},
+    ]}}
+    # 高度 / 坡度 / 3 m 切片层号（slab_at = 引擎 levelAt）来自引擎；最后一列是按实际台地分的层号：
+    # 层表 = 基准面 0、override 台地 6、pit 质心处实际高度 −0.58（雕刻模式里负特征是叠加的，坑底不是 −3）；没有出生点 → 基准面为 0，坑 −1、台地 +1
+    expect = [(-3.3, 7.7, 8.445, 2.645, 3, 1), (12.1, -4.4, 6.318, 1.044, 2, 1), (0, 21, 6.0, 0.0, 2, 1), (15, 21, -0.581, 0.457, 0, -1), (-22, 12.5, 2.074, 0.234, 1, 0), (23, -23, 0.415, 0.22, 0, 0), (5.5, -15.2, 5.54, 0.541, 2, 1)]
+    MT = sr.Terrain(mini)
+    got = [(x, z, round(MT.height_at(x, z), 3), round(MT.slope_at(x, z), 3), MT.slab_at(x, z), MT.level_at(x, z)) for x, z, *_ in expect]
+    okk = all(abs(g[2] - e[2]) <= 0.002 and abs(g[3] - e[3]) <= 0.002 and g[4] == e[4] and g[5] == e[5] for g, e in zip(got, expect))
+    check("雕刻模式：raise / noise / quant / line-set / dune / override / pit 七个样本点的高度、坡度、切片层号与引擎一致（±2 mm），台地层号按层表", okk, f"got {got}")
+    check("雕刻模式层表：基准面 0、override 台地 6、坑底 −0.58 → [−0.58, 0, 6]，没有出生点时基准面为 0", MT.layers == [-0.58, 0.0, 6.0] and MT.zero == 1 and MT.zero_from == "base", f"{MT.layers} zero={MT.zero}")
+    check("雕刻模式：旧式 override 台地登记为 terrace，雕刻 op 不登记", [(t["id"], t["level"], t["height"]) for t in MT.terraces] == [("m_top", 2, 6.0)], str(MT.terraces))
+    check("JS 取整：切片层号 .5 向上（13.5 m / 3 m → 5，不是银行家舍入的 4）", sr.js_round(4.5) == 5 and sr.js_round(2.5) == 3 and sr.js_round(-0.5) == 0 and sr.js_round(1.4) == 1)
+
+    # ------------------------------------------------ 6. SID 自带层表（引擎写的 / 人定的 terrain.layers，docs/07 §5）→ 直接用，不自己找平面
+    sid6 = copy.deepcopy(sid)
+    sid6["terrain"]["layers"] = [{"id": "L0", "height_m": 0, "source": "user"}, {"id": "L1", "height_m": 3, "source": "user"}, {"id": "L2", "height_m": 6, "source": "user"}, {"id": "L3", "height_m": 12, "label": "塔顶", "source": "user"}]
+    T6 = sr.Terrain(sid6)
+    check("SID 带 terrain.layers → 层表直接用它（含人加的 12 m 层），没给 meta.layer_zero 时出生点所在层仍为 0",
+          T6.layers == [0.0, 3.0, 6.0, 12.0] and T6.layers_from == "sid" and T6.zero == 0 and T6.zero_from == "spawn" and T6.level_at(0, -18) == 2 and T6.level_at(0, 28) == 0, f"{T6.layers} zero={T6.zero} {T6.zero_from}")
+    sid6["meta"]["layer_zero"], sid6["meta"]["layer_zero_from"] = 6, "user"
+    T6b = sr.Terrain(sid6)
+    s6 = score(sid6, rb)["summary"]
+    check("meta.layer_zero = 6 → 6 m 那层为 0：出生点 −2、12 m 层 +1；summary.layers 透出 source / zero_from",
+          T6b.zero == 2 and T6b.zero_from == "user" and T6b.level_at(0, 28) == -2 and T6b.layer_index(12) - T6b.zero == 1
+          and s6["layers"] == {"heights_m": [0.0, 3.0, 6.0, 12.0], "zero_m": 6.0, "zero_from": "user", "range": [-2, 1], "source": "sid"}, json.dumps(s6["layers"]))
+    sid6["terrain"]["layers"] = []
+    check("terrain.layers 为空 → 回到自己找平面（旧口径不变）", sr.Terrain(sid6).layers == [0.0, 3.0, 6.0] and sr.Terrain(sid6).layers_from == "auto")
 
     failed = [r for r in results if not r[1]]
     print(f"\nDONE passed={len(results) - len(failed)} failed={len(failed)}")

@@ -1,0 +1,98 @@
+<!doctype html><meta charset="utf-8"><title>层：层表 / 层号 / 按层显示</title><pre id="out">running</pre>
+<script type="module">
+// layers.test.html — 层的口径（docs/07 §7）：按场景里实际的台地分，出生点所在层为 0、往上 +1、往下 −1；人定的层表（plan.site.layers）；
+// 俯视图按层显示（单层 / 穿透 ±N）。跑法：python -X utf8 tools/run_browser_test.py medium/engine/tests/layers.test.html
+import { test, run, assert, close } from "./harness.js";
+import { buildTerrain, findLayers } from "../terrain.js";
+import { compilePlan, applyOps } from "../plan.js";
+import { villageSid } from "./fixtures.js";
+import { renderMap, layerOfVolume } from "../../views/map.js";
+
+const village = await fetch("../../../spec/examples/plans/mountain-village.plan.json", { cache: "no-store" }).then((r) => r.json());
+const near = (a, b, eps = 0.01) => Math.abs(a - b) <= eps;
+const sameTable = (got, want) => got.length === want.length && got.every((v, i) => near(v, want[i]));
+
+test("夹具山村（4 层台地 0 / 3 / 6 / 9 m，出生点在山脚）：层表与层号", () => {
+  const T = buildTerrain(villageSid());
+  assert(sameTable(T.layers, [0, 3, 6, 9]), "层表 " + JSON.stringify(T.layers));
+  assert(T.zero === 0 && T.zeroFrom === "spawn", `0 层 = 出生点所在层（${T.zero} / ${T.zeroFrom}）`);
+  const top = T.topTerrace();
+  assert(T.layerAt(top.centroid[0], top.centroid[1]) === 3, "顶层台地 = 3 层");
+  assert(T.layerAt(0, 56) === 0, "入口处 0 层");
+  assert(T.layerTable.every((l, i) => l.source === "auto" && l.no === i) && T.layerByNo(3).height_m === 9, "层表项带 source / no");
+  assert(T.levelAt(top.centroid[0], top.centroid[1]) === 3, "旧的 levelAt（3 m 切片）不变");
+});
+
+test("云岭寨示例：层表 0 / 4.5 / 9 / 13.5 / 18 / 22.5 m，出生点在 4.5 m 那层 = 0，鼓楼 4 层，山脚竹林 −1 层；写进 SID", () => {
+  const R = compilePlan(village, { seed: 7 }), T = R.T, sid = R.sid;
+  assert(sameTable(T.layers, [0, 4.5, 9, 13.5, 18, 22.5]), "层表 " + JSON.stringify(T.layers));
+  assert(near(T.layers[T.zero], 4.5) && T.zeroFrom === "spawn", `0 层在 4.5 m（${T.layers[T.zero]}）`);
+  const tower = sid.volumes.find((v) => v.plan_id === "drum_tower");
+  assert(tower && layerOfVolume(T, tower) === 4, "鼓楼 4 层");
+  const bamboo = sid.volumes.filter((v) => String(v.id).startsWith("tree_bamboo"));
+  const bl = bamboo.map((v) => layerOfVolume(T, v)); // 竹林铺在西坡上：山脚的在 −1 层，往上爬到 2 层
+  assert(bamboo.length > 50 && Math.min(...bl) === -1 && bl.filter((k) => k === -1).length >= 10 && Math.max(...bl) <= 2, `竹林 ${bamboo.length} 棵：山脚的在 −1 层（${[...new Set(bl)].sort()}）`);
+  assert(Array.isArray(sid.terrain.layers) && sid.terrain.layers.length === 6 && sid.terrain.layers.every((l) => l.source === "auto"), "sid.terrain.layers 是引擎找的 6 层");
+  assert(near(sid.meta.layer_zero, 4.5) && sid.meta.layer_zero_from === "spawn", "meta.layer_zero = 4.5 / spawn");
+  assert(sid.terrain.layers.map((l) => l.no).join(",") === "-1,0,1,2,3,4", "层号 −1 … 4：" + sid.terrain.layers.map((l) => l.no).join(","));
+});
+
+test("人定的层表（site.layers）：以人定的为准、带名字；layer_zero_m 定 0 层；导出的 SID 带着它，再编译还在", () => {
+  const p = applyOps(village, [{ op: "set", id: "site", field: "layers", value: [{ height_m: 0 }, { height_m: 4.5, label: "寨口" }, { height_m: 30, label: "云台" }] }]).plan;
+  assert(Array.isArray(p.site.layers) && p.site.layers.length === 3 && p.site.layers[2].label === "云台", "applyOps 写进 site.layers");
+  const R = compilePlan(p, { seed: 7 }), T = R.T, sid = R.sid;
+  assert(sameTable(T.layers, [0, 4.5, 30]), "层表以人定的为准 " + JSON.stringify(T.layers));
+  assert(sid.terrain.layers.every((l) => l.source === "user") && sid.terrain.layers[1].label === "寨口" && sid.terrain.layers[2].label === "云台", "SID 层表带 source = user 与名字");
+  assert(near(sid.meta.layer_zero, 4.5) && sid.meta.layer_zero_from === "spawn", "0 层仍是出生点那层");
+  const tower = sid.volumes.find((v) => v.plan_id === "drum_tower");
+  assert(layerOfVolume(T, tower) === 1, "鼓楼（22.5 m）归到最近的 30 m 层 = +1");
+  // 0 层改到 30 m 那层
+  const p2 = applyOps(p, [{ op: "set", id: "site", field: "layer_zero_m", value: 30 }]).plan, R2 = compilePlan(p2, { seed: 7 });
+  const sp = R2.sid.markers.find((m) => m.kind === "player_spawn");
+  assert(R2.T.zeroFrom === "user" && near(R2.T.layers[R2.T.zero], 30) && R2.T.layerAt(sp.position[0], sp.position[2]) === -1 && layerOfVolume(R2.T, tower) === 0, `layer_zero_m = 30：${R2.T.zeroFrom} ${R2.T.layers[R2.T.zero]} 出生点 ${R2.T.layerAt(sp.position[0], sp.position[2])}`);
+  // 导出的 SID（meta.plan 里带 site.layers）再编译 → 还在；直接 buildTerrain 这份 SID 也读得到人定的层
+  const again = compilePlan(JSON.parse(JSON.stringify(R2.sid.meta.plan)), { seed: 7 });
+  assert(sameTable(again.T.layers, [0, 4.5, 30]) && again.T.zeroFrom === "user", "重编译后层表 / 0 层还在");
+  const T3 = buildTerrain(JSON.parse(JSON.stringify(R2.sid)));
+  assert(sameTable(T3.layers, [0, 4.5, 30]) && T3.zeroFrom === "user", "buildTerrain 读 SID 里的人定层表 " + JSON.stringify(T3.layers));
+  // 清掉 → 回到自动
+  const p3 = applyOps(p2, [{ op: "set", id: "site", field: "layers", value: null }, { op: "set", id: "site", field: "layer_zero_m", value: null }]).plan;
+  const R3 = compilePlan(p3, { seed: 7 });
+  assert(!p3.site.layers && sameTable(R3.T.layers, [0, 4.5, 9, 13.5, 18, 22.5]) && R3.T.zeroFrom === "spawn", "恢复自动");
+});
+
+test("findLayers：平面 ≥ 10 格才算、0.35 m 内合并、权重大的优先", () => {
+  const nx = 12, nz = 12, h = new Float32Array(nx * nz);
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) h[j * nx + i] = i >= 6 ? 3 : i === 3 && j >= 2 && j <= 4 ? 1.2 : 0; // 右半 3 m 的大平面；中间一小撮 1.2 m（< 10 格）
+  const L = findLayers({ nx, nz, h }, 0, [], () => 0);
+  assert(sameTable(L, [0, 3]), "小撮不算层 " + JSON.stringify(L));
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) if (i >= 6) h[j * nx + i] = j < 6 ? 3 : 3.2; // 3 与 3.2 合并
+  assert(sameTable(findLayers({ nx, nz, h }, 0, [], () => 0), [0, 3]) || sameTable(findLayers({ nx, nz, h }, 0, [], () => 0), [0, 3.2]), "0.35 m 内合并 " + JSON.stringify(findLayers({ nx, nz, h }, 0, [], () => 0)));
+});
+
+test("俯视图按层：单层只画这一层的东西；穿透 ±1 时邻层淡显、更远的隐藏；全部时照旧", () => {
+  const R = compilePlan(village, { seed: 7 }), base = { sid: R.sid, T: R.T, plan: R.plan, index: R.index, facts: R.facts, checks: R.checks, stratum: "ground", interiorLevel: 0, selected: null, diffs: [], section: null };
+  const all = renderMap(base, {});
+  const nAll = all.querySelectorAll('[data-type="house"], [data-type="shape"], [data-type="landmark"]').length;
+  assert(nAll > 20 && !all.querySelector("clipPath"), `全部：${nAll} 个体块、不裁剪`);
+  const solo = renderMap(Object.assign({}, base, { layerView: { cur: 1, mode: "solo", depth: 1 } }), {});
+  const vols = [...solo.querySelectorAll('[data-type="house"], [data-type="shape"], [data-type="landmark"]')];
+  assert(vols.length > 0 && vols.length < nAll && vols.every((n) => n.getAttribute("data-layer") === "1"), `单层 1：只剩 1 层的 ${vols.length} 个体块`);
+  assert(solo.querySelector("clipPath") && solo.querySelector("g.ground-wrap[clip-path]") && solo.querySelectorAll("clipPath rect").length > 10, "地面层按 1 层的范围裁剪");
+  assert(!solo.querySelector('use'), "单层没有淡显的 use");
+  assert(solo.getAttribute("data-layer-cur") === "1", "svg 带 data-layer-cur");
+  const xray = renderMap(Object.assign({}, base, { layerView: { cur: 1, mode: "xray", depth: 1 } }), {});
+  const uses = [...xray.querySelectorAll("use[data-layer]")];
+  assert(uses.map((u) => u.getAttribute("data-layer")).sort().join(",") === "0,2", "穿透 ±1：淡显 0 与 2 层 " + uses.map((u) => u.getAttribute("data-layer")));
+  assert(uses.every((u) => Number(u.getAttribute("opacity")) < 1 && u.getAttribute("pointer-events") === "none"), "淡显层不接指针");
+  const xv = [...xray.querySelectorAll('[data-type="house"], [data-type="shape"], [data-type="landmark"]')];
+  const far = xv.filter((n) => Math.abs(Number(n.getAttribute("data-layer")) - 1) > 1);
+  assert(far.length === 0 && xv.some((n) => n.getAttribute("data-layer") === "0" && n.hasAttribute("data-inactive")), "更远的体块隐藏、邻层体块淡显且不可点");
+  const xray2 = renderMap(Object.assign({}, base, { layerView: { cur: 0, mode: "xray", depth: Infinity } }), {});
+  assert(xray2.querySelectorAll("use[data-layer]").length === 5, "穿透全部：其余 5 层都淡显");
+  const op = (k) => Number(xray2.querySelector(`use[data-layer="${k}"]`).getAttribute("opacity"));
+  assert(op(1) > op(2) && op(2) > op(4) && op(-1) === op(1), `按层差递减 ${op(1)} ${op(2)} ${op(4)}`);
+});
+
+run();
+</script>

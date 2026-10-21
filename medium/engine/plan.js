@@ -270,6 +270,13 @@ export function normalizePlan(input) {
   site.size_m = Array.isArray(sz) ? [sz[0], sz[1] ?? sz[0]] : Number.isFinite(sz) ? [sz, sz] : [160, 160];
   site.ground = site.ground || "flat";
   site.layer_m = site.layer_m || 3;
+  // 人定的层表（docs/07 §7）：按高度升序、0.05 m 内去重、最多 24 层；0 层高度不是数就去掉
+  if (Array.isArray(site.layers)) {
+    const ls = site.layers.filter((l) => isObj(l) && Number.isFinite(Number(l.height_m))).map((l) => Object.assign({ height_m: r2(clamp(Number(l.height_m), -200, 400)) }, l.label ? { label: String(l.label).slice(0, 16) } : {})).sort((a, b) => a.height_m - b.height_m);
+    site.layers = ls.filter((l, i) => !i || l.height_m - ls[i - 1].height_m > 0.05).slice(0, 24);
+    if (!site.layers.length) delete site.layers;
+  } else delete site.layers;
+  if (site.layer_zero_m != null && !Number.isFinite(Number(site.layer_zero_m))) delete site.layer_zero_m;
   plan.site = site;
   plan.marks = cleanMarks(plan.marks, site, warn);
   if (!plan.marks.length) delete plan.marks;

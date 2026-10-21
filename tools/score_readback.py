@@ -25,12 +25,15 @@ map.json：{"读回里的名字": "意图里的 id", ...}，用于 A 条件（AI
 阈值（docs/02 第 8 节 / spec/PROTOCOL.md 4.2）：位置 < 1 m，尺寸比 0.8–1.25，朝向 < 20°。
 
 除位置 / 尺寸 / 朝向 / 缺漏外，还比四件事（docs/03 第 11 节第 7 条）。地形用纯 Python 复刻 medium/engine/terrain.js 的高度函数：
-  - 台地层：每个 volume 的意图位置与读回位置各算一次层号 round((h − base) / meta.layer_height_m)，rows 里 level_intent / level_readback / level_ok
+  - 台地层：层按场景里实际的台地分（高度场里的平坦面 + 台地多边形 + 基准面），出生点所在层为 0、往上 +1、往下 −1，点归到高度最近的层；
+    每个 volume 的意图位置与读回位置各算一次，rows 里 level_intent / level_readback / level_ok，summary.layers 给层的高度表
   - 可见性：从读回的 player_spawn（眼高 meta.player_height）看读回地标（importance=landmark）顶部，沿线每 1 m 采样
     地形（+0.3 m 容差）与其它读回体块的 OBB → summary.visible_from_spawn {intent, readback, blocked_by}
   - 连通性：2 m 网格 BFS（可走 = 坡度 ≤ 0.7 或在任一可走路的走廊内；读回里的路取 aux_<path_id>_* / <path_id> 路段合并），
     出生点能否走到地标门前（距地标中心 ≤ 6 m）→ summary.trail_connected {intent, readback}
   - 颜色：读回对象带 color "#RRGGBB" 时，与意图 style.palette 中该对象 color_role 的 hex 比 CIE76 ΔE（≤ 10 合格），rows 里 color_ok / delta_e
+地形两种模式都复刻了：旧式「正特征取最大、负相加 + override 平顶」，以及 terrain.sculpt = true 的雕刻模式（raise / noise / dune / quant / set /
+max / min，poly / line / all 遮罩，slope / cliff / terraced / round 边坡；值噪声逐位同 JS）。与 buildTerrain 的 2 m 网格逐格一致（误差 < 1 mm）。
 """
 from __future__ import annotations
 
@@ -274,16 +277,30 @@ def normalize_feature(f: dict, layer: float) -> dict:
     return out
 
 
+POLY_KINDS = {"plateau", "ridge", "cliff", "valley", "basin", "pit"}   # 有 polygon 时按「平顶 + 坡裙」算（valley / basin / pit 是负的平底）
+
+
+def js_round(v: float) -> int:
+    """JS 的 Math.round（.5 向正无穷进位），Python 的 round 是银行家舍入，层号在 x.5 处会差一层"""
+    return int(math.floor(v + 0.5))
+
+
 def feature_contribution(f: dict, x: float, z: float) -> float:
     k = f.get("kind")
     poly = f.get("polygon")
-    if k in ("plateau", "ridge", "cliff") and poly:
+    if k in POLY_KINDS and poly:
         if point_in_polygon([x, z], poly):
             return f["height"]
         d = dist_to_polygon([x, z], poly)
         return f["height"] * max(0.0, 1 - d / f["skirt"])
-    R = max(f.get("radius") or 1.0, 0.5)   # 圆形穹顶（hill / pit / 无 polygon 的 plateau）
     c = f.get("center") or [0, 0, 0]
+    rx, rz = f.get("rx") or 0, f.get("rz") or 0
+    if rx > 0 and rz > 0:   # 椭圆穹顶（angle 为长轴方向，弧度）
+        dx, dz = x - c[0], z - c[2]
+        ca, sa = math.cos(f.get("angle") or 0.0), math.sin(f.get("angle") or 0.0)
+        u, v = (dx * ca + dz * sa) / rx, (-dx * sa + dz * ca) / rz
+        return f["height"] * max(0.0, 1 - (u * u + v * v))
+    R = max(f.get("radius") or 1.0, 0.5)   # 圆形穹顶（hill / pit / 无 polygon 的 plateau）
     r = math.hypot(x - c[0], z - c[2])
     if k == "plateau":
         return f["height"] if r <= R else f["height"] * max(0.0, 1 - (r - R) / f["skirt"])
@@ -291,14 +308,148 @@ def feature_contribution(f: dict, x: float, z: float) -> float:
 
 
 def height_from_features(feats, base: float, x: float, z: float) -> float:
+    """叠加：正特征取最大、负特征相加；带 override 的平顶特征（plan 的台地）落在多边形内时之前的叠加作废"""
     pos = neg = 0.0
     for f in feats:
+        if f.get("override") and f.get("polygon") and point_in_polygon([x, z], f["polygon"]):
+            pos, neg = max(0.0, f["height"]), min(0.0, f["height"])
+            continue
         c = feature_contribution(f, x, z)
         if c >= 0:
             pos = max(pos, c)
         else:
             neg += c
     return base + pos + neg
+
+
+# ---- 雕刻模式（sid.terrain.sculpt = true：plan v2 的地形操作，复刻 terrain.js valueNoise / maskWeight / applySculpt）
+def _i32(v: int) -> int:
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
+def _imul(a: int, b: int) -> int:
+    return _i32(_i32(a) * _i32(b))   # JS Math.imul：32 位整数乘法
+
+
+def smooth01(t: float) -> float:
+    return 0.0 if t <= 0 else 1.0 if t >= 1 else t * t * (3 - 2 * t)
+
+
+def hash2(ix: int, iz: int, seed: int) -> float:
+    h = _i32(_imul(ix, 374761393) + _imul(iz, 668265263) + _imul(seed, 2246822519))
+    h = _imul(h ^ ((h & 0xFFFFFFFF) >> 13), 1274126177)
+    return ((h ^ ((h & 0xFFFFFFFF) >> 16)) & 0xFFFFFFFF) / 4294967296
+
+
+def value_noise(x: float, z: float, seed=1) -> float:
+    """种子化值噪声（0..1），双线性 + smoothstep；与 JS 逐位一致（seed 走 |0）"""
+    seed = 1 if seed is None else int(seed) if math.isfinite(seed) else 0
+    ix, iz = math.floor(x), math.floor(z)
+    fx, fz = smooth01(x - ix), smooth01(z - iz)
+    a, b = hash2(ix, iz, seed), hash2(ix + 1, iz, seed)
+    c, d = hash2(ix, iz + 1, seed), hash2(ix + 1, iz + 1, seed)
+    return (a * (1 - fx) + b * fx) * (1 - fz) + (c * (1 - fx) + d * fx) * fz
+
+
+def wave_at(w: dict, x: float, z: float) -> float:
+    """起伏：noise ±amp；dune 0..amp 的沙丘脊（沿 dir 排列）"""
+    s = w.get("scale") or 30
+    seed = w.get("seed")
+    amp = w.get("amp") or 0
+    if w.get("kind") == "dune":
+        d = w.get("dir") or [1, 0]
+        u = (x * d[0] + z * d[1]) / s
+        warp = value_noise(x / (s * 1.3), z / (s * 1.3), seed) * 2.2
+        v = (math.sin(2 * math.pi * u + warp) + 1) / 2
+        return amp * v ** 1.6 * (0.75 + 0.5 * value_noise(x / (s * 2.5), z / (s * 2.5), math.nan if seed is None else seed + 7))
+    n = value_noise(x / s, z / s, seed) * 0.7 + value_noise(x * 2.1 / s, z * 2.1 / s, math.nan if seed is None else seed + 11) * 0.3
+    return amp * (n * 2 - 1)
+
+
+def _sculpt_bbox(f: dict):
+    pts = f.get("line") or f.get("polygon")
+    pad = (f.get("skirt") or 0) + (f.get("half") or 0) + 0.5
+    xs, zs = [p[0] for p in pts], [p[1] for p in pts]
+    return [min(xs) - pad, min(zs) - pad, max(xs) + pad, max(zs) + pad]
+
+
+def mask_weight(f: dict, x: float, z: float) -> float:
+    """一个雕刻特征在 (x, z) 的遮罩权重 0..1：mask poly / line / all，edge slope|cliff|terraced|round，skirt 边坡宽"""
+    if f.get("mask") == "all" or (not f.get("polygon") and not f.get("line")):
+        return 1.0
+    bb = f.get("_bb")
+    if bb is None:
+        bb = f["_bb"] = _sculpt_bbox(f)
+    if x < bb[0] or x > bb[2] or z < bb[1] or z > bb[3]:
+        return 0.0
+    if f.get("line"):
+        dl = dist_to_polyline([x, z], f["line"])
+        half = f.get("half") or 0
+        inside, d = dl <= half, abs(dl - half)
+    else:
+        hole = f.get("hole")
+        inside = point_in_polygon([x, z], f["polygon"]) and not (hole and point_in_polygon([x, z], hole))
+        d = dist_to_polygon([x, z], f["polygon"])
+        if hole:
+            d = min(d, dist_to_polygon([x, z], hole))
+    sk = max(0.01, f.get("skirt") or 0.01)
+    edge = f.get("edge")
+    if inside:
+        return smooth01(d / sk) if edge == "round" else 1.0
+    if edge == "round":
+        return 0.0
+    t = 1 - d / sk
+    if t <= 0:
+        return 0.0
+    if edge == "cliff":
+        return t
+    if edge == "terraced":
+        n = max(1, f.get("steps") or 3)
+        return math.floor(t * n + 1e-9) / n
+    return smooth01(t)
+
+
+def apply_sculpt(f: dict, h: float, x: float, z: float) -> float:
+    """一个特征作用在高度 h 上。不带 op 的旧式特征：override 平顶落在多边形里就是它，其余按贡献取大（负的相加）"""
+    if not f.get("op"):
+        if f.get("override") and f.get("polygon") and point_in_polygon([x, z], f["polygon"]):
+            return f["height"]
+        c = feature_contribution(f, x, z)
+        return max(h, c) if c >= 0 else h + c
+    w = mask_weight(f, x, z)
+    if w <= 0:
+        return h
+    tgt = f.get("target")
+    if f.get("ramp"):
+        r = f["ramp"]
+        a, b = r["a"], r["b"]
+        dx, dz = b[0] - a[0], b[1] - a[1]
+        L2 = dx * dx + dz * dz or 1e-9
+        tgt = r["ya"] + (r["yb"] - r["ya"]) * clamp(((x - a[0]) * dx + (z - a[1]) * dz) / L2, 0.0, 1.0)
+    if tgt is None:
+        tgt = h
+    blend = f.get("blend")
+    if blend == "add":
+        return h + (wave_at(f["wave"], x, z) if f.get("wave") else (f.get("amount") or 0)) * w
+    if blend == "set":
+        return h + (tgt - h) * w
+    if blend == "max":
+        return max(h, h + (tgt - h) * w)
+    if blend == "min":
+        return min(h, h + (tgt - h) * w)
+    if blend == "quant":
+        st, b0 = f.get("step") or 3, f.get("base") or 0
+        q = b0 + math.floor((h - b0) / st + 1e-6) * st
+        return h + (q - h) * w
+    return h
+
+
+def sculpt_height(feats, base: float, x: float, z: float) -> float:
+    h = base
+    for f in feats:
+        h = apply_sculpt(f, h, x, z)
+    return h
 
 
 class Terrain:
@@ -315,16 +466,80 @@ class Terrain:
             self.layer = DEFAULT_LAYER_M
         terr = sid.get("terrain") or {}
         self.base = float(terr.get("base_height") or 0)
-        self.features = [normalize_feature(f, self.layer) for f in (terr.get("features") or []) if isinstance(f, dict)]
+        self.sculpt = bool(terr.get("sculpt"))   # plan v2：features 按顺序雕刻（带 op 的不做 normalize）
+        self.features = [dict(f) if self.sculpt and f.get("op") else normalize_feature(f, self.layer)
+                         for f in (terr.get("features") or []) if isinstance(f, dict)]
         self.nx = math.ceil((self.xmax - self.xmin) / res) + 1
         self.nz = math.ceil((self.zmax - self.zmin) / res) + 1
-        self.h = [height_from_features(self.features, self.base, self.xmin + i * res, self.zmin + j * res)
+        hf = sculpt_height if self.sculpt else height_from_features
+        self.h = [hf(self.features, self.base, self.xmin + i * res, self.zmin + j * res)
                   for j in range(self.nz) for i in range(self.nx)]
+        # 台地只登记旧式 plateau / ridge 多边形（雕刻 register 出来的凸包台地没复刻：评分只用 level_at，不用 terrace_at）
         self.terraces = sorted(
-            [{"id": f.get("id"), "level": f["level"] if isinstance(f.get("level"), (int, float)) else round(f["height"] / self.layer),
+            [{"id": f.get("id"), "level": f["level"] if isinstance(f.get("level"), (int, float)) else js_round(f["height"] / self.layer),
               "height": f["height"], "polygon": f["polygon"]}
-             for f in self.features if f.get("kind") in ("plateau", "ridge") and f.get("polygon")],
+             for f in self.features if not f.get("op") and f.get("kind") in ("plateau", "ridge") and f.get("polygon") and (self.sculpt or f["height"] >= 0)],
             key=lambda t: (t["height"], str(t["id"])))
+        # 层：按场景里实际的台地分，不按 layer_height_m 切片。层 = 高度场里的平坦面（≥ 10 格 ≈ 40 m² 同一高度）∪ 台地多边形的高度 ∪ 基准面；
+        # 出生点所在层为 0，往上 +1、往下 −1（没有出生点时基准面为 0）。点归到高度最近的层。
+        # SID 自带层表（terrain.layers，引擎写的或人定的，docs/07 §7）时直接用它、不自己找平面；meta.layer_zero 给了就以离它最近的那层为 0
+        given = self._given_layers(terr)
+        if given:
+            self.layers, self.layers_from = given, "sid"
+        else:
+            self.layers, self.layers_from = self._find_layers(), "auto"
+        sp = next((m for m in sid.get("markers") or [] if isinstance(m, dict) and m.get("kind") == "player_spawn" and m.get("position")), None)
+        lz = meta.get("layer_zero")
+        if given and isinstance(lz, (int, float)) and not isinstance(lz, bool) and math.isfinite(lz):
+            self.zero_from = str(meta.get("layer_zero_from") or "sid")
+            self.zero = self.layer_index(float(lz))
+        else:
+            self.zero_from = "spawn" if sp else "base"
+            self.zero = self.layer_index(self.height_at(sp["position"][0], sp["position"][2])) if sp else self.layer_index(self.base)
+
+    @staticmethod
+    def _given_layers(terr: dict) -> list[float]:
+        """terrain.layers → 高度表（升序、去重）；条目是 {height_m, …} 或直接是数；不合法 / 空 → []"""
+        raw = terr.get("layers")
+        if not isinstance(raw, list):
+            return []
+        hs = []
+        for l in raw:
+            v = l.get("height_m") if isinstance(l, dict) else l
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                hs.append(round(float(v), 2))
+        return sorted(set(hs))
+
+    def _find_layers(self) -> list[float]:
+        """层的高度表：基准面 ∪ 旧式多边形特征（台地 / 谷 / 坑）质心处的实际高度 ∪ 高度场里真正平坦的面
+        （四邻高度都相同的格 ≥ 10 个 ≈ 40 m²，与 sculptTerraces 的面积门槛一致；坡裙上整排同高的格不算）"""
+        nx, nz, h = self.nx, self.nz, self.h
+        counts: dict[float, int] = {}
+        for j in range(1, nz - 1):
+            for i in range(1, nx - 1):
+                k = j * nx + i
+                v = h[k]
+                if abs(h[k - 1] - v) < 0.01 and abs(h[k + 1] - v) < 0.01 and abs(h[k - nx] - v) < 0.01 and abs(h[k + nx] - v) < 0.01:
+                    counts[round(v, 2)] = counts.get(round(v, 2), 0) + 1
+        big = len(h)
+        cand = {round(self.base, 2): big}
+        for f in self.features:
+            poly = f.get("polygon")
+            if not f.get("op") and f.get("kind") in POLY_KINDS and poly and len(poly) >= 3:
+                c = polygon_centroid(poly)
+                hc = round(self.height_at(c[0], c[1]), 2)
+                cand[hc] = cand.get(hc, 0) + big
+        for k, n in counts.items():
+            if n >= 10:
+                cand[k] = cand.get(k, 0) + n
+        layers: list[float] = []
+        for hgt in sorted(cand, key=lambda k: (-cand[k], k)):   # 权重大的优先；0.35 m 内视为同一层
+            if all(abs(hgt - L) > 0.35 for L in layers):
+                layers.append(hgt)
+        return sorted(layers)
+
+    def layer_index(self, hgt: float) -> int:
+        return min(range(len(self.layers)), key=lambda i: (abs(hgt - self.layers[i]), i))
 
     def inside(self, x: float, z: float) -> bool:
         return self.xmin <= x <= self.xmax and self.zmin <= z <= self.zmax
@@ -346,7 +561,12 @@ class Terrain:
         return math.hypot(gx, gz)
 
     def level_at(self, x: float, z: float) -> int:
-        return int(round((self.height_at(x, z) - self.base) / self.layer))
+        """层号：高度最近的层相对出生点所在层的序号（0 / +1 / −1 …），不是 round(h / layer_height_m)"""
+        return self.layer_index(self.height_at(x, z)) - self.zero
+
+    def slab_at(self, x: float, z: float) -> int:
+        """旧口径：round((h − base) / layer_height_m)，与前端 T.levelAt 同；只给剖面 / 等高线那类按米数分带的用途"""
+        return js_round((self.height_at(x, z) - self.base) / self.layer)
 
     def terrace_at(self, x: float, z: float):
         best = None
@@ -687,6 +907,8 @@ def compare(intent: dict[str, dict], rb: dict[str, dict], mapping: dict[str, str
         "delta_e_mean": mean([r["delta_e"] for r in rows]),
         "visible_from_spawn": {"intent": None, "readback": None, "blocked_by": None, "blocked_by_intent": None},
         "trail_connected": {"intent": None, "readback": None},
+        "layers": {"heights_m": [round(v, 2) for v in T.layers], "zero_m": round(T.layers[T.zero], 2), "zero_from": T.zero_from,
+                   "range": [0 - T.zero, len(T.layers) - 1 - T.zero], "source": T.layers_from} if has_terrain else None,
     }
     if sid is not None:
         scene_checks(sid, T, intent, rb, rb_to_intent, rb_raw, unscored, summary)
@@ -754,6 +976,9 @@ def print_report(res: dict, fmt: str) -> None:
     de_mean = s.get("delta_e_mean")
     print(f"台地层一致的比例 {pct(s.get('level_ok_rate_pct'))}；颜色 ΔE ≤ {DELTA_E_T:g} 的比例 {pct(s.get('color_ok_rate_pct'))}"
           + ("" if de_mean is None else f"（ΔE 均值 {de_mean}）"))
+    ly = s.get("layers")
+    if ly:
+        print(f"层：{'出生点所在层' if ly['zero_from'] == 'spawn' else '基准面'}为 0（{ly['zero_m']} m），往上 +1、往下 −1；本场景 {len(ly['heights_m'])} 层，高度 {ly['heights_m']} m，层号范围 {ly['range'][0]}…{ly['range'][1]}")
     vis, con = s.get("visible_from_spawn") or {}, s.get("trail_connected") or {}
 
     def why(b):

@@ -38,6 +38,8 @@
         "section": { "type": "object", "description": "自选剖切（D19）：沿主路（trail）或一条直线（line），宽度带内的东西投到剖面上", "properties": { "mode": { "type": "string", "enum": ["trail", "line"] }, "line": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/definitions/vec2" }, "description": "直线模式的两个端点 [x, z]" }, "width_m": { "type": "number", "minimum": 2, "maximum": 60, "default": 12 } } },
         "plan_version": { "type": "integer", "description": "v0.5：2 = 由场景程序（plan v2）编译；resolve 按体块的 land 重新落地" },
         "ground": { "type": "string", "description": "v0.5：plan.site.ground（flat / rolling / hills / mountain / canyon / lake / island / coast / desert / cavern / sky）" },
+        "layer_zero": { "type": "number", "description": "v0.6：0 层的高度（米）：terrain.layers 里离它最近的那层是 0 层，往上 +1、往下 −1（出生点所在层 / 人定 / 基准面）" },
+        "layer_zero_from": { "type": "string", "enum": ["spawn", "user", "base"], "description": "v0.6：0 层怎么来的：spawn 出生点所在层（默认）、user 人定（plan.site.layer_zero_m）、base 没有出生点时的基准面" },
         "marks": { "type": "array", "description": "v0.6：人画的标记（plan.marks，docs/07 §1.1）：圈的一块 / 画的一笔 / 点的位置，坐标相对场地中心（x 东、z 南，米）。只供参考，不是几何（不出体块、不参与碰撞）", "items": { "type": "object", "required": ["id", "type"], "properties": { "id": { "type": "string" }, "type": { "type": "string", "enum": ["area", "trace", "pin"] }, "label": { "type": "string" }, "polygon_m": { "type": "array", "items": { "$ref": "#/definitions/vec2" } }, "path_m": { "type": "array", "items": { "$ref": "#/definitions/vec2" } }, "point_m": { "$ref": "#/definitions/vec2" } } } }
       }
     },
@@ -65,6 +67,8 @@
         "base": { "type": "string", "enum": ["flat", "heightmap", "none"] },
         "base_height": { "type": "number" },
         "heightmap": { "type": "string", "description": "可选：灰度图路径" },
+        "layers": { "type": "array", "description": "v0.6：层表（高度升序）：按场景里实际的台地 / 平面分，不是 layer_height_m 切片。source = auto 引擎从高度场找的（基准面 ∪ 台地多边形 ∪ 平坦面 ≥ 40 m²，0.35 m 内合并）/ user 人定的（plan.site.layers）。层号 = 下标 − meta.layer_zero 那层的下标；评分脚本读到它就直接用",
+          "items": { "type": "object", "required": ["height_m"], "properties": { "id": { "type": "string" }, "height_m": { "type": "number" }, "label": { "type": "string" }, "source": { "type": "string", "enum": ["auto", "user"] }, "no": { "type": "integer", "description": "层号（出生点所在层 0）" } } } },
         "features": {
           "type": "array",
           "items": {

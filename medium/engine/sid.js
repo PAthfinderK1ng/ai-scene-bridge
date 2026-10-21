@@ -223,6 +223,10 @@ export function resolve(sid, opts = {}) {
   const planMode = !!(sid.meta && sid.meta.plan_mode);
   for (const k of ["volumes", "regions", "paths", "markers", "spaces", "relations", "constraints"]) sid[k] = Array.isArray(sid[k]) ? sid[k] : [];
   const T = buildTerrain(sid, { res: 2 });
+  // 层表写回文档（docs/07 §7）：terrain.layers = 引擎找的或人定的全表，meta.layer_zero = 0 层的高度（出生点所在层 / 人定 / 基准面）；导出 / 评分脚本直接读它
+  sid.terrain.layers = T.layerTable.map((l) => Object.assign({}, l));
+  sid.meta = sid.meta || {};
+  sid.meta.layer_zero = r2(T.layers[T.zero]); sid.meta.layer_zero_from = T.zeroFrom;
 
   // 清掉上次 resolve 生成的对象（旧模式连主路一起；plan 模式的路是编译出来的，只清自动支路）
   sid.volumes = sid.volumes.filter((v) => v && !v.generated);

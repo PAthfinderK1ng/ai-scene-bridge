@@ -1,9 +1,9 @@
 // views/profile.js — 剖面：沿主路或一条直线、带宽度（数据来自 engine/section.js 的 sampleSection）。
 // 画：地面线、台地平台段（可拖）、带内体块、全部地标（顶边可拖）、地下 / 空中空间的内部切面（每个内部层的通道段、房间、层间连接）、
 // 连接点、每层高把手。v5：带内形体按真实高度画轮廓（锥 / 尖顶三角、穹顶半圆、拱两腿 + 弧、环两截管、浮岛倒三角），悬空的画在空中。
-// 层号与俯视图统一：第 1 层 = 入口地面。纵向有夸张，标注一律写真实米数。
+// 层号与俯视图统一（docs/07 §7）：按场景里实际的台地分，出生点所在层为 0、往上 +1、往下 −1（T.layers / T.layerNo）；没有层表的旧文档退回 layer_height_m 切片。纵向有夸张，标注一律写真实米数。
 // 拖动只改 DOM，节流 120 ms 调 onDragLive（给 3D 预览）；松手才回调。纯函数，不 import app.js / ui.js，不调 AI。
-import { svgel, spawnOf, spawnY, landmarkOf, SELECT_COLOR, SECTION_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth, shapeOf, volDims, roofOf, volumeBase, elevOf, volumeType, volumeColor, paletteOf, archThickness, torusTube, volToWorld, isUpright, opHeightInfo } from "./map.js";
+import { svgel, spawnOf, spawnY, landmarkOf, SELECT_COLOR, SECTION_COLOR, ROOM_FILL, sublevelOf, interiorLevelName, spaceDepth, shapeOf, volDims, roofOf, volumeBase, elevOf, volumeType, volumeColor, paletteOf, archThickness, torusTube, volToWorld, isUpright, opHeightInfo, hasLayers, layerNoText } from "./map.js";
 import { sampleSection, projectToPath, SECTION_WIDTH } from "../engine/section.js";
 import { SPACE_LABEL, VIA_LABEL, STRATUM_LABEL, LAYOUT_LABEL, SKY_LAYOUT_LABEL, ROLE_LABEL, levelsOf, levelStep } from "../engine/interior.js";
 
@@ -121,16 +121,19 @@ export function renderProfile(ctx, opts = {}) {
   const grp = (type, sidId, extra = {}) => svgel("g", Object.assign({ "data-type": type, "data-sid-id": sidId, "data-plan-id": planOf.get(sidId) || null }, extra));
   const clickSelect = (node, target) => { if (!select) return; node.style.cursor = node.style.cursor || "pointer"; node.addEventListener("click", (e) => { e.stopPropagation(); select(target(e)); }); };
 
-  // 层线与层号（右侧真实米数）；地面以下只标米数
-  const nT = Math.max(2, ((T.terraces || []).reduce((m, t) => Math.max(m, t.level), 0)) + 1), layerLines = [];
-  for (let k = 0; k < nT; k++) {
-    const y = sy(k * layer); if (y < mT) break;
-    const ln = svgel("line", { x1: mL, x2: Wv - mR, y1: y, y2: y, stroke: k === 0 ? "#a9b48f" : "#c9d2b6", "stroke-width": k === 0 ? 0.7 : 0.5, "stroke-dasharray": k === 0 ? null : "2 2" });
-    const tl = svgel("text", { x: mL - 3, y: y + 2, "font-size": 5.5, "text-anchor": "end", fill: "#6b7a4b" }, `${k} 层`);
-    const tr = svgel("text", { x: Wv - mR + 2, y: y + 2, "font-size": 5, fill: "#999" }, `${k * layer ? "+" : ""}${fmt1(k * layer)} m`);
-    s.append(ln, tl, tr); layerLines.push({ k, ln, tl, tr });
+  // 层线与层号（左：层号，出生点所在层 0、往上 +1、往下 −1；右：真实米数）。没有层表的旧文档按 layer_height_m 切片画；地面以下只标米数
+  const HL = hasLayers(T), lno = (hgt) => (HL ? T.layerNo(hgt) : Math.round(hgt / layer)), lnoText = (hgt) => `${layerNoText(lno(hgt))} 层`;
+  const rows = HL ? T.layerTable.map((l) => ({ k: l.no, h: l.height_m, label: l.label })) : Array.from({ length: Math.max(2, ((T.terraces || []).reduce((m, t) => Math.max(m, t.level), 0)) + 1) }, (_, k) => ({ k, h: k * layer }));
+  const layerLines = [];
+  for (const r of rows) {
+    const y = sy(r.h); if (y < mT || y > Hv - mB) continue;
+    const zero = r.k === 0;
+    const ln = svgel("line", { x1: mL, x2: Wv - mR, y1: y, y2: y, stroke: zero ? "#a9b48f" : "#c9d2b6", "stroke-width": zero ? 0.7 : 0.5, "stroke-dasharray": zero ? null : "2 2", "data-layer": r.k });
+    const tl = svgel("text", { x: mL - 3, y: y + 2, "font-size": 5.5, "text-anchor": "end", fill: "#6b7a4b", "data-layer": r.k }, `${layerNoText(r.k)} 层${r.label ? ` ${r.label}` : ""}`);
+    const tr = svgel("text", { x: Wv - mR + 2, y: y + 2, "font-size": 5, fill: "#999" }, `${r.h > 0 ? "+" : r.h < 0 ? "−" : ""}${fmt1(Math.abs(r.h))} m`);
+    s.append(ln, tl, tr); layerLines.push({ k: r.k, h: r.h, ln, tl, tr });
   }
-  for (let h = -layer; h >= lo; h -= layer) s.append(svgel("text", { x: Wv - mR + 2, y: sy(h) + 2, "font-size": 5, fill: "#999" }, `${fmt1(h)} m`));
+  if (!HL) for (let h = -layer; h >= lo; h -= layer) s.append(svgel("text", { x: Wv - mR + 2, y: sy(h) + 2, "font-size": 5, fill: "#999" }, `${fmt1(h)} m`));
   if (lo < 0) s.append(svgel("text", { x: mL - 3, y: sy(lo / 2) + 2, "font-size": 5.5, "text-anchor": "end", fill: "#7a6a55" }, "地下"));
 
   // 地面（地下层时淡一点，空间才显出来）；沿主路时按坡度着色
@@ -184,7 +187,7 @@ export function renderProfile(ctx, opts = {}) {
   for (const t of S.terraces) {
     const y = sy(t.height), x0 = sx(t.d0), x1 = sx(t.d1), g = grp("feature", t.id);
     const vis = svgel("line", { x1: x0, x2: x1, y1: y, y2: y, stroke: t.user_height ? "#b8452b" : "#6b7a4b", "stroke-width": 1.6, "stroke-linecap": "round", "pointer-events": "none", "data-vis": 1 });
-    const hit = svgel("rect", { x: x0, y: y - 3.5, width: Math.max(2, x1 - x0), height: 7, fill: "transparent", class: "h-terrace", "data-id": t.id, style: opts.onTerraceHeight ? "cursor:ns-resize" : null }, svgel("title", {}, `${t.level} 层 · +${fmt1(t.height)} m${opts.onTerraceHeight ? "（上下拖）" : ""}`));
+    const hit = svgel("rect", { x: x0, y: y - 3.5, width: Math.max(2, x1 - x0), height: 7, fill: "transparent", class: "h-terrace", "data-id": t.id, style: opts.onTerraceHeight ? "cursor:ns-resize" : null }, svgel("title", {}, `${lnoText(t.height)} · ${t.height < 0 ? "−" : "+"}${fmt1(Math.abs(t.height))} m${opts.onTerraceHeight ? "（上下拖）" : ""}`));
     g.append(vis, hit); s.append(g);
     if (!segs.has(t.id)) segs.set(t.id, []);
     segs.get(t.id).push({ vis, hit, t });
@@ -199,7 +202,7 @@ export function renderProfile(ctx, opts = {}) {
     }
     if (typeof opts.onTerraceHeight !== "function") { for (const { hit } of list) clickSelect(hit, target); continue; }
     for (const { hit } of list) drag(hit, {
-      move: (dy) => { const h = clampN(snap(t.height - dy / pxPerM), -20, 80); for (const q of list) { q.vis.setAttribute("y1", sy(h)); q.vis.setAttribute("y2", sy(h)); q.hit.setAttribute("y", sy(h) - 3.5); } return { h, text: `第 ${t.level} 层：${sgn(h)} m` }; },
+      move: (dy) => { const h = clampN(snap(t.height - dy / pxPerM), -20, 80); for (const q of list) { q.vis.setAttribute("y1", sy(h)); q.vis.setAttribute("y2", sy(h)); q.hit.setAttribute("y", sy(h) - 3.5); } return { h, text: `${lnoText(t.height)}：${sgn(h)} m` }; },
       live: (r) => ({ kind: "terrace", id, value: r.h }),
       click: select && (() => select(target())),
       end: (r) => { if (r.h !== t.height) opts.onTerraceHeight(id, r.h); },
@@ -319,8 +322,8 @@ export function renderProfile(ctx, opts = {}) {
   const opI = ctx.selected && ctx.selected.plan_id && typeof opts.onOpHeight === "function" ? opHeightInfo(ctx.plan || (sid.meta && sid.meta.plan), sid, ctx.selected.plan_id) : null;
   if (opI && opI.field && S.path && S.path.length > 1) opHandle(s, S, opI, { sx, sy, pxPerM, total, drag, opts });
 
-  // 每层高把手：左上角「每层高 3 m ↕」，上下拖等比缩放所有层线
-  const topK = layerLines.length ? layerLines[layerLines.length - 1].k : 1, knobY = mT - 4;
+  // 每层高把手：左上角「每层高 3 m ↕」，上下拖改每层高（= 台地级高 / 坡度）；没有层表的旧文档里层线跟着等比缩放，有层表时层线是实际台地、不动
+  const topK = Math.max(1, layerLines.length ? Math.max(...layerLines.map((L) => Math.abs(L.k))) : 1), knobY = mT - 4;
   const knob = svgel("text", { x: 2, y: knobY, "font-size": 5.5, fill: "#6b7a4b", class: "h-layer", style: opts.onLayerHeight ? "cursor:ns-resize" : null }, `每层高 ${layer} m${opts.onLayerHeight ? " ↕" : ""} · 纵向有夸张`);
   s.append(knob);
   if (typeof opts.onLayerHeight === "function") {
@@ -329,7 +332,7 @@ export function renderProfile(ctx, opts = {}) {
     drag(hitK, {
       move: (dy) => {
         const h = clampN(snap(layer - dy / pxPerM / Math.max(1, topK)), LAYER_RANGE[0], LAYER_RANGE[1]);
-        for (const L of layerLines) { const y = sy(L.k * h); L.ln.setAttribute("y1", y); L.ln.setAttribute("y2", y); L.tl.setAttribute("y", y + 2); L.tr.setAttribute("y", y + 2); L.tr.textContent = `${L.k ? "+" : ""}${fmt1(L.k * h)} m`; }
+        if (!HL) for (const L of layerLines) { const y = sy(L.k * h); L.ln.setAttribute("y1", y); L.ln.setAttribute("y2", y); L.tl.setAttribute("y", y + 2); L.tr.setAttribute("y", y + 2); L.tr.textContent = `${L.k ? "+" : ""}${fmt1(L.k * h)} m`; }
         knob.textContent = `每层高 ${h} m ↕ · 纵向有夸张`;
         const on = slopeChoices(h).items.find((x) => x.on);
         return { h, text: `每层高 ${h} m${on ? `（${on.l}）` : ""}` };
@@ -357,7 +360,8 @@ export function renderProfile(ctx, opts = {}) {
   cap.className = "caption";
   if (mode === "trail") {
     const local = f.max_local_slope != null && f.max_slope != null && f.max_local_slope > f.max_slope + 0.05 ? f.max_local_slope : null;
-    const bits = [`沿主路 ${stats.length_m} m`, `爬升 ${stats.climb_m} m（0→${Math.round(climb / layer)} 层）`];
+    const g0 = S.ground[0], g1 = S.ground[S.ground.length - 1];
+    const bits = [`沿主路 ${stats.length_m} m`, `爬升 ${stats.climb_m} m（${HL && g0 && g1 ? `${layerNoText(lno(g0.h))}→${layerNoText(lno(g1.h))} 层` : `0→${Math.round(climb / layer)} 层`}）`];
     if (f.max_slope != null) bits.push(`最陡 ${slopeLabel(f.max_slope)}${local != null ? `（台阶处 ${Math.round((Math.atan(local) * 180) / Math.PI)}°）` : ""}`);
     if (f.steps_estimate != null) bits.push(`约 ${Math.round(f.steps_estimate)} 级`);
     if (f.folds != null) bits.push(f.folds === 0 ? "直上" : `之字 ${f.folds} 折`);

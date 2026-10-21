@@ -32,6 +32,7 @@
 「场景对话」导出的 SID 比第一版多这些东西，含义如下：
 - `terrain.features[]` 里的台地是**多边形**：`kind: plateau`，`polygon` 是俯视多边形，`level` 是层号（0 最低），`height = level × meta.layer_height_m`，边缘坡面宽 `skirt`。高度场 = 各台地贡献取最大值：多边形内等于 `height`，外侧线性落到 0。请按这个做地形（Unity：Terrain 或按多边形挤出的网格；UE：Landscape 或 ProceduralMesh），不要用圆形山丘近似。
 - `volumes[]` 里 `generated: true` 的是引擎按规则铺的民居 / 树（长边平行等高线、门朝下坡或朝路、不压路、不重叠、不跨崖），坐标同样精确；`locked: true` 的是人确认过的，一毫米不能动；`importance: landmark` 的是地标；`kind: prop` + `shape: cylinder` + `label: 树` 是树冠占位。
+- `terrain.layers[]`（v0.6）是**层表**：按场景里实际的台地 / 平面分（引擎从高度场找的 `source: auto`，或人定的 `source: user`，带 `height_m` / `label` / `no`），不是 `layer_height_m` 切片；`meta.layer_zero` 是 0 层的高度（`layer_zero_from` 说明来自出生点所在层 / 人定 / 基准面），层号 `no` = 往上 +1、往下 −1。BRIEF.md 与俯视图 / 剖面的「N 层」都按它说；读回比对的「层」列也按它算。
 - `paths[]`：`main_trail` 是主路（`user_drawn: true` 表示人手画的），`spur_*` 是为了让每层台地都有路可达而补的支路，`stream` 是溪（`kind: river`）。主路请做成**石阶 + 歇脚平台**，`BRIEF.md` 里有折数、爬升、台阶数估计。
 - `regions[]`：每层台地一个（`terrace_level`），`kind` 为 other（民居）/ plaza（广场，不放房）/ forest（林子，只有树）/ farmland / terrace（梯田）/ gathering（聚落，更密的民居，照常放房）；`user_set: true` 的是人圈出来的多边形。
 - `meta.card` 是 AI 与人商定的结构卡（原型、层数、层高、地标放置类、入口放置类、每层用途与密度、色板、时段），`meta.archetype` 是地形原型名；`meta.ignored_checks` 是人说「不重要」的关系检查。
@@ -182,7 +183,7 @@ Unreal：
 | 尺寸比（最大维度） | 0.8–1.25 | 改 scale；注意 Cylinder 高是 scale.y × 2 |
 | 朝向差 | < 20° | 先查符号（−rotation_y），再查长短边是否对调 |
 | 缺漏 / 多余 | 0 | 补上 / 删掉 |
-| 台地层（每个体块，`level_ok`） | 读回位置落在的层 = 意图位置的层（层号 = round((地形高 − base) / `meta.layer_height_m`)，地形按 `terrain.features` 的高度函数算） | 把体块挪回它该在的台地多边形内；别只改 y |
+| 台地层（每个体块，`level_ok`） | 读回位置落在的层 = 意图位置的层。层按场景里**实际的台地**分（高度场里的平坦面、台地多边形、基准面），不是按 `layer_height_m` 切片：出生点所在层为 0，往上 +1、往下 −1，点归到高度最近的层；地形按 `terrain.features` 的高度函数算，`summary.layers` 给出每层高度 | 把体块挪回它该在的台地多边形内；别只改 y |
 | 出生点看见地标（`summary.visible_from_spawn.readback`） | 与意图一致（从 `player_spawn` 位置 `player_height` 眼高到地标顶部，沿线每 1 m 采样：地形 + 0.3 m 不高过视线、不穿过任何体块 OBB） | 看 `blocked_by`：`terrain` 查地形有没有做高了，`volume:<名字>` 把那个体块挪开或压矮 |
 | 主路连通（`summary.trail_connected.readback`） | 与意图一致（2 m 网格 BFS，可走 = 坡度 ≤ 0.7 或在路走廊内；路走廊 = 到路中心线 ≤ 宽/2 + 1 m；终点 = 距地标中心 ≤ 6 m 的任一格） | 路段要连续、按 `aux_<path_id>_*` 命名、从 `player_spawn` 一直铺到地标门前；台地墙处靠路爬坡 |
 | 颜色（读回带 `color` 时，`color_ok`） | CIE76 ΔE ≤ 10（与 `color_role` → `style.palette` 的 HEX 比） | 重设材质，直接用 HEX |

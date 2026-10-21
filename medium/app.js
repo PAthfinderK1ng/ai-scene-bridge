@@ -38,6 +38,7 @@ export const store = {
   cards: null, comparing: false, variantN: 0,                              // 三张卡
   sel: null, open: new Set(), collapsed: new Set(), closed: new Set(), checksOpen: false, // 场景树展开 / 选中
   view: "map", tool: "move", stratum: "ground", interiorLevel: 0, eye: {},
+  layerCur: null, layerMode: "xray", layerDepth: 1,                        // 俯视图按层显示（docs/07 §7）：看哪一层（null = 全部）、单层 / 穿透、穿透几层（Infinity = 全部）
   insetOn: local("scene.inset.on", false), insetMin: local("scene.inset.min", false), three: null, inset: null,
   diffs: [], readback: null, corrections: [], reference: null, board: null,
   undo: [], redo: [],
@@ -50,6 +51,7 @@ export const store = {
 function recompute() {
   const R = compilePlan(store.plan, { seed: store.seed, ignored: store.ignored });
   Object.assign(store, { plan: R.plan, sid: R.sid, T: R.T, checks: R.checks, facts: R.facts, index: R.index, warnings: R.warnings, ms: R.ms });
+  if (store.layerCur != null && !(MapView.hasLayers(R.T) && R.T.layerByNo(store.layerCur))) store.layerCur = null; // 层表变了、选中的那层没了 → 回到全部
 }
 const compileCard = (p) => { try { return compilePlan(p, { seed: store.seed }); } catch (e) { console.error(e); return null; } };
 
@@ -188,6 +190,24 @@ export function setStratum(st) {
   render();
 }
 export function setInteriorLevel(s) { store.interiorLevel = clamp(s | 0, 0, 2); renderViews(); renderSide(); }
+// ---------- 俯视图按层显示（docs/07 §7）：层按场景里实际的台地分，出生点所在层为 0、往上 +1、往下 −1
+/** 看哪一层（null = 全部）；选了一层就回到地面层 */
+export function setLayer(n) {
+  const v = n == null ? null : Math.round(Number(n));
+  store.layerCur = Number.isFinite(v) ? v : null;
+  if (store.layerCur != null && store.stratum !== "ground") { store.stratum = "ground"; store.interiorLevel = 0; }
+  if (store.view !== "map" && store.view !== "profile") store.view = "map";
+  renderViews(); renderSide(); markDirty();
+}
+/** 单层（solo：只画这一层）/ 穿透（xray：当前层实画、其它层按层差淡显） */
+export function setLayerMode(m) { store.layerMode = m === "solo" ? "solo" : "xray"; renderViews(); markDirty(); }
+/** 穿透几层（1 / 2 / Infinity = 全部） */
+export function setLayerDepth(d) { store.layerDepth = d === Infinity || d === "all" ? Infinity : Math.max(1, Math.round(Number(d)) || 1); renderViews(); markDirty(); }
+/** 打开右栏「场地」里的层表（加 / 删 / 改名 / 设 0 层） */
+export function openLayers() {
+  store.closed.delete("site"); store.open.add("site"); renderSide();
+  const n = document.querySelector('#comp .item[data-ref="site"]'); if (n) n.scrollIntoView({ block: "nearest" });
+}
 const maxLevels = (st) => Math.max(1, ...((store.sid && store.sid.spaces) || []).filter((s) => s.stratum === st).map(levelsOf));
 export function levelName(s, n) { return n <= 1 ? "" : s === n - 1 ? "上层" : s === 0 ? "下层" : "中层"; }
 export function sOf(space, k) { const n = levelsOf(space), kk = clamp(k | 0, 0, n - 1); return space.stratum === "sky" ? kk : n - 1 - kk; }
@@ -229,6 +249,7 @@ export function ctx(extra = {}) {
   else if (s && (PARTS.has(s.type) || s.type === "space")) selected = { plan_id: s.plan_id || undefined, sid_id: s.sid_id || undefined, part: s.part || undefined, type: s.type || undefined };
   else if (s && s.plan_id) selected = { plan_id: hlId(s.plan_id), type: s.type || undefined };
   return Object.assign({ sid: store.sid, T: store.T, facts: store.facts, checks: store.checks, plan: store.plan, index: store.index, stratum: store.stratum, interiorLevel: store.interiorLevel,
+    layerView: { cur: store.layerCur, mode: store.layerMode, depth: store.layerDepth },
     section: sectionSpec(), selected, diffs: store.diffs, tool: store.tool, eye: store.eye, sectionHandles: store.tool === "move" || store.tool === "section" }, extra);
 }
 function syncChrome() {
@@ -255,6 +276,21 @@ function syncChrome() {
   lv.hidden = N <= 1;
   const ks = [...Array(N).keys()]; if (store.stratum === "sky") ks.reverse();
   lv.replaceChildren(...ks.map((k) => el("button", { type: "button", class: k === store.interiorLevel ? "on" : "", "data-level": k, title: `空间内部${kName(k)}：实画这一层，其它层淡画`, onclick: () => setInteriorLevel(k) }, k === 0 ? "入口" : `${k + 1} 层`)));
+  // 地形的层（docs/07 §7）：地面层、层表 ≥ 2 层时出一列按钮（高的在上）：全部 / 各层 / 单层 · 穿透 / 穿透几层 / 层…
+  const T = store.T, ls = $("#layer-switch"), HL = store.stratum === "ground" && MapView.hasLayers(T) && T.layers.length > 1;
+  ls.hidden = !HL;
+  if (!HL) return;
+  const cur = store.layerCur, LB = (txt, on, title, fn, cls = "", extra = {}) => el("button", Object.assign({ type: "button", class: (on ? "on " : "") + cls, title, onclick: fn }, extra), txt);
+  ls.replaceChildren(
+    el("div", { class: "lhead" }, "层"),
+    LB("全部", cur == null, "所有层都画实（不按层过滤）", () => setLayer(null), "", { "data-layer": "all" }),
+    ...T.layerTable.map((l) => l.no).reverse().map((n) => LB(MapView.layerNoText(n), cur === n, MapView.layerTitle(T, n) + "：点一下只看这一层", () => setLayer(cur === n ? null : n), "lno" + (n === 0 ? " zero" : ""), { "data-layer": n })),
+    el("div", { class: "lmode" },
+      LB("单层", store.layerMode === "solo", "只画选中的这一层（房、树、路段、区域、地形轮廓）", () => setLayerMode("solo"), "", { "data-layer-mode": "solo", disabled: cur == null || null }),
+      LB("穿透", store.layerMode === "xray", "当前层画实、其它层按层差淡显", () => setLayerMode("xray"), "", { "data-layer-mode": "xray", disabled: cur == null || null })),
+    cur != null && store.layerMode === "xray" ? el("div", { class: "ldepth" }, ...[[1, "±1"], [2, "±2"], [Infinity, "全部"]].map(([d, l]) => LB(l, store.layerDepth === d, d === Infinity ? "穿透所有层" : `穿透上下各 ${d} 层`, () => setLayerDepth(d), "", { "data-layer-depth": d === Infinity ? "all" : d }))) : null,
+    LB("层…", false, "编辑层表：加一层 / 改名 / 删掉 / 设 0 层（在右栏「场地」里）", openLayers, "", { "data-layer-edit": 1 }));
+  for (const n of [...ls.childNodes]) if (n.nodeType === 3) n.remove(); // 没有穿透档位时的 null 不留文字
 }
 const SAMPLE_NAMES = { academy: "星穹学院", harbor: "海盗港", sky: "空中花园", temple: "沙漠神殿", cyber: "赛博夜市", village: "山城村庄", maze: "矿洞迷宫" };
 function welcome() {
@@ -554,7 +590,7 @@ export async function onIntent(text, variant = 0) {
   } catch (e) { th.fail(e, () => onIntent(text, variant)); } finally { busy(false); flush(); }
 }
 function redraft() { if (!store.intent) return; store.variantN += 1; msg("user", "三个都不要，重出"); onIntent(store.intent, store.variantN); }
-function fresh(s) { s.comparing = false; s.sel = null; s.diffs = []; s.readback = null; s.corrections = []; s.step = 3; s.section = null; s.ignored = []; s.open = new Set(); s.collapsed = new Set(); s.stratum = "ground"; s.interiorLevel = 0; s.refs = []; s.lastRefs = []; }
+function fresh(s) { s.comparing = false; s.sel = null; s.diffs = []; s.readback = null; s.corrections = []; s.step = 3; s.section = null; s.ignored = []; s.open = new Set(); s.collapsed = new Set(); s.stratum = "ground"; s.interiorLevel = 0; s.layerCur = null; s.refs = []; s.lastRefs = []; }
 export function pick(i) {
   const C = store.cards, plan = C && C.plans[i];
   if (!plan) return;
@@ -1011,7 +1047,7 @@ export function sceneData() {
   return { v: 6, step: store.step, intent: store.intent, plan: store.plan, seed: store.seed, ignored: store.ignored, section: store.section,
     cards: C ? { plans: C.plans, concepts: C.concepts, diversity: C.diversity, locked: C.locked } : null, variantN: store.variantN,
     chat: store.chat, history: store.history, undo: store.undo.slice(-30), redo: store.redo.slice(-30), refs: store.refs.filter((r) => r.pinned), lastRefs: store.lastRefs || [],
-    view: { view: store.view, stratum: store.stratum, interiorLevel: store.interiorLevel } };
+    view: { view: store.view, stratum: store.stratum, interiorLevel: store.interiorLevel, layerCur: store.layerCur, layerMode: store.layerMode, layerDepth: Number.isFinite(store.layerDepth) ? store.layerDepth : "all" } };
 }
 /** 换到一个场景：store 换成它存下的状态，重编译、重画聊天栏（d = {} 是一个空的新场景） */
 export function loadState(d = {}) {
@@ -1021,7 +1057,8 @@ export function loadState(d = {}) {
     cards: d.cards && Array.isArray(d.cards.plans) && d.cards.plans.length ? Object.assign({}, d.cards, { compiled: null }) : null,
     chat: arr(d.chat), history: arr(d.history), undo: arr(d.undo), redo: arr(d.redo), refs: arr(d.refs), lastRefs: arr(d.lastRefs), localFx: [], pending: null,
     sel: null, diffs: [], readback: null, corrections: [], open: new Set(), collapsed: new Set(), closed: new Set(), tool: "move",
-    view: ["map", "profile", "eye", "three"].includes(v.view) ? v.view : "map", stratum: v.stratum || "ground", interiorLevel: v.interiorLevel | 0 });
+    view: ["map", "profile", "eye", "three"].includes(v.view) ? v.view : "map", stratum: v.stratum || "ground", interiorLevel: v.interiorLevel | 0,
+    layerCur: Number.isFinite(Number(v.layerCur)) && v.layerCur !== null ? Math.round(Number(v.layerCur)) : null, layerMode: v.layerMode === "solo" ? "solo" : "xray", layerDepth: v.layerDepth === "all" ? Infinity : Math.max(1, Math.round(Number(v.layerDepth)) || 1) });
   try { if (d.plan) { store.plan = normalizePlan(d.plan).plan; recompute(); } } catch (e) { console.error(e); store.plan = null; }
   if (!store.plan) Object.assign(store, { sid: null, T: null, checks: [], facts: {}, index: {}, warnings: [] });
   setStep(store.plan ? (d.step === 2 && store.cards ? 2 : 3) : store.cards ? 2 : 1);
@@ -1118,7 +1155,7 @@ function bind() {
   bindComposer(); bindSettings();
 }
 /** ui.js / session.js 用的动作（它们只 import store 和它，不逐个 import app.js 的函数） */
-export const actions = { edit, planOps, select, render, renderViews, note, setView, setInteriorLevel, levelName, kName, labelOf, removePlanItem, removeSelected, undo, placeholder, markDirty,
+export const actions = { edit, planOps, select, render, renderViews, note, setView, setInteriorLevel, setLayer, setLayerMode, setLayerDepth, openLayers, levelName, kName, labelOf, removePlanItem, removeSelected, undo, placeholder, markDirty,
   applyFix, nextSeed, API, sys, msg, ctx, nodeName, sectionSpec, sectionCtx, structTokens, spaceOf, mapHandlers, hidePopup, PARTS, treeIdOf, instanceIdOf, hlId, volOf, OPT, aiTag, loadExample, setTool };
 async function start() {
   bind(); setStep(1); render();
@@ -1136,5 +1173,5 @@ async function start() {
 start();
 
 // 调试 / 自动化测试用（唯一的全局）
-window.__scene = { store, edit, planOps, undo, redo, select, setView, setTool, setStratum, setInteriorLevel, say, pick, variants, loadExample, structTokens, moveIdOf, offsetAfter, profileOps, applyFix, removePlanItem, openExport, buildBrief, buildPackage, exportSid, render, ctx, sectionSpec, mapHandlers, profileHandlers, API, treeIdOf, instanceIdOf,
+window.__scene = { store, edit, planOps, undo, redo, select, setView, setTool, setStratum, setInteriorLevel, setLayer, setLayerMode, setLayerDepth, say, pick, variants, loadExample, structTokens, moveIdOf, offsetAfter, profileOps, applyFix, removePlanItem, openExport, buildBrief, buildPackage, exportSid, render, ctx, sectionSpec, mapHandlers, profileHandlers, API, treeIdOf, instanceIdOf,
   addRef, refOf, takeRefs, describe, applyRevise, commitHeight, sceneData, loadState, S };

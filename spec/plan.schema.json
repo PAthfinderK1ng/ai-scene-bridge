@@ -136,7 +136,11 @@
           "description": "基础形态：flat 平地；rolling 缓坡起伏；hills 丘陵；mountain 中间高；canyon 高原中间一道峡谷（南北走）；lake 中间低、带湖；island 中间陆地、四周海；coast 北陆南海；desert 沙丘；cavern 四周岩壁围住的洞底；sky 没有地面（远处云海），只有浮岛",
           "x-ui": { "label": "基础地形", "kind": "enum", "summary": true, "short": "{o}", "options": { "flat": "平地", "rolling": "缓坡", "hills": "丘陵", "mountain": "山", "canyon": "峡谷", "lake": "湖", "island": "海岛", "coast": "海岸", "desert": "沙漠", "cavern": "洞穴", "sky": "天空" } } },
         "relief_m": { "type": "number", "minimum": 0, "maximum": 80, "description": "基础形态的高差（米）；不写按 ground 默认", "x-ui": { "label": "高差", "kind": "number", "step": 1, "unit": "m" } },
-        "layer_m": { "type": "number", "minimum": 2, "maximum": 6, "default": 3, "description": "一层多高（台地、剖面刻度用）", "x-ui": { "label": "每层高", "kind": "number", "step": 0.5, "unit": "m" } }
+        "layer_m": { "type": "number", "minimum": 2, "maximum": 6, "default": 3, "description": "一层多高（台地、剖面刻度用）", "x-ui": { "label": "每层高", "kind": "number", "step": 0.5, "unit": "m" } },
+        "layers": { "type": "array", "maxItems": 24, "description": "人定的层表（docs/07 §7）：不写时引擎按场景里实际的台地 / 平面自动分层；写了就以这张表为准（高度升序，米）。界面上「层」按它显示：出生点所在层为 0，往上 +1、往下 −1",
+          "items": { "type": "object", "additionalProperties": false, "required": ["height_m"], "properties": { "height_m": { "type": "number", "minimum": -200, "maximum": 400 }, "label": { "type": "string", "maxLength": 16 } } },
+          "x-ui": { "hidden": true } },
+        "layer_zero_m": { "type": "number", "description": "人指定的 0 层高度（米，取层表里最近的那层）；不写时出生点所在层为 0", "x-ui": { "hidden": true } }
       }
     },
 

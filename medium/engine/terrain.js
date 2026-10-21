@@ -222,6 +222,36 @@ function sculptTerraces(feats, grid, layer) {
   return out;
 }
 
+// ------------------------------------------------------------ 层：按场景里实际的台地 / 平面分，不按 layer_height_m 切片（docs/07 §7；与 tools/score_readback.py Terrain._find_layers 同口径）
+/** 层表的合并阈值（米）：高度差不到这个数的平面算同一层 */
+export const LAYER_MERGE_M = 0.35;
+/**
+ * 高度场里的层（高度表，升序）：基准面 ∪ 旧式多边形特征（台地 / 谷 / 坑）质心处的实际高度 ∪ 真正平坦的面（四邻同高的格 ≥ 10 个 ≈ 40 m²，
+ * 坡裙上整排同高的格不算），权重大的优先、LAYER_MERGE_M 内合并。
+ * @param {{nx, nz, h}} grid 高度场 @param {number} base 基准面 @param {object[]} feats 特征 @param {(x, z) => number} heightAt
+ * @returns {number[]}
+ */
+export function findLayers(grid, base, feats, heightAt) {
+  const { nx, nz, h } = grid, counts = new Map(), key = (v) => Math.round(v * 100) / 100;
+  for (let j = 1; j < nz - 1; j++) for (let i = 1; i < nx - 1; i++) {
+    const k = j * nx + i, v = h[k];
+    if (Math.abs(h[k - 1] - v) < 0.01 && Math.abs(h[k + 1] - v) < 0.01 && Math.abs(h[k - nx] - v) < 0.01 && Math.abs(h[k + nx] - v) < 0.01) { const kk = key(v); counts.set(kk, (counts.get(kk) || 0) + 1); }
+  }
+  const big = h.length, cand = new Map([[key(base), big]]);
+  for (const f of feats) if (!f.op && POLY_KINDS.has(f.kind) && Array.isArray(f.polygon) && f.polygon.length >= 3) { const c = polygonCentroid(f.polygon), hc = key(heightAt(c[0], c[1])); cand.set(hc, (cand.get(hc) || 0) + big); }
+  for (const [k, n] of counts) if (n >= 10) cand.set(k, (cand.get(k) || 0) + n);
+  const layers = [];
+  for (const hgt of [...cand.keys()].sort((a, b) => cand.get(b) - cand.get(a) || a - b)) if (layers.every((L) => Math.abs(hgt - L) > LAYER_MERGE_M)) layers.push(hgt);
+  return layers.sort((a, b) => a - b);
+}
+/** 人定的层表（sid.terrain.layers 里 source = "user" 的那些，升序、去重）；没有 → null（用引擎自动找的） */
+export function userLayersOf(sid) {
+  const src = sid && sid.terrain && Array.isArray(sid.terrain.layers) ? sid.terrain.layers : [];
+  const ls = src.filter((l) => l && l.source === "user" && Number.isFinite(Number(l.height_m))).map((l) => ({ height_m: r2(Number(l.height_m)), label: l.label ? String(l.label) : undefined })).sort((a, b) => a.height_m - b.height_m);
+  const out = ls.filter((l, i) => !i || l.height_m - ls[i - 1].height_m > 0.05);
+  return out.length ? out : null;
+}
+
 // ------------------------------------------------------------ 地形对象
 export function buildTerrain(sid, opts = {}) {
   const b = sid.bounds || DEFAULT_BOUNDS;
@@ -258,7 +288,18 @@ export function buildTerrain(sid, opts = {}) {
       return [(T.heightAt(x + d, z) - T.heightAt(x - d, z)) / (2 * d), (T.heightAt(x, z + d) - T.heightAt(x, z - d)) / (2 * d)];
     },
     slopeAt(x, z) { const g = T.gradientAt(x, z); return Math.hypot(g[0], g[1]); },
+    /** 旧口径：round((h − base) / layer_height_m) 的切片号（布房 / 等高线 / 支路那类按米数分带的用途）；界面上的「层」用 layerAt */
     levelAt(x, z) { return Math.round((T.heightAt(x, z) - base) / layer); },
+    // ---- 层（按实际台地分；出生点所在层为 0、往上 +1、往下 −1）：layers 高度表（升序）、layerTable 带 id / label / source、zero 出生点那层的下标
+    layers: [], layerTable: [], zero: 0, zeroFrom: "base",
+    /** 高度最近的层的下标（并列取低的那层） */
+    layerIndexOf(h) { let bi = 0, bd = Infinity; for (let i = 0; i < T.layers.length; i++) { const d = Math.abs(h - T.layers[i]); if (d < bd) { bd = d; bi = i; } } return bi; },
+    /** 高度 → 层号（相对出生点所在层） */
+    layerNo(h) { return T.layerIndexOf(h) - T.zero; },
+    /** (x, z) 处地面的层号 */
+    layerAt(x, z) { return T.layerNo(T.heightAt(x, z)); },
+    /** 层号 → 层表项（没有这一层 → null） */
+    layerByNo(n) { return T.layerTable[n + T.zero] || null; },
     terraceAt(x, z) {
       // 重叠时：override 的（plan 里后压上去的）按顺序取最后一个，其余取最高
       let best = null, bk = -Infinity;
@@ -306,6 +347,15 @@ export function buildTerrain(sid, opts = {}) {
       return out;
     },
   };
+  // 层表：人定的（plan.site.layers → sid.terrain.layers source = user）优先，否则从高度场找；0 层 = 人定（meta.layer_zero_from = user）> 出生点所在层 > 基准面
+  const user = userLayersOf(sid);
+  T.layers = user ? user.map((l) => l.height_m) : findLayers(T.grid, base, feats, T.heightAt);
+  T.layerTable = T.layers.map((hgt, i) => Object.assign({ id: `L${i}`, height_m: r2(hgt), source: user ? "user" : "auto" }, user && user[i].label ? { label: user[i].label } : {}));
+  const meta = sid.meta || {}, sp = (sid.markers || []).find((m) => m && m.kind === "player_spawn" && Array.isArray(m.position));
+  if (meta.layer_zero_from === "user" && Number.isFinite(Number(meta.layer_zero))) { T.zero = T.layerIndexOf(Number(meta.layer_zero)); T.zeroFrom = "user"; }
+  else if (sp) { T.zero = T.layerIndexOf(T.heightAt(sp.position[0], sp.position[2])); T.zeroFrom = "spawn"; }
+  else { T.zero = T.layerIndexOf(base); T.zeroFrom = "base"; }
+  for (let i = 0; i < T.layerTable.length; i++) T.layerTable[i].no = i - T.zero;
   return T;
 }
 
